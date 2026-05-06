@@ -1,8 +1,20 @@
 from __future__ import annotations
 
+import json
+import webbrowser
+from pathlib import Path
 from typing import Any
 
-from hubspot_agent.config import detect_default_portal, load_portal_config
+from hubspot_agent.app_credentials import load_app_credentials, save_app_credentials
+from hubspot_agent.auth import exchange_code_for_token, get_authorization_url
+from hubspot_agent.callback_server import run_callback_server
+from hubspot_agent.config import (
+    CONFIG_DIR,
+    PortalConfig,
+    detect_default_portal,
+    load_portal_config,
+    save_portal_config,
+)
 from hubspot_agent.models import AgentResult
 from hubspot_agent.orchestrator import dispatch_agent, route_request
 
@@ -16,14 +28,12 @@ def hubspot_command(request: str, working_dir: str = ".") -> str:
     if not request:
         return "Usage: /hubspot <request>"
 
-    # Portal management commands
     if request.lower().startswith("portal "):
         return _handle_portal_command(request[7:].strip(), working_dir)
 
     if request.lower() == "refresh":
         return _handle_refresh(working_dir)
 
-    # Default: route to orchestrator
     portal_id = detect_default_portal(working_dir)
     if not portal_id:
         return (
@@ -33,7 +43,11 @@ def hubspot_command(request: str, working_dir: str = ".") -> str:
 
     portal_config = load_portal_config(portal_id)
     if not portal_config:
-        return f"Portal {portal_id} found but no token configured. Set HUBSPOT_TOKEN_{portal_id} or save a token file."
+        return (
+            f"Portal {portal_id} found but no token configured. "
+            f"Use `/hubspot portal auth {portal_id}` for OAuth, or "
+            f"`/hubspot portal token {portal_id}` for a Private App token."
+        )
 
     agent_names = route_request(request)
     if not agent_names:
@@ -59,19 +73,178 @@ def hubspot_command(request: str, working_dir: str = ".") -> str:
 def _handle_portal_command(subcommand: str, working_dir: str) -> str:
     parts = subcommand.split(maxsplit=1)
     if not parts:
-        return "Usage: /hubspot portal {switch <id> | list}"
+        return "Usage: /hubspot portal {auth <id> | token <id> | switch <id> | list}"
 
     action = parts[0].lower()
+
+    if action == "auth":
+        if len(parts) < 2:
+            return "Usage: /hubspot portal auth <portal_id>"
+        return _handle_portal_auth(parts[1].strip())
+
+    if action == "token":
+        if len(parts) < 2:
+            return "Usage: /hubspot portal token <portal_id>"
+        return _handle_portal_token(parts[1].strip())
+
     if action == "switch":
         if len(parts) < 2:
             return "Usage: /hubspot portal switch <portal_id>"
-        portal_id = parts[1].strip()
-        return f"Switched to portal {portal_id}."
+        return _handle_portal_switch(parts[1].strip(), working_dir)
 
     if action == "list":
-        return "Configured portals: (not yet implemented — use `.hubspot-portal` files)"
+        return _handle_portal_list()
 
     return f"Unknown portal command: {action}"
+
+
+def _handle_portal_auth(portal_id: str) -> str:
+    creds = load_app_credentials()
+    if not creds:
+        return (
+            "🔑 HubSpot app credentials needed.\n\n"
+            "Save them with:\n"
+            "```python\n"
+            "from hubspot_agent.app_credentials import save_app_credentials\n"
+            f"save_app_credentials(client_id='your-client-id', client_secret='your-client-secret', app_id='your-app-id')\n"
+            "```\n\n"
+            "Then run: `/hubspot portal auth {portal_id}`"
+        )
+
+    scopes = [
+        "crm.objects.contacts.read",
+        "crm.objects.contacts.write",
+        "crm.objects.companies.read",
+        "crm.objects.companies.write",
+        "crm.objects.deals.read",
+        "crm.objects.deals.write",
+        "crm.schemas.contacts.read",
+        "crm.schemas.contacts.write",
+        "automation.workflows.read",
+        "automation.workflows.write",
+        "crm.lists.read",
+        "crm.lists.write",
+        "crm.pipelines.read",
+        "crm.pipelines.write",
+        "settings.users.read",
+        "settings.users.write",
+        "crm.objects.engagements.read",
+        "crm.objects.engagements.write",
+    ]
+
+    try:
+        url = get_authorization_url(portal_id, scopes)
+    except ValueError as exc:
+        return f"❌ {exc}"
+
+    lines = [
+        f"🔐 OAuth Authorization for Portal {portal_id}",
+        "",
+        f"**Authorization URL:** {url}",
+        "",
+        "A browser window should open automatically. If not, copy the URL above.",
+        "Waiting for callback on http://localhost:3000/oauth/callback ...",
+    ]
+
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+    try:
+        code = run_callback_server(port=3000, timeout=300.0)
+    except TimeoutError:
+        return "⏱️ Authorization timed out. Please try again."
+    except RuntimeError as exc:
+        return f"❌ {exc}"
+
+    import asyncio
+    try:
+        asyncio.run(exchange_code_for_token(portal_id, code))
+    except Exception as exc:
+        return f"❌ Token exchange failed: {exc}"
+
+    return (
+        f"✅ OAuth authorization complete for portal {portal_id}.\n"
+        f"Access token saved. You can now run `/hubspot <request>`."
+    )
+
+
+def _handle_portal_token(portal_id: str) -> str:
+    return (
+        f"🔑 Private App Token for Portal {portal_id}\n\n"
+        "Save your token with:\n"
+        "```python\n"
+        "from hubspot_agent.config import PortalConfig, save_portal_config\n"
+        f"save_portal_config(PortalConfig(portal_id='{portal_id}', token='pat-na1-...', auth_type='private_app'))\n"
+        "```\n\n"
+        "Or set the environment variable:\n"
+        f"`export HUBSPOT_TOKEN_{portal_id}=pat-na1-...`"
+    )
+
+
+def _handle_portal_switch(portal_id: str, working_dir: str) -> str:
+    portal_file = Path(working_dir) / ".hubspot-portal"
+    portal_file.write_text(f"{portal_id}\n")
+
+    config = load_portal_config(portal_id)
+    if not config:
+        return (
+            f"Switched to portal {portal_id}, but no token is configured.\n"
+            f"Use `/hubspot portal auth {portal_id}` for OAuth, or "
+            f"`/hubspot portal token {portal_id}` for a Private App token."
+        )
+
+    return f"✅ Switched to portal {portal_id} ({config.tier})."
+
+
+def _handle_portal_list() -> str:
+    if not CONFIG_DIR.exists():
+        return "No portals configured yet."
+
+    entries: list[dict[str, Any]] = []
+    for path in sorted(CONFIG_DIR.iterdir()):
+        if path.suffix == ".json" and not path.name.startswith("app_credentials"):
+            try:
+                data = json.loads(path.read_text())
+                entries.append({
+                    "portal_id": data.get("portal_id", path.stem),
+                    "auth_type": data.get("auth_type", "private_app"),
+                    "tier": data.get("tier", "unknown"),
+                    "expires_at": data.get("expires_at"),
+                })
+            except json.JSONDecodeError:
+                continue
+        elif path.suffix == ".token":
+            entries.append({
+                "portal_id": path.stem,
+                "auth_type": "private_app",
+                "tier": "unknown",
+                "expires_at": None,
+            })
+
+    if not entries:
+        return "No portals configured yet."
+
+    lines = ["**Configured Portals**", ""]
+    lines.append("| Portal ID | Auth Type | Tier | Expires |")
+    lines.append("|-----------|-----------|------|---------|")
+    for e in entries:
+        expires = "N/A" if e["auth_type"] == "private_app" else _format_expiry(e.get("expires_at"))
+        lines.append(f"| {e['portal_id']} | {e['auth_type']} | {e['tier']} | {expires} |")
+
+    return "\n".join(lines)
+
+
+def _format_expiry(expires_at: float | None) -> str:
+    if not expires_at:
+        return "unknown"
+    import time
+    remaining = int(expires_at - time.time())
+    if remaining < 0:
+        return "expired"
+    hours = remaining // 3600
+    return f"{hours}h"
 
 
 def _handle_refresh(working_dir: str) -> str:

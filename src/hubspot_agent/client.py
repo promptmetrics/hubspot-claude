@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,6 +23,7 @@ class HubSpotClient:
     _RATE_LIMIT = 100  # requests per 10 seconds
     _BATCH_CONCURRENT = 4
     _WINDOW_SECONDS = 10
+    _REFRESH_BUFFER_SECONDS = 300
 
     def __init__(self, portal: PortalConfig):
         self.portal = portal
@@ -33,6 +35,7 @@ class HubSpotClient:
         self._semaphore = asyncio.Semaphore(self._RATE_LIMIT)
         self._batch_semaphore = asyncio.Semaphore(self._BATCH_CONCURRENT)
         self._request_times: list[float] = []
+        self._token_refresh_lock = asyncio.Lock()
 
     async def _enforce_rate_limit(self) -> None:
         now = asyncio.get_event_loop().time()
@@ -44,6 +47,29 @@ class HubSpotClient:
                 await asyncio.sleep(sleep_for)
         self._request_times.append(asyncio.get_event_loop().time())
 
+    async def _get_fresh_token(self, force: bool = False) -> str:
+        if self.portal.auth_type != "oauth" or not self.portal.refresh_token:
+            return self.portal.token
+
+        needs_refresh = force or (
+            self.portal.expires_at
+            and self.portal.expires_at - time.time() < self._REFRESH_BUFFER_SECONDS
+        )
+        if not needs_refresh:
+            return self.portal.token
+
+        async with self._token_refresh_lock:
+            # Re-check inside the lock in case another task already refreshed
+            if not force and self.portal.expires_at and self.portal.expires_at - time.time() >= self._REFRESH_BUFFER_SECONDS:
+                return self.portal.token
+            from hubspot_agent.auth import refresh_access_token
+            body = await refresh_access_token(self.portal.portal_id, self.portal.refresh_token)
+            self.portal.token = body["access_token"]
+            self.portal.refresh_token = body.get("refresh_token", self.portal.refresh_token)
+            self.portal.expires_at = time.time() + body.get("expires_in", 21600)
+            self._client.headers["Authorization"] = f"Bearer {self.portal.token}"
+        return self.portal.token
+
     async def _request(
         self,
         method: str,
@@ -53,10 +79,17 @@ class HubSpotClient:
         expected_scopes: list[str] | None = None,
     ) -> APIResponse:
         await self._enforce_rate_limit()
+        await self._get_fresh_token()
         kwargs: dict[str, Any] = {}
         if body is not None:
             kwargs["json"] = body
         resp = await self._client.request(method, path, **kwargs)
+        if resp.status_code == 401:
+            await self._get_fresh_token(force=True)
+            # Only retry safe (read-only) methods automatically to avoid duplicate
+            # side effects if the original request was processed before the 401.
+            if method.upper() in ("GET", "HEAD"):
+                resp = await self._client.request(method, path, **kwargs)
         if resp.status_code == 429:
             retry_after = int(resp.headers.get("Retry-After", 10))
             raise RateLimitError("Rate limit exceeded", retry_after=retry_after)
@@ -64,6 +97,11 @@ class HubSpotClient:
             raise ScopeError(
                 f"Missing required scopes: {expected_scopes}",
                 required_scopes=expected_scopes,
+            )
+        if resp.status_code == 401:
+            raise HubSpotError(
+                "Token invalid after refresh",
+                status_code=401,
             )
         if resp.status_code >= 400:
             raise HubSpotError(

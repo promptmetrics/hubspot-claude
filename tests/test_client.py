@@ -49,3 +49,73 @@ async def test_client_hubspot_error(respx_mock):
     with pytest.raises(HubSpotError):
         await client.get("/crm/v3/objects/contacts/1", portal_id="123")
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_401_triggers_refresh(respx_mock, monkeypatch, tmp_path):
+    import time
+    from pathlib import Path
+    monkeypatch.setattr("hubspot_agent.config.CONFIG_DIR", tmp_path)
+
+    client = HubSpotClient(PortalConfig(
+        portal_id="123",
+        token="expired-token",
+        auth_type="oauth",
+        refresh_token="refresh-123",
+        expires_at=time.time() + 10000,
+    ))
+
+    call_count = {"n": 0}
+    def handler(request):
+        auth = request.headers.get("Authorization", "")
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            assert "expired-token" in auth
+            return httpx.Response(401, json={"message": "Token expired"})
+        assert "valid-token" in auth
+        return httpx.Response(200, json={"id": "1"})
+
+    respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(side_effect=handler)
+    respx_mock.post("https://api.hubapi.com/oauth/v1/token").mock(
+        return_value=httpx.Response(200, json={
+            "access_token": "valid-token",
+            "refresh_token": "refresh-123",
+            "expires_in": 21600,
+        })
+    )
+
+    resp = await client.get("/crm/v3/objects/contacts/1", portal_id="123")
+    assert resp.body["id"] == "1"
+    assert call_count["n"] == 2
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_401_after_refresh_raises(respx_mock, monkeypatch, tmp_path):
+    import time
+    from hubspot_agent.errors import HubSpotError
+
+    monkeypatch.setattr("hubspot_agent.config.CONFIG_DIR", tmp_path)
+
+    client = HubSpotClient(PortalConfig(
+        portal_id="123",
+        token="bad-token",
+        auth_type="oauth",
+        refresh_token="refresh-123",
+        expires_at=time.time() - 100,
+    ))
+
+    respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(
+        return_value=httpx.Response(401, json={"message": "Token expired"})
+    )
+    respx_mock.post("https://api.hubapi.com/oauth/v1/token").mock(
+        return_value=httpx.Response(200, json={
+            "access_token": "still-bad-token",
+            "refresh_token": "refresh-123",
+            "expires_in": 21600,
+        })
+    )
+
+    with pytest.raises(HubSpotError, match="Token invalid after refresh"):
+        await client.get("/crm/v3/objects/contacts/1", portal_id="123")
+    await client.close()
