@@ -1,0 +1,108 @@
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+
+from hubspot_agent.config import PortalConfig
+from hubspot_agent.errors import HubSpotError, RateLimitError, ScopeError
+
+
+@dataclass
+class APIResponse:
+    status_code: int
+    body: dict[str, Any]
+    headers: dict[str, str]
+
+
+class HubSpotClient:
+    BASE_URL = "https://api.hubapi.com"
+    _RATE_LIMIT = 100  # requests per 10 seconds
+    _BATCH_CONCURRENT = 4
+    _WINDOW_SECONDS = 10
+
+    def __init__(self, portal: PortalConfig):
+        self.portal = portal
+        self._client = httpx.AsyncClient(
+            base_url=self.BASE_URL,
+            headers={"Authorization": f"Bearer {portal.token}"},
+            timeout=httpx.Timeout(30.0, connect=5.0),
+        )
+        self._semaphore = asyncio.Semaphore(self._RATE_LIMIT)
+        self._batch_semaphore = asyncio.Semaphore(self._BATCH_CONCURRENT)
+        self._request_times: list[float] = []
+
+    async def _enforce_rate_limit(self) -> None:
+        now = asyncio.get_event_loop().time()
+        cutoff = now - self._WINDOW_SECONDS
+        self._request_times = [t for t in self._request_times if t > cutoff]
+        if len(self._request_times) >= self._RATE_LIMIT:
+            sleep_for = self._request_times[0] - cutoff
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+        self._request_times.append(asyncio.get_event_loop().time())
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        portal_id: str,
+        body: dict[str, Any] | None = None,
+        expected_scopes: list[str] | None = None,
+    ) -> APIResponse:
+        await self._enforce_rate_limit()
+        kwargs: dict[str, Any] = {}
+        if body is not None:
+            kwargs["json"] = body
+        resp = await self._client.request(method, path, **kwargs)
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", 10))
+            raise RateLimitError("Rate limit exceeded", retry_after=retry_after)
+        if resp.status_code == 403 and expected_scopes:
+            raise ScopeError(
+                f"Missing required scopes: {expected_scopes}",
+                required_scopes=expected_scopes,
+            )
+        if resp.status_code >= 400:
+            raise HubSpotError(
+                resp.text or f"HTTP {resp.status_code}",
+                status_code=resp.status_code,
+            )
+        return APIResponse(
+            status_code=resp.status_code,
+            body=resp.json() if resp.text else {},
+            headers=dict(resp.headers),
+        )
+
+    async def get(
+        self, path: str, portal_id: str, expected_scopes: list[str] | None = None
+    ) -> APIResponse:
+        return await self._request("GET", path, portal_id, expected_scopes=expected_scopes)
+
+    async def post(
+        self,
+        path: str,
+        portal_id: str,
+        body: dict[str, Any] | None = None,
+        expected_scopes: list[str] | None = None,
+    ) -> APIResponse:
+        return await self._request("POST", path, portal_id, body, expected_scopes)
+
+    async def patch(
+        self,
+        path: str,
+        portal_id: str,
+        body: dict[str, Any] | None = None,
+        expected_scopes: list[str] | None = None,
+    ) -> APIResponse:
+        return await self._request("PATCH", path, portal_id, body, expected_scopes)
+
+    async def delete(
+        self, path: str, portal_id: str, expected_scopes: list[str] | None = None
+    ) -> APIResponse:
+        return await self._request("DELETE", path, portal_id, expected_scopes=expected_scopes)
+
+    async def close(self) -> None:
+        await self._client.aclose()
