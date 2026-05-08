@@ -7,6 +7,7 @@ import hmac
 import json
 import logging
 import signal
+import time
 import uuid
 from typing import Any
 
@@ -32,6 +33,7 @@ _EVENT_ROUTING: dict[str, str] = {
     "product": "objects",
     "line_item": "objects",
     "quote": "objects",
+    "object": "objects",
     "call": "engagements",
     "email": "engagements",
     "meeting": "engagements",
@@ -214,7 +216,7 @@ class WebhookServer:
         self._processor_task: asyncio.Task[Any] | None = None
         self._shutdown_event = asyncio.Event()
 
-    def _validate_signature(self, body: bytes, signature_header: str | None) -> bool:
+    def _validate_legacy_signature(self, body: bytes, signature_header: str | None) -> bool:
         if not signature_header:
             return False
         expected = base64.b64encode(
@@ -222,13 +224,78 @@ class WebhookServer:
         ).decode()
         return hmac.compare_digest(expected, signature_header)
 
+    def _validate_v3_signature(
+        self,
+        method: str,
+        uri: str,
+        body: bytes,
+        signature_header: str | None,
+        timestamp_header: str | None,
+    ) -> bool:
+        if not signature_header or not timestamp_header:
+            return False
+        # Validate timestamp freshness (within 5 minutes)
+        try:
+            timestamp = int(timestamp_header)
+        except ValueError:
+            return False
+        current_time = int(time.time() * 1000)
+        if abs(current_time - timestamp) > 300_000:
+            logger.warning("V3 signature timestamp expired: %s", timestamp)
+            return False
+        # Build raw bytes: method + uri + body + timestamp (HubSpot signs raw bytes)
+        raw = method.encode() + uri.encode() + body + str(timestamp).encode()
+        expected = base64.b64encode(
+            hmac.new(self.client_secret.encode(), raw, hashlib.sha256).digest()
+        ).decode()
+        return hmac.compare_digest(expected, signature_header)
+
+    def _reconstruct_uri(self, request: web.Request) -> str:
+        # When behind a reverse proxy (e.g. ngrok), reconstruct the original URL
+        # HubSpot signed the request using the public URL, not the internal one
+        scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
+        host = request.headers.get("X-Forwarded-Host", request.headers.get("Host", ""))
+        # Use raw_path to preserve percent-encoding (HubSpot signs the encoded URI)
+        path = request.raw_path if request.raw_path else request.path
+        query = request.query_string
+        if query:
+            return f"{scheme}://{host}{path}?{query}"
+        return f"{scheme}://{host}{path}"
+
     async def _handle_webhook(self, request: web.Request) -> web.Response:
         body = await request.read()
-        signature = request.headers.get("X-HubSpot-Signature")
+        # Try V3 signature first, then fall back to legacy
+        v3_signature = request.headers.get("X-HubSpot-Signature-v3")
+        v3_timestamp = request.headers.get("X-HubSpot-Request-Timestamp")
+        uri = self._reconstruct_uri(request)
+        method = request.method
 
-        if not self._validate_signature(body, signature):
-            logger.warning("Invalid webhook signature from %s", request.remote)
-            return web.Response(status=401, text="Unauthorized")
+        valid = False
+        if v3_signature and v3_timestamp:
+            valid = self._validate_v3_signature(
+                method=method,
+                uri=uri,
+                body=body,
+                signature_header=v3_signature,
+                timestamp_header=v3_timestamp,
+            )
+            if not valid:
+                logger.warning(
+                    "Invalid V3 webhook signature from %s (uri=%s)",
+                    request.remote,
+                    uri,
+                )
+                return web.Response(status=401, text="Unauthorized")
+        else:
+            legacy_signature = request.headers.get("X-HubSpot-Signature")
+            valid = self._validate_legacy_signature(body, legacy_signature)
+            if not valid:
+                logger.warning(
+                    "Invalid legacy webhook signature from %s (uri=%s)",
+                    request.remote,
+                    uri,
+                )
+                return web.Response(status=401, text="Unauthorized")
 
         try:
             event = json.loads(body)
