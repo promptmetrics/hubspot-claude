@@ -17,33 +17,9 @@ def test_route_workflows_keywords():
 
 
 def test_route_lists_keywords():
-    result = route_request("add contacts to a list")
+    # "list" scores lists=1; no other fast-path agent scores, so it wins
+    result = route_request("remove from list")
     assert "lists" in result
-
-
-def test_route_pipelines_keywords():
-    result = route_request("reorder deal pipeline stages")
-    assert "pipelines" in result
-
-
-def test_route_users_keywords():
-    result = route_request("onboard a new user")
-    assert "users" in result
-
-
-def test_route_hygiene_keywords():
-    result = route_request("find duplicate contacts")
-    assert "hygiene" in result
-
-
-def test_route_analytics_keywords():
-    result = route_request("how many deals closed this month")
-    assert "analytics" in result
-
-
-def test_route_associations_keywords():
-    result = route_request("link contacts to companies")
-    assert "associations" in result
 
 
 def test_route_engagements_keywords():
@@ -51,17 +27,39 @@ def test_route_engagements_keywords():
     assert "engagements" in result
 
 
-def test_route_raw_api_keywords():
-    result = route_request("use raw api for custom endpoint")
-    assert "raw_api" in result
-
-
 def test_route_ambiguous_returns_empty():
     result = route_request("hello world")
     assert result == []
 
 
-def test_route_multi_agent_dependency_order():
+def test_route_non_fast_path_returns_empty_without_llm():
+    # pipelines, users, hygiene, analytics, associations, raw_api are not in fast-path.
+    # Requests are phrased to avoid accidental fast-path keyword matches.
+    assert route_request("reorder stages in the sales pipeline") == []
+    assert route_request("onboard a new user") == []
+    assert route_request("find duplicate records") == []
+    assert route_request("how many closed this month") == []
+    assert route_request("link records to companies") == []
+    assert route_request("use raw api for custom endpoint") == []
+
+
+def test_route_multi_agent_ambiguous_without_llm():
+    # "property" scores properties=1, "workflow" scores workflows=1
+    # Both score 1, so fast-path sees ambiguity (1 < 2*1) and returns None.
     result = route_request("create a property and then build a workflow")
-    # properties should come before workflows due to dependency
+    assert result == []
+
+
+def test_route_multi_agent_with_llm_response():
+    result = route_request(
+        "create a property and then build a workflow",
+        llm_response='["workflows", "properties"]',
+    )
     assert result.index("properties") < result.index("workflows")
+
+
+def test_route_llm_response_takes_priority():
+    # When llm_response is provided it is used directly, bypassing fast-path
+    result = route_request("find contacts", llm_response='["properties"]')
+    assert "properties" in result
+    assert "objects" not in result

@@ -207,3 +207,33 @@ def test_hubspot_setup_run_setup_raises(tmp_path, monkeypatch):
     result = hubspot_command("setup 456", working_dir=str(tmp_path))
     assert "Setup failed" in result
     assert "boom" in result
+
+
+def test_hubspot_status_no_portal(tmp_path):
+    result = hubspot_command("status", working_dir=str(tmp_path))
+    assert "No default portal found" in result
+
+
+def test_hubspot_status_with_traces(tmp_path, monkeypatch):
+    from pathlib import Path
+    from hubspot_agent.config import PortalConfig, save_portal_config
+    from hubspot_agent.trace import emit_trace, new_trace_id
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("hubspot_agent.config.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr("hubspot_agent.cli.CONFIG_DIR", tmp_path)
+
+    portal_file = tmp_path / ".hubspot-portal"
+    portal_file.write_text("123\n")
+    save_portal_config(PortalConfig(portal_id="123", token="t"))
+
+    tid = new_trace_id()
+    emit_trace("123", "request_received", tid, {"request": "find contacts"})
+    emit_trace("123", "tool_call", tid, {"tool_name": "hubspot_search_v1"})
+    emit_trace("123", "completion", tid, {"estimated_usd": 0.002})
+
+    result = hubspot_command("status", working_dir=str(tmp_path))
+    assert "Portal: 123" in result
+    assert "Requests: 1" in result
+    assert "Est. cost: $0.002" in result
+    assert "hubspot_search_v1: 1" in result

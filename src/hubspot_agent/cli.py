@@ -20,7 +20,16 @@ from hubspot_agent.models import AgentResult
 from hubspot_agent.setup import REQUIRED_SCOPES
 import asyncio
 
-from hubspot_agent.orchestrator import check_dispatch_readiness, dispatch_agent, initialize_session, route_request
+from hubspot_agent.orchestrator import (
+    check_dispatch_readiness,
+    dispatch_agent,
+    dispatch_agents_parallel,
+    initialize_session,
+    parse_batch_mode,
+    route_request,
+)
+from hubspot_agent.trace import compute_status_aggregates, emit_trace, new_trace_id
+from hubspot_agent.tour import run_tour
 
 
 def _run_async(async_fn, *args, **kwargs):
@@ -49,8 +58,14 @@ def hubspot_command(request: str, working_dir: str = ".") -> str:
     if request.lower() == "refresh":
         return _handle_refresh(working_dir)
 
+    if request.lower() == "status":
+        return _handle_status(working_dir)
+
     if request.lower().startswith("setup"):
         return _handle_setup(request[5:].strip(), working_dir)
+
+    if request.lower() == "tour":
+        return _handle_tour(working_dir)
 
     portal_id = detect_default_portal(working_dir)
     if not portal_id:
@@ -67,30 +82,47 @@ def hubspot_command(request: str, working_dir: str = ".") -> str:
             f"`/hubspot portal token {portal_id}` for a Private App token."
         )
 
+    trace_id = new_trace_id()
+    emit_trace(portal_id, "request_received", trace_id, {"request": request})
+
     _run_async(initialize_session, portal_id)
 
-    agent_names = route_request(request)
+    batch_mode, cleaned_request = parse_batch_mode(request)
+    agent_names = route_request(cleaned_request, portal_id=portal_id)
     if not agent_names:
+        emit_trace(portal_id, "error", trace_id, {"error": "no matching agents", "request": request})
         return (
             f"{_header(portal_id, portal_config.tier)}\n\n"
             "I'm not sure which HubSpot domain this request belongs to. "
             "Could you rephrase or specify what you'd like to do (e.g., 'find contacts', 'create workflow')?"
         )
 
+    emit_trace(portal_id, "route_decision", trace_id, {"agents": agent_names})
+
     readiness = _run_async(check_dispatch_readiness, agent_names, portal_config)
     if not readiness["ready"]:
+        emit_trace(portal_id, "error", trace_id, {"error": readiness["decline_reason"]})
         return f"{_header(portal_id, portal_config.tier)}\n\n❌ {readiness['decline_reason']}"
 
     lines = [f"{_header(portal_id, portal_config.tier)}", f"**Routing to:** {', '.join(agent_names)}", ""]
 
-    for agent_name in agent_names:
-        result = dispatch_agent(agent_name, request, portal_config=portal_config, mode="preview")
+    results = _run_async(
+        dispatch_agents_parallel,
+        agent_names,
+        cleaned_request,
+        portal_config=portal_config,
+        mode="preview",
+        trace_id=trace_id,
+        batch_mode=batch_mode,
+    )
+    for result in results:
         lines.append(f"### {result.agent_name}")
         if result.status == "error":
             lines.append(f"❌ {result.error_message}")
         else:
             lines.append(result.data.get("full_prompt", "").split("User request:")[1].split("\n")[0] if "User request:" in result.data.get("full_prompt", "") else "")
 
+    emit_trace(portal_id, "completion", trace_id, {"status": "preview_ready", "agents": agent_names, "batch_mode": batch_mode.value})
     return "\n".join(lines)
 
 
@@ -303,6 +335,32 @@ def _format_expiry(expires_at: float | None) -> str:
     return f"{hours}h"
 
 
+def _handle_status(working_dir: str) -> str:
+    portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return "No default portal found. Create a `.hubspot-portal` file to use status."
+
+    portal_config = load_portal_config(portal_id)
+    if not portal_config:
+        return f"Portal {portal_id} has no token configured."
+
+    agg = compute_status_aggregates(portal_id, window_hours=24)
+    lines = [
+        f"📍 Portal: {portal_id} ({portal_config.tier})",
+        "",
+        "**Last 24 Hours**",
+        f"- Requests: {agg['total_requests']}",
+        f"- Avg latency: {agg['avg_latency_ms']} ms",
+        f"- Error rate: {agg['error_rate'] * 100:.1f}%",
+        f"- Est. cost: ${agg['total_estimated_usd']:.4f}",
+    ]
+    if agg["tool_call_counts"]:
+        lines.append("- Tool calls:")
+        for tool_name, count in agg["tool_call_counts"].items():
+            lines.append(f"  - {tool_name}: {count}")
+    return "\n".join(lines)
+
+
 def _handle_refresh(working_dir: str) -> str:
     from hubspot_agent.cache import SchemaCache
 
@@ -313,3 +371,22 @@ def _handle_refresh(working_dir: str) -> str:
     cache = SchemaCache(portal_id)
     cache.refresh_all()
     return f"Cache refreshed for portal {portal_id}."
+
+
+def _handle_tour(working_dir: str) -> str:
+    portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return (
+            "No default portal found. Create a `.hubspot-portal` file in your working directory "
+            "with your portal ID, or use `/hubspot portal switch <portal_id>`."
+        )
+
+    portal_config = load_portal_config(portal_id)
+    if not portal_config:
+        return (
+            f"Portal {portal_id} found but no token configured. "
+            f"Use `/hubspot portal auth {portal_id}` for OAuth, or "
+            f"`/hubspot portal token {portal_id}` for a Private App token."
+        )
+
+    return run_tour(portal_id, portal_config=portal_config)

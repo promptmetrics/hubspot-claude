@@ -14,7 +14,7 @@ def mock_portal(tmp_path, monkeypatch):
 def test_integration_read_query(mock_portal):
     result = hubspot_command("how many contacts", working_dir=mock_portal)
     assert "Portal: 123" in result
-    assert "analytics" in result
+    assert "objects" in result
 
 
 def test_integration_write_routing(mock_portal):

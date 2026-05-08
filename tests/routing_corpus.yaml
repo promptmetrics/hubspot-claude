@@ -1,0 +1,72 @@
+# Routing regression corpus
+# Each entry: request text -> expected route(s)
+# Fast-path routes should be stable across prompt changes.
+
+- request: "find all contacts"
+  expected_routes: ["objects"]
+  mode: fast_path
+
+- request: "create a new company"
+  expected_routes: ["objects"]
+  mode: fast_path
+
+- request: "update deal properties"
+  expected_routes: ["objects"]
+  mode: fast_path
+
+- request: "list workflows"
+  expected_routes: []
+  mode: fast_path
+
+- request: "add contacts to a list"
+  expected_routes: []
+  mode: fast_path
+
+- request: "create a workflow to send welcome emails"
+  expected_routes: ["workflows"]
+  mode: fast_path
+
+- request: "log a call with a contact"
+  expected_routes: ["objects", "engagements"]
+  mode: fast_path
+
+- request: "get pipeline stages for deals"
+  expected_routes: ["objects"]
+  mode: fast_path
+
+- request: "how many contacts were created last week"
+  expected_routes: ["objects"]
+  mode: fast_path
+
+- request: "clean up duplicate contacts"
+  expected_routes: ["objects"]
+  mode: llm
+
+- request: "associate a deal with a company"
+  expected_routes: ["objects"]
+  mode: llm
+
+- request: "create a custom property on contacts"
+  expected_routes: []
+  mode: fast_path
+
+- request: "show me the analytics for email opens"
+  expected_routes: []
+  mode: llm
+
+- request: "create a list of contacts who haven't engaged in 30 days"
+  expected_routes: []
+  mode: fast_path
+
+- request: "remove from list"
+  expected_routes: ["lists"]
+  mode: fast_path
+
+# Edge cases
+- request: ""
+  expected_routes: []
+  mode: fast_path
+
+- request: "hello"
+  expected_routes: []
+  mode: fast_path
