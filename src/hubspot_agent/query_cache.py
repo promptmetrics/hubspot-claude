@@ -14,8 +14,9 @@ class QueryCache:
     TTL_SECONDS = 300  # 5 minutes
 
     def __init__(self, portal_id: str) -> None:
+        from hubspot_agent.maintenance import _portal_dir
         self.portal_id = portal_id
-        self.base_dir = Path.home() / ".claude" / "hubspot" / portal_id
+        self.base_dir = _portal_dir(portal_id)
         self.cache_file = self.base_dir / "query_cache.json"
         self._data: dict[str, dict[str, Any]] = {}
         self._load()

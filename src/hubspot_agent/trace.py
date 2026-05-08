@@ -80,7 +80,8 @@ class TraceSummary:
 
 
 def _trace_file_path(portal_id: str) -> Path:
-    base = Path.home() / ".claude" / "hubspot" / portal_id
+    from hubspot_agent.maintenance import _portal_dir
+    base = _portal_dir(portal_id)
     base.mkdir(parents=True, exist_ok=True)
     return base / "traces.jsonl"
 

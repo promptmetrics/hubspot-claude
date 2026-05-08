@@ -6,7 +6,8 @@ from typing import Any
 
 
 def _overrides_path(portal_id: str) -> Path:
-    return Path.home() / ".claude" / "hubspot" / portal_id / "routing_overrides.json"
+    from hubspot_agent.maintenance import _portal_dir
+    return _portal_dir(portal_id) / "routing_overrides.json"
 
 
 def load_routing_overrides(portal_id: str) -> dict[str, Any]:
