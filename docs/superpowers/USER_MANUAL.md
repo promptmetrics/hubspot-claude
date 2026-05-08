@@ -21,10 +21,12 @@ A Claude Code skill that lets you administer HubSpot CRM with natural language. 
 
 The HubSpot Agent supports two ways to connect. Pick the one that matches your situation.
 
-| Method | Best For | Needs Developer App? | Token Lifespan |
-|--------|----------|----------------------|----------------|
-| **Private App Token** | Personal use, single user, scripts | No | Never expires |
-| **OAuth 2.0** | Teams, shared access, multi-user | Yes — create a public app in the HubSpot developer portal | ~6 hours (auto-refreshed) |
+
+| Method                | Best For                           | Needs Developer App?                                      | Token Lifespan            |
+| --------------------- | ---------------------------------- | --------------------------------------------------------- | ------------------------- |
+| **Private App Token** | Personal use, single user, scripts | No                                                        | Never expires             |
+| **OAuth 2.0**         | Teams, shared access, multi-user   | Yes — create a public app in the HubSpot developer portal | ~6 hours (auto-refreshed) |
+
 
 ---
 
@@ -39,11 +41,11 @@ Use this if you want to get moving in under five minutes.
 3. Click **Create private app**.
 4. Give it a name (for example, `Claude Code Agent`).
 5. On the **Scopes** tab, grant the scopes you need. At minimum:
-   - `crm.objects.contacts.read`, `crm.objects.contacts.write`
-   - `crm.objects.companies.read`, `crm.objects.companies.write`
-   - `crm.objects.deals.read`, `crm.objects.deals.write`
-   - `crm.schemas.deals.read`, `crm.schemas.contacts.read`
-   - `automation` (for workflows)
+  - `crm.objects.contacts.read`, `crm.objects.contacts.write`
+  - `crm.objects.companies.read`, `crm.objects.companies.write`
+  - `crm.objects.deals.read`, `crm.objects.deals.write`
+  - `crm.schemas.deals.read`, `crm.schemas.contacts.read`
+  - `automation` (for workflows)
 6. Click **Create app**, then copy the token. It starts with `pat-na1-`.
 
 **Step 2 — Save the token in Claude Code**
@@ -484,6 +486,7 @@ When a new session starts, the skill loads the most recent summary as context to
 Hooks let you mirror events to external systems or inject custom gates.
 
 Supported events:
+
 - `pre_write` — fired before any mutating API call; can block the operation.
 - `post_write` — fired after a successful write; useful for Slack notifications or secondary logging.
 - `pre_approval` — fired before the approval prompt is shown; can auto-approve or auto-deny based on custom logic.
@@ -518,6 +521,7 @@ For example:
 ```
 
 The planner generates:
+
 - Node 1: `search_deals` (filter: no owner)
 - Node 2: `create_task` (depends on Node 1 outputs, one task per deal)
 
@@ -555,6 +559,7 @@ Flush the cache manually:
 **Symptom:** Every command returns `No portal configured`.
 
 **Fix:**
+
 1. Check if `.hubspot-portal` exists in your working directory.
 2. Run `/hubspot portal list` to see configured portals.
 3. If the list is empty, follow the [Quick Start](#quick-start) to authenticate.
@@ -566,11 +571,12 @@ Flush the cache manually:
 **Symptom:** A write fails with `403 Forbidden` or `Scope missing`.
 
 **Fix:**
+
 1. Log into HubSpot and go to your Private App or OAuth app settings.
 2. Add the missing scope. Common forgotten scopes:
-   - `automation` (for workflows)
-   - `crm.schemas.deals.read` (for pipeline or property changes)
-   - `crm.objects.owners.read` (for user/assignment operations)
+  - `automation` (for workflows)
+  - `crm.schemas.deals.read` (for pipeline or property changes)
+  - `crm.objects.owners.read` (for user/assignment operations)
 3. If using OAuth, re-run `/hubspot portal auth <portal_id>` to refresh the token with the new scopes.
 
 ---
@@ -580,6 +586,7 @@ Flush the cache manually:
 **Symptom:** Requests start returning `429 Too Many Requests`.
 
 **Fix:**
+
 - The skill's client already implements exponential backoff and retry. If you still see 429s, your portal may be on a lower HubSpot tier.
 - Spread bulk operations across a longer time window, or use `--batch` so the agent can coalesce writes into fewer API calls.
 - Check `/hubspot status` to see recent request volume and latency.
@@ -605,6 +612,7 @@ This flushes the local schema cache and query cache. The next request fetches fr
 **Symptom:** A write ran without asking you.
 
 **Fix:**
+
 - Check if you are in a role with `auto_approve` enabled in `roles.json`.
 - Check if a `pre_approval` hook is configured that suppresses prompts.
 - If neither applies, file a bug — writes should never run silently.
@@ -616,6 +624,7 @@ This flushes the local schema cache and query cache. The next request fetches fr
 **Symptom:** Commands fail with `401 Unauthorized` even though OAuth was set up.
 
 **Fix:**
+
 1. Check that `client_secret` is still correct in `~/.claude/hubspot/<portal_id>.json`.
 2. Re-run `/hubspot portal auth <portal_id>` to generate a new refresh token.
 3. If the HubSpot app was deleted or secret rotated, recreate the app and save new credentials.
@@ -626,18 +635,20 @@ This flushes the local schema cache and query cache. The next request fetches fr
 
 ### CLI Commands
 
-| Command | Description |
-|---------|-------------|
-| `/hubspot <request>` | Main entry point. Routes natural language to the appropriate agent. |
-| `/hubspot setup <portal_id> oauth` | Start OAuth credential setup for a portal. |
-| `/hubspot setup <portal_id> token <pat>` | Save a Private App token for a portal. |
-| `/hubspot portal auth <portal_id>` | Run the OAuth browser flow for a portal. |
-| `/hubspot portal token <portal_id>` | Show token setup instructions (no-op helper). |
-| `/hubspot portal switch <portal_id>` | Change the active portal for subsequent commands. |
-| `/hubspot portal list` | List all portals with stored credentials. |
-| `/hubspot status` | Show last 24 hours of stats: requests, latency, error rate, estimated cost. |
-| `/hubspot refresh` | Flush the schema cache and query cache. |
-| `/hubspot tour` | Run an interactive 7-step tour demonstrating reads, writes, and approvals. |
+
+| Command                                  | Description                                                                 |
+| ---------------------------------------- | --------------------------------------------------------------------------- |
+| `/hubspot <request>`                     | Main entry point. Routes natural language to the appropriate agent.         |
+| `/hubspot setup <portal_id> oauth`       | Start OAuth credential setup for a portal.                                  |
+| `/hubspot setup <portal_id> token <pat>` | Save a Private App token for a portal.                                      |
+| `/hubspot portal auth <portal_id>`       | Run the OAuth browser flow for a portal.                                    |
+| `/hubspot portal token <portal_id>`      | Show token setup instructions (no-op helper).                               |
+| `/hubspot portal switch <portal_id>`     | Change the active portal for subsequent commands.                           |
+| `/hubspot portal list`                   | List all portals with stored credentials.                                   |
+| `/hubspot status`                        | Show last 24 hours of stats: requests, latency, error rate, estimated cost. |
+| `/hubspot refresh`                       | Flush the schema cache and query cache.                                     |
+| `/hubspot tour`                          | Run an interactive 7-step tour demonstrating reads, writes, and approvals.  |
+
 
 ### Disk File Reference
 
@@ -667,20 +678,24 @@ This flushes the local schema cache and query cache. The next request fetches fr
 
 ### Risk Levels and Approval Gates
 
-| Risk Level | Trigger | Approval UI |
-|---|---|---|
-| Read-only | Any search, get, list, report | None |
-| Create | Any POST | Preview of the payload + `y` confirm |
-| Update single | One record | Inline diff (old vs new) + `y` confirm |
-| Update bulk | More than 10 records | Full plan preview + explicit confirm |
-| Delete / Merge / Archive | Any destructive operation | Exact count gate — type the number of affected records |
+
+| Risk Level               | Trigger                       | Approval UI                                            |
+| ------------------------ | ----------------------------- | ------------------------------------------------------ |
+| Read-only                | Any search, get, list, report | None                                                   |
+| Create                   | Any POST                      | Preview of the payload + `y` confirm                   |
+| Update single            | One record                    | Inline diff (old vs new) + `y` confirm                 |
+| Update bulk              | More than 10 records          | Full plan preview + explicit confirm                   |
+| Delete / Merge / Archive | Any destructive operation     | Exact count gate — type the number of affected records |
+
 
 ### Environment Variables
 
-| Variable | Purpose |
-|---|---|
-| `HUBSPOT_TOKEN_<portal_id>` | Fallback Private App token if not in `~/.claude/hubspot/<portal_id>.json` |
-| `HUBSPOT_OAUTH_CALLBACK_PORT` | Override the default `3000` port for the OAuth redirect listener |
+
+| Variable                      | Purpose                                                                   |
+| ----------------------------- | ------------------------------------------------------------------------- |
+| `HUBSPOT_TOKEN_<portal_id>`   | Fallback Private App token if not in `~/.claude/hubspot/<portal_id>.json` |
+| `HUBSPOT_OAUTH_CALLBACK_PORT` | Override the default `3000` port for the OAuth redirect listener          |
+
 
 ---
 
