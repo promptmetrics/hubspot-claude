@@ -61,10 +61,10 @@ def test_json_config_with_oauth_fields(tmp_path, monkeypatch):
 def test_backward_compat_token_file(tmp_path, monkeypatch):
     from hubspot_agent.config import CONFIG_DIR, load_portal_config
     monkeypatch.setattr("hubspot_agent.config.CONFIG_DIR", tmp_path / "hubspot")
-    token_file = (tmp_path / "hubspot") / "legacy.token"
+    token_file = (tmp_path / "hubspot") / "12345.token"
     token_file.parent.mkdir(parents=True, exist_ok=True)
     token_file.write_text("legacy-token-value")
-    loaded = load_portal_config("legacy")
+    loaded = load_portal_config("12345")
     assert loaded is not None
     assert loaded.token == "legacy-token-value"
     assert loaded.auth_type == "private_app"

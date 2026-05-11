@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,11 @@ def _ensure_config_dir() -> Path:
     return CONFIG_DIR
 
 
+def _validate_portal_id(portal_id: str) -> None:
+    if not portal_id or not re.fullmatch(r"[0-9]+", portal_id):
+        raise ValueError(f"Invalid portal_id: {portal_id}")
+
+
 def detect_default_portal(working_dir: str) -> str | None:
     portal_file = Path(working_dir) / ".hubspot-portal"
     if portal_file.exists():
@@ -34,10 +40,12 @@ def detect_default_portal(working_dir: str) -> str | None:
 
 
 def _portal_json_file(portal_id: str) -> Path:
+    _validate_portal_id(portal_id)
     return CONFIG_DIR / f"{portal_id}.json"
 
 
 def _portal_token_file(portal_id: str) -> Path:
+    _validate_portal_id(portal_id)
     return CONFIG_DIR / f"{portal_id}.token"
 
 
@@ -82,6 +90,7 @@ def load_portal_config(portal_id: str) -> PortalConfig | None:
 
 
 def save_portal_config(portal: PortalConfig) -> None:
+    _validate_portal_id(portal.portal_id)
     _ensure_config_dir()
     json_file = _portal_json_file(portal.portal_id)
     data: dict[str, Any] = {
@@ -97,6 +106,7 @@ def save_portal_config(portal: PortalConfig) -> None:
     if portal.expires_at:
         data["expires_at"] = portal.expires_at
     json_file.write_text(json.dumps(data, indent=2))
+    json_file.chmod(0o600)
 
     # Remove old .token file if present to avoid ambiguity
     token_file = _portal_token_file(portal.portal_id)

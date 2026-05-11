@@ -7,7 +7,6 @@ from typing import Any
 
 from hubspot_agent.app_credentials import load_app_credentials, save_app_credentials
 from hubspot_agent.auth import exchange_code_for_token, get_authorization_url
-from hubspot_agent.callback_server import run_callback_server
 from hubspot_agent.config import (
     CONFIG_DIR,
     PortalConfig,
@@ -20,7 +19,11 @@ from hubspot_agent.models import AgentResult
 from hubspot_agent.setup import REQUIRED_SCOPES
 import asyncio
 
+from hubspot_agent.models import BatchApprovalMode
 from hubspot_agent.orchestrator import (
+    _clear_pending_preview,
+    _load_pending_preview,
+    _list_pending_previews,
     check_dispatch_readiness,
     dispatch_agent,
     dispatch_agents_parallel,
@@ -29,7 +32,6 @@ from hubspot_agent.orchestrator import (
     route_request,
 )
 from hubspot_agent.trace import compute_status_aggregates, emit_trace, new_trace_id
-from hubspot_agent.tour import run_tour
 
 
 def _run_async(async_fn, *args, **kwargs):
@@ -64,8 +66,14 @@ def hubspot_command(request: str, working_dir: str = ".") -> str:
     if request.lower().startswith("setup"):
         return _handle_setup(request[5:].strip(), working_dir)
 
-    if request.lower() == "tour":
-        return _handle_tour(working_dir)
+    if request.lower().startswith("approve "):
+        return _handle_approve(request[8:].strip(), working_dir)
+
+    if request.lower() in ("y", "yes"):
+        return _handle_approve_last(working_dir)
+
+    if request.lower() in ("n", "no", "reject"):
+        return _handle_reject_last(working_dir)
 
     portal_id = detect_default_portal(working_dir)
     if not portal_id:
@@ -119,8 +127,17 @@ def hubspot_command(request: str, working_dir: str = ".") -> str:
         lines.append(f"### {result.agent_name}")
         if result.status == "error":
             lines.append(f"❌ {result.error_message}")
+        elif result.status == "preview":
+            lines.append(f"⚠️  Preview (action: {result.data.get('action_id')})")
+            lines.append(f"Risk: {result.data.get('risk_level', 'unknown')}")
+            lines.append(f"Impact: {result.data.get('impact_count', 'unknown')} records")
+            preview_text = result.data.get("preview", "")
+            if preview_text:
+                lines.append(preview_text)
+            lines.append("")
+            lines.append("Approve with `y` or `approve <id>`, reject with `n`.")
         else:
-            lines.append(result.data.get("full_prompt", "").split("User request:")[1].split("\n")[0] if "User request:" in result.data.get("full_prompt", "") else "")
+            lines.append(result.data.get("message", ""))
 
     emit_trace(portal_id, "completion", trace_id, {"status": "preview_ready", "agents": agent_names, "batch_mode": batch_mode.value})
     return "\n".join(lines)
@@ -162,23 +179,17 @@ def _authenticate_portal_oauth(portal_id: str) -> dict[str, Any]:
     except Exception:
         pass
 
-    try:
-        code = run_callback_server(port=3000, timeout=300.0)
-    except TimeoutError:
-        return {"success": False, "message": "⏱️ Authorization timed out. Please try again."}
-    except RuntimeError as exc:
-        return {"success": False, "message": f"❌ {exc}"}
-
-    try:
-        _run_async(exchange_code_for_token, portal_id, code)
-    except Exception as exc:
-        return {"success": False, "message": f"❌ Token exchange failed: {exc}"}
-
     return {
         "success": True,
         "message": (
-            f"✅ OAuth authorization complete for portal {portal_id}.\n"
-            f"Access token saved. You can now run `/hubspot <request>`."
+            f"🔐 OAuth authorization started for portal {portal_id}.\n\n"
+            f"**Authorization URL:** {url}\n\n"
+            "A browser window should open automatically. If not, copy the URL above.\n"
+            "After authorizing, exchange the code with:\n"
+            "```python\n"
+            f"from hubspot_agent.auth import exchange_code_for_token\n"
+            f"await exchange_code_for_token('{portal_id}', '<paste-code-here>', '<paste-state-here>')\n"
+            "```"
         ),
     }
 
@@ -373,20 +384,67 @@ def _handle_refresh(working_dir: str) -> str:
     return f"Cache refreshed for portal {portal_id}."
 
 
-def _handle_tour(working_dir: str) -> str:
+def _handle_approve(action_id: str, working_dir: str) -> str:
     portal_id = detect_default_portal(working_dir)
     if not portal_id:
-        return (
-            "No default portal found. Create a `.hubspot-portal` file in your working directory "
-            "with your portal ID, or use `/hubspot portal switch <portal_id>`."
-        )
+        return "No default portal found."
 
     portal_config = load_portal_config(portal_id)
     if not portal_config:
-        return (
-            f"Portal {portal_id} found but no token configured. "
-            f"Use `/hubspot portal auth {portal_id}` for OAuth, or "
-            f"`/hubspot portal token {portal_id}` for a Private App token."
-        )
+        return f"Portal {portal_id} has no token configured."
 
-    return run_tour(portal_id, portal_config=portal_config)
+    preview_data = _load_pending_preview(portal_id, action_id)
+    if not preview_data:
+        return f"No pending preview found with ID {action_id}."
+
+    result = _run_async(
+        dispatch_agent,
+        preview_data["agent_name"],
+        preview_data["request_text"],
+        portal_config=portal_config,
+        mode="execute",
+        trace_id=preview_data.get("trace_id"),
+        batch_mode=BatchApprovalMode(preview_data.get("batch_mode", "single")),
+        proposed_payload=preview_data.get("proposed_payload"),
+    )
+
+    _clear_pending_preview(portal_id, action_id)
+
+    if result.status == "error":
+        return f"❌ Execution failed: {result.error_message}"
+
+    return f"✅ Approved and executed action {action_id}.\n\n{result.data.get('message', '')}"
+
+
+def _handle_approve_last(working_dir: str) -> str:
+    portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return "No default portal found."
+
+    files = _list_pending_previews(portal_id)
+    if not files:
+        return "No pending previews to approve."
+
+    action_id = files[0].stem
+    return _handle_approve(action_id, working_dir)
+
+
+def _handle_reject_last(working_dir: str) -> str:
+    portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return "No default portal found."
+
+    files = _list_pending_previews(portal_id)
+    if not files:
+        return "No pending previews to reject."
+
+    action_id = files[0].stem
+    preview_data = _load_pending_preview(portal_id, action_id)
+    _clear_pending_preview(portal_id, action_id)
+
+    if preview_data:
+        return f"❌ Rejected preview {action_id} for {preview_data['agent_name']}."
+
+    return "No pending previews to reject."
+
+

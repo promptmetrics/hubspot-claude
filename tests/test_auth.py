@@ -1,3 +1,5 @@
+import urllib.parse
+
 import pytest
 import respx
 from httpx import Response
@@ -22,7 +24,9 @@ def test_get_authorization_url_with_credentials(tmp_path, monkeypatch):
     assert url.startswith("https://app.hubspot.com/oauth/authorize")
     assert "client_id=client-123" in url
     assert "crm.objects.contacts.read" in url
-    assert "state=123" in url
+    assert "state=" in url
+    assert "code_challenge=" in url
+    assert "code_challenge_method=S256" in url
 
 
 def test_get_authorization_url_no_credentials(tmp_path, monkeypatch):
@@ -49,7 +53,10 @@ async def test_exchange_code_for_token(respx_mock, monkeypatch, tmp_path):
         })
     )
 
-    result = await exchange_code_for_token("123", "auth-code-abc")
+    url = get_authorization_url("123", ["crm.objects.contacts.read"])
+    state = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["state"][0]
+
+    result = await exchange_code_for_token("123", "auth-code-abc", state)
     assert result["access_token"] == "new-access-token"
 
     portal = load_portal_config("123")
