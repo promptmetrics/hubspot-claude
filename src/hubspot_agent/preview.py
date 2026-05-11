@@ -2,9 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from hubspot_agent.plan import DAGPlan, PlanModification
-
-
 def render_field_diff(
     old_records: list[dict[str, Any]],
     new_records: list[dict[str, Any]],
@@ -99,81 +96,3 @@ def format_preview(
     return "\n".join(lines)
 
 
-def render_dag_plan(
-    plan: DAGPlan,
-    modification: PlanModification | None = None,
-) -> str:
-    """Render a DAGPlan as a markdown table for HITL approval.
-
-    Steps are shown in topological (execution) order so the user sees
-    the actual sequence the executor will follow.
-    """
-    from collections import deque
-
-    title = "Modified Execution Plan" if modification else "Execution Plan"
-    lines: list[str] = [
-        f"## {title}: {plan.plan_id}",
-        f"- **Overall Risk:** {plan.overall_risk.value.upper()}",
-        f"- **Estimated Duration:** {plan.estimated_duration_seconds}s",
-        f"- **Nodes:** {len(plan.nodes)} | **Edges:** {len(plan.edges)}",
-    ]
-
-    if modification and modification.skip_nodes:
-        lines.append(f"- **Skipped Nodes:** {', '.join(modification.skip_nodes)}")
-
-    lines.extend([
-        "",
-        "| Step | Agent | Action | Risk | Dependencies | Summary |",
-        "|------|-------|--------|------|--------------|---------|",
-    ])
-
-    # Build dependency map for display
-    dep_map: dict[str, list[str]] = {n.node_id: [] for n in plan.nodes}
-    for src, dst in plan.edges:
-        dep_map.setdefault(dst, []).append(src)
-
-    # Topological sort for rendering order
-    in_degree: dict[str, int] = {n.node_id: 0 for n in plan.nodes}
-    for src, dst in plan.edges:
-        if src in in_degree and dst in in_degree:
-            in_degree[dst] += 1
-
-    node_map = {n.node_id: n for n in plan.nodes}
-    queue = deque([nid for nid, deg in in_degree.items() if deg == 0])
-    sorted_ids: list[str] = []
-    adjacency: dict[str, list[str]] = {n.node_id: [] for n in plan.nodes}
-    for src, dst in plan.edges:
-        if src in adjacency:
-            adjacency[src].append(dst)
-
-    while queue:
-        current = queue.popleft()
-        sorted_ids.append(current)
-        for neighbor in adjacency[current]:
-            in_degree[neighbor] -= 1
-            if in_degree[neighbor] == 0:
-                queue.append(neighbor)
-
-    # Fallback: if cycle or incomplete sort, use original order
-    if len(sorted_ids) != len(plan.nodes):
-        sorted_ids = [n.node_id for n in plan.nodes]
-
-    for i, node_id in enumerate(sorted_ids, start=1):
-        node = node_map[node_id]
-        deps = ", ".join(dep_map.get(node.node_id, [])) or "None"
-        summary = node.payload_summary.get("text", "")[:60]
-        if len(summary) == 60:
-            summary += "..."
-
-        if modification and node.node_id in modification.parameter_edits:
-            edits = modification.parameter_edits[node.node_id]
-            edit_str = "; ".join(f"{k}={v}" for k, v in edits.items())
-            summary += f" **(EDITED: {edit_str})**"
-
-        lines.append(
-            f"| {i} | {node.agent} | {node.action} | {node.risk_level.value.upper()} | {deps} | {summary} |"
-        )
-
-    lines.append("")
-    lines.append("Approve this full plan to execute all steps in dependency order? (y/n)")
-    return "\n".join(lines)

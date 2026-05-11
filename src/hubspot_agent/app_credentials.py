@@ -34,7 +34,9 @@ def save_app_credentials(
     payload: dict[str, Any] = {"client_id": client_id, "client_secret": client_secret}
     if app_id is not None:
         payload["app_id"] = app_id
-    _credentials_file().write_text(json.dumps(payload, indent=2))
+    path = _credentials_file()
+    path.write_text(json.dumps(payload, indent=2))
+    path.chmod(0o600)
 
 
 def get_client_id() -> str | None:

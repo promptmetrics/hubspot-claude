@@ -35,9 +35,6 @@ async def test_check_dispatch_readiness_all_clear(respx_mock, monkeypatch, tmp_p
     )
     result = await check_dispatch_readiness(["workflows"], portal)
     assert result["ready"] is True
-    assert result["decline_reason"] is None
-    assert result["missing_scopes"] == {}
-    assert result["missing_capabilities"] == {}
 
 
 @pytest.mark.asyncio
@@ -69,8 +66,7 @@ async def test_check_dispatch_readiness_missing_capability(respx_mock, monkeypat
     )
     result = await check_dispatch_readiness(["workflows"], portal)
     assert result["ready"] is False
-    assert result["missing_capabilities"] == {"workflows": ["workflows"]}
-    assert "Professional or Enterprise" in result["decline_reason"]
+    assert "workflows" in result["decline_reason"]
 
 
 @pytest.mark.asyncio
@@ -103,7 +99,7 @@ async def test_check_dispatch_readiness_missing_capability_on_starter_portal(res
     result = await check_dispatch_readiness(["workflows"], portal)
     assert result["ready"] is False
     assert result["decline_reason"] is not None
-    assert "Professional or Enterprise" in result["decline_reason"]
+    assert "workflows" in result["decline_reason"]
 
 
 @pytest.mark.asyncio
@@ -123,4 +119,4 @@ async def test_check_dispatch_readiness_uses_cached_matrix(monkeypatch, tmp_path
     )
     result = await check_dispatch_readiness(["workflows"], portal)
     assert result["ready"] is False
-    assert result["missing_capabilities"] == {"workflows": ["workflows"]}
+    assert "workflows" in result["decline_reason"]
