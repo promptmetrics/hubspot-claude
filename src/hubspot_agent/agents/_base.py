@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from hubspot_agent.config import PortalConfig
+from hubspot_agent.research import RESEARCH_PROMPT_BLOCK
 from hubspot_agent.tools import ToolDef, list_tools
 
 SELF_CORRECTION_PROMPT_BLOCK = """\
@@ -106,6 +107,7 @@ def build_agent_prompt(
         f"- For write operations, confirm the action before executing.\n"
         f"- If the request is ambiguous, ask for clarification.\n"
         f"\n{SELF_CORRECTION_PROMPT_BLOCK}\n"
+        f"\n{RESEARCH_PROMPT_BLOCK}\n"
     )
     if has_write_tools:
         system_prompt += f"\n{REFLECTION_PROMPT_BLOCK}\n"
