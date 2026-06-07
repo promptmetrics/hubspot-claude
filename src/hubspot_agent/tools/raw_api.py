@@ -14,7 +14,7 @@ async def hubspot_raw_api(
     method: str,
     path: str,
     body: dict[str, Any] | None = None,
-    client: HubSpotClient = None,
+    client: HubSpotClient | None = None,
     portal_id: str = "",
     expected_scopes: list[str] | None = None,
 ) -> dict[str, Any]:

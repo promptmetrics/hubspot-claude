@@ -6,7 +6,7 @@ from typing import Any
 
 import httpx
 
-from hubspot_agent.client import HubSpotClient
+from hubspot_agent.client import APIResponse, HubSpotClient
 from hubspot_agent.errors import ErrorCategory, HubSpotError, RateLimitError
 
 
@@ -61,9 +61,11 @@ class ChaosHubSpotClient(HubSpotClient):
         method: str,
         path: str,
         portal_id: str,
-        body: dict[str, Any] | None = None,
+        body: Any | None = None,
         expected_scopes: list[str] | None = None,
-    ) -> Any:
+        data: dict[str, Any] | None = None,
+        files: dict[str, Any] | None = None,
+    ) -> APIResponse:
         fault = self._select_fault()
 
         if fault == "rate_limit":
@@ -83,7 +85,7 @@ class ChaosHubSpotClient(HubSpotClient):
 
         if fault == "truncation":
             return await self._request_with_truncation(
-                method, path, portal_id, body, expected_scopes
+                method, path, portal_id, body, expected_scopes, data, files
             )
 
         return await super()._request(method, path, portal_id, body, expected_scopes)
@@ -93,9 +95,11 @@ class ChaosHubSpotClient(HubSpotClient):
         method: str,
         path: str,
         portal_id: str,
-        body: dict[str, Any] | None = None,
+        body: Any | None = None,
         expected_scopes: list[str] | None = None,
-    ) -> Any:
+        data: dict[str, Any] | None = None,
+        files: dict[str, Any] | None = None,
+    ) -> APIResponse:
         await self._enforce_rate_limit()
         await self._get_fresh_token()
         kwargs: dict[str, Any] = {}
@@ -115,8 +119,8 @@ class ChaosHubSpotClient(HubSpotClient):
         original_request = self._client.request
         async def _fake_request(*args, **kwargs):
             return fake_resp
-        self._client.request = _fake_request
+        setattr(self._client, "request", _fake_request)
         try:
             return await super()._request(method, path, portal_id, body, expected_scopes)
         finally:
-            self._client.request = original_request
+            setattr(self._client, "request", original_request)

@@ -11,14 +11,67 @@ from typing import Any
 from hubspot_agent.capabilities import CapabilityMatrix, probe_portal, validate_capabilities
 from hubspot_agent.client import HubSpotClient
 from hubspot_agent.config import CONFIG_DIR, load_portal_config
+from hubspot_agent.dispatch import get_execute_dispatch, get_preview_builder, get_reconcile_dispatch
 from hubspot_agent.models import AgentResult, BatchApprovalMode, PreviewResult, RiskLevel, TaskIntent
+from hubspot_agent.persistence import clear as _clear_pending_preview
+from hubspot_agent.persistence import list_pending as _list_pending_previews
+from hubspot_agent.persistence import load as _load_pending_preview
+from hubspot_agent.persistence import store as _store_pending_preview
 from hubspot_agent.preview import format_preview
+from hubspot_agent.research import classify_url
 from hubspot_agent.tools import invoke_tool
 
 
+def _normalize_informing_sources(sources: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Validate and correct trust-tier assignments from sub-agents.
+
+    Sub-agents are expected to assign trust_tier using richer context
+    (accepted-answer flag, employee badge, post age). This function
+    catches obvious URL-vs-tier mismatches so the orchestrator can
+    override misreported tiers before they reach the user or audit log.
+    """
+    if not sources:
+        return []
+    normalized: list[dict[str, Any]] = []
+    for src in sources:
+        url = src.get("url", "")
+        inferred_source, inferred_tier = classify_url(url)
+        reported_tier = src.get("trust_tier", inferred_tier)
+        # If the reported tier contradicts what the URL alone supports,
+        # downgrade to the safest tier the URL can justify.
+        if inferred_source == "official" and reported_tier != "official":
+            # URL is official but agent said otherwise — fix it
+            corrected_tier = "official"
+        elif inferred_source == "community" and reported_tier == "official":
+            # Agent claimed official but URL is community — downgrade
+            corrected_tier = "community-unverified"
+        else:
+            corrected_tier = reported_tier
+        normalized.append(
+            {
+                "source": inferred_source,
+                "trust_tier": corrected_tier,
+                "title": src.get("title", ""),
+                "url": url,
+                "last_updated": src.get("last_updated"),
+            }
+        )
+    return normalized
+
+
 async def initialize_session(portal_id: str) -> None:
-    """Stub: portal setup will be re-integrated in Phase 1."""
-    pass
+    """Warm schema cache and reap expired pending previews for a portal."""
+    from hubspot_agent.cache import warm_standard_schemas, discover_custom_schemas
+    from hubspot_agent.config import load_portal_config
+    from hubspot_agent.persistence import reap_expired
+
+    portal_config = load_portal_config(portal_id)
+    if portal_config is None:
+        raise RuntimeError(f"No config for portal {portal_id}")
+
+    await warm_standard_schemas(portal_config)
+    await discover_custom_schemas(portal_config)
+    reap_expired(portal_id, max_age_hours=24)
 
 
 def parse_batch_mode(request: str) -> tuple[BatchApprovalMode, str]:
@@ -70,7 +123,7 @@ def route_request(request_text: str, portal_id: str | None = None) -> list[str]:
         "users": ["user", "team", "permission", "role", "owner", "assign"],
         "hygiene": ["duplicate", "clean", "merge", "deduplicate", "stale", "missing", "data quality"],
         "analytics": ["report", "dashboard", "metric", "analytics", "funnel", "conversion", "pipeline report"],
-        "associations": ["associate", "link", "relationship", "related", "linked", "connection"],
+        "associations": ["associate", "link", "relationship", "related", "linked", "connection", "associated with", "linked to", "related to"],
         "engagements": ["call", "email", "meeting", "note", "task", "activity", "log"],
         "custom_objects": ["custom object", "custom schema", "object schema"],
         "service": ["ticket pipeline", "knowledge base", "kb article", "feedback survey", "service automation"],
@@ -85,8 +138,18 @@ def route_request(request_text: str, portal_id: str | None = None) -> list[str]:
     if not scores:
         return []
 
-    best = sorted(scores, key=scores.get, reverse=True)
+    best = sorted(scores, key=lambda k: scores[k], reverse=True)
     primary_score = scores[best[0]]
+
+    # Cross-object association detection: if two object types appear with association language
+    _OBJECT_TYPES = {"contact", "contacts", "company", "companies", "deal", "deals", "ticket", "tickets"}
+    _ASSOC_PHRASES = {"associated with", "linked to", "related to", "at", "for"}
+    found_objs = {obj for obj in _OBJECT_TYPES if obj in text}
+    has_assoc_phrase = any(phrase in text for phrase in _ASSOC_PHRASES)
+    if len(found_objs) >= 2 and has_assoc_phrase:
+        # Force both associations + objects when cross-object language is detected
+        forced_agents = ["objects", "associations"]
+        return _order_by_dependencies(forced_agents)
 
     # Conjunction detection: if "and" links two high-scoring distinct domains
     has_conjunction = any(trigger in text for trigger in _SEQUENTIAL_TRIGGERS)
@@ -140,7 +203,7 @@ def _fast_path_route(request_text: str, portal_id: str | None = None) -> list[st
     if not scores:
         return None
 
-    best = sorted(scores, key=scores.get, reverse=True)
+    best = sorted(scores, key=lambda k: scores[k], reverse=True)
     primary_score = scores[best[0]]
     if len(best) > 1 and primary_score >= 2 * scores.get(best[1], 0):
         return [best[0]]
@@ -167,42 +230,6 @@ async def check_dispatch_readiness(agent_names: list[str], portal_config) -> dic
         return {"ready": True}
     reasons = [f"{agent}: {', '.join(missing)}" for agent, missing in blocked.items()]
     return {"ready": False, "decline_reason": "; ".join(reasons)}
-
-
-# ---------------------------------------------------------------------------
-# Pending preview storage
-# ---------------------------------------------------------------------------
-
-def _pending_previews_dir(portal_id: str) -> Path:
-    return CONFIG_DIR / portal_id / "pending_previews"
-
-
-def _store_pending_preview(portal_id: str, action_id: str, data: dict[str, Any]) -> None:
-    pending_dir = _pending_previews_dir(portal_id)
-    pending_dir.mkdir(parents=True, exist_ok=True)
-    file_path = pending_dir / f"{action_id}.json"
-    file_path.write_text(json.dumps(data, indent=2, default=str))
-    file_path.chmod(0o600)
-
-
-def _load_pending_preview(portal_id: str, action_id: str) -> dict[str, Any] | None:
-    file_path = _pending_previews_dir(portal_id) / f"{action_id}.json"
-    if not file_path.exists():
-        return None
-    return json.loads(file_path.read_text())
-
-
-def _clear_pending_preview(portal_id: str, action_id: str) -> None:
-    file_path = _pending_previews_dir(portal_id) / f"{action_id}.json"
-    if file_path.exists():
-        file_path.unlink()
-
-
-def _list_pending_previews(portal_id: str) -> list[Path]:
-    pending_dir = _pending_previews_dir(portal_id)
-    if not pending_dir.exists():
-        return []
-    return sorted(pending_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
 # ---------------------------------------------------------------------------
@@ -285,58 +312,30 @@ def _extract_search_term(intent: TaskIntent) -> str:
 # Preview engine
 # ---------------------------------------------------------------------------
 
+async def _fallback_preview(
+    agent_name: str,
+    intent: TaskIntent,
+    client: HubSpotClient,
+    portal_id: str,
+) -> PreviewResult:
+    """Generic preview when no agent-specific preview builder is registered."""
+    return PreviewResult(
+        preview={"message": f"{intent.intent_type} operation on {agent_name}"},
+        impact_count=intent.estimated_impact or 1,
+        risk_level=intent.risk_level,
+    )
+
+
 async def _build_preview_for_intent(
     agent_name: str,
     intent: TaskIntent,
     client: HubSpotClient,
     portal_id: str,
 ) -> PreviewResult:
-    if agent_name == "objects" and intent.target_object:
-        if intent.intent_type in ("search", "update", "delete"):
-            search_term = _extract_search_term(intent)
-            try:
-                result = await invoke_tool(
-                    "hubspot_search_objects",
-                    portal_id,
-                    object_type=intent.target_object,
-                    query={"query": search_term, "limit": 10, "properties": ["firstname", "lastname", "email", "name", "phone"]},
-                    client=client,
-                    portal_id=portal_id,
-                )
-            except Exception as exc:
-                return PreviewResult(
-                    preview={"error": str(exc)},
-                    impact_count=0,
-                    risk_level=intent.risk_level,
-                )
-            if "error" in result:
-                return PreviewResult(
-                    preview={"error": result["error"]},
-                    impact_count=0,
-                    risk_level=intent.risk_level,
-                )
-            records = result.get("results", [])
-            return PreviewResult(
-                preview={"records": records},
-                impact_count=len(records),
-                risk_level=intent.risk_level,
-                proposed_payload={},
-                original_values={r.get("id"): r.get("properties", {}) for r in records},
-            )
-
-        if intent.intent_type == "create":
-            return PreviewResult(
-                preview={"message": f"Will create a new {intent.target_object} record"},
-                impact_count=1,
-                risk_level=intent.risk_level,
-                proposed_payload={"object_type": intent.target_object, "properties": {}},
-            )
-
-    return PreviewResult(
-        preview={"message": f"{intent.intent_type} operation on {agent_name}"},
-        impact_count=intent.estimated_impact or 1,
-        risk_level=intent.risk_level,
-    )
+    builder = get_preview_builder(agent_name)
+    if builder is not None:
+        return await builder(agent_name, intent, client, portal_id)
+    return await _fallback_preview(agent_name, intent, client, portal_id)
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +352,7 @@ async def dispatch_agent(
     proposed_payload: dict[str, Any] | None = None,
 ) -> AgentResult:
     """Dispatch a single agent with preview or execute mode."""
-    from hubspot_agent.agents import get_agent_prompt
+    from hubspot_agent.agents import get_agent_category, get_agent_emoji, get_agent_prompt
 
     prompt = get_agent_prompt(agent_name, portal_config)
     if prompt is None:
@@ -361,6 +360,8 @@ async def dispatch_agent(
             agent_name=agent_name,
             status="error",
             error_message=f"Unknown agent: {agent_name}",
+            category=get_agent_category(agent_name),
+            emoji=get_agent_emoji(agent_name),
         )
 
     intent = _parse_agent_intent(agent_name, request_text)
@@ -373,6 +374,7 @@ async def dispatch_agent(
             )
 
             action_id = str(uuid.uuid4())[:8]
+            normalized_sources = _normalize_informing_sources(preview.informing_sources)
             preview_data = {
                 "agent_name": agent_name,
                 "request_text": request_text,
@@ -381,15 +383,30 @@ async def dispatch_agent(
                 "trace_id": trace_id,
                 "batch_mode": batch_mode.value,
                 "proposed_payload": proposed_payload or {},
+                "informing_sources": normalized_sources,
             }
             _store_pending_preview(portal_config.portal_id, action_id, preview_data)
 
-            preview_text = format_preview(
-                old_records=[],
-                new_records=[],
-                impact_count=preview.impact_count,
-                mode="summary",
-            )
+            # Build preview text from the agent's preview dict
+            if "message" in preview.preview:
+                preview_text = preview.preview["message"]
+            elif "records" in preview.preview:
+                record_count = len(preview.preview["records"])
+                preview_text = f"Found {record_count} records"
+                if record_count > 0:
+                    ids = [str(r.get("id", "?")) for r in preview.preview["records"][:5]]
+                    preview_text += f" (IDs: {', '.join(ids)})"
+                    if record_count > 5:
+                        preview_text += f" and {record_count - 5} more"
+            elif "error" in preview.preview:
+                preview_text = f"Error: {preview.preview['error']}"
+            else:
+                preview_text = format_preview(
+                    old_records=[],
+                    new_records=[],
+                    impact_count=preview.impact_count,
+                    mode="summary",
+                )
 
             return AgentResult(
                 agent_name=agent_name,
@@ -401,112 +418,39 @@ async def dispatch_agent(
                     "impact_count": preview.impact_count,
                     "full_prompt": prompt.system_prompt,
                 },
+                informing_sources=normalized_sources,
+                category=get_agent_category(agent_name),
+                emoji=get_agent_emoji(agent_name),
             )
 
         # Execute mode
-        if agent_name == "objects" and intent.target_object:
-            if intent.intent_type == "search":
-                search_term = _extract_search_term(intent)
-                result = await invoke_tool(
-                    "hubspot_search_objects",
-                    portal_config.portal_id,
-                    object_type=intent.target_object,
-                    query={"query": search_term, "limit": 10},
-                    client=client,
-                    portal_id=portal_config.portal_id,
-                )
+        execute_fn = get_execute_dispatch(agent_name)
+        if execute_fn is not None:
+            result_data = await execute_fn(
+                agent_name, intent, request_text, client, portal_config.portal_id, proposed_payload
+            )
+            if result_data.get("status") == "error":
                 return AgentResult(
                     agent_name=agent_name,
-                    status="success",
-                    data={"result": result},
+                    status="error",
+                    error_message=result_data.get("message", "Execution failed"),
+                    category=get_agent_category(agent_name),
+                    emoji=get_agent_emoji(agent_name),
                 )
-
-            if intent.intent_type == "create":
-                props = proposed_payload.get("properties", {}) if proposed_payload else {}
-                result = await invoke_tool(
-                    "hubspot_create_object",
-                    portal_config.portal_id,
-                    object_type=intent.target_object,
-                    properties=props,
-                    client=client,
-                    portal_id=portal_config.portal_id,
-                )
-                return AgentResult(
-                    agent_name=agent_name,
-                    status="success",
-                    data={"result": result},
-                )
-
-            if intent.intent_type == "update":
-                search_term = _extract_search_term(intent)
-                search_result = await invoke_tool(
-                    "hubspot_search_objects",
-                    portal_config.portal_id,
-                    object_type=intent.target_object,
-                    query={"query": search_term, "limit": 10},
-                    client=client,
-                    portal_id=portal_config.portal_id,
-                )
-                records = search_result.get("results", [])
-                if not records:
-                    return AgentResult(
-                        agent_name=agent_name,
-                        status="error",
-                        error_message="No matching records found to update.",
-                    )
-                object_id = records[0].get("id")
-                props = proposed_payload.get("properties", {}) if proposed_payload else {}
-                result = await invoke_tool(
-                    "hubspot_update_object",
-                    portal_config.portal_id,
-                    object_id=object_id,
-                    object_type=intent.target_object,
-                    properties=props,
-                    client=client,
-                    portal_id=portal_config.portal_id,
-                )
-                return AgentResult(
-                    agent_name=agent_name,
-                    status="success",
-                    data={"result": result},
-                )
-
-            if intent.intent_type == "delete":
-                search_term = _extract_search_term(intent)
-                search_result = await invoke_tool(
-                    "hubspot_search_objects",
-                    portal_config.portal_id,
-                    object_type=intent.target_object,
-                    query={"query": search_term, "limit": 10},
-                    client=client,
-                    portal_id=portal_config.portal_id,
-                )
-                records = search_result.get("results", [])
-                if not records:
-                    return AgentResult(
-                        agent_name=agent_name,
-                        status="error",
-                        error_message="No matching records found to delete.",
-                    )
-                object_id = records[0].get("id")
-                result = await invoke_tool(
-                    "hubspot_delete_object",
-                    portal_config.portal_id,
-                    object_id=object_id,
-                    object_type=intent.target_object,
-                    client=client,
-                    portal_id=portal_config.portal_id,
-                )
-                return AgentResult(
-                    agent_name=agent_name,
-                    status="success",
-                    data={"result": result},
-                )
+            return AgentResult(
+                agent_name=agent_name,
+                status="success",
+                data=result_data.get("data", {"message": result_data.get("message", "")}),
+                category=get_agent_category(agent_name),
+                emoji=get_agent_emoji(agent_name),
+            )
 
         return AgentResult(
             agent_name=agent_name,
             status="success",
             data={"message": f"Executed {agent_name} for: {request_text}"},
+            category=get_agent_category(agent_name),
+            emoji=get_agent_emoji(agent_name),
         )
     finally:
         await client.close()
@@ -535,3 +479,39 @@ async def dispatch_agents_parallel(
         for name in agent_names
     ]
     return await asyncio.gather(*coros)
+
+
+# ---------------------------------------------------------------------------
+# Post-timeout reconciliation
+# ---------------------------------------------------------------------------
+
+async def reconcile_after_timeout(
+    portal_id: str,
+    agent_name: str,
+    request_text: str,
+    expected_payload: dict[str, Any],
+    portal_config,
+) -> dict[str, Any]:
+    """Verify what was actually applied after a write-operation timeout.
+
+    Dispatches a lightweight read to compare expected vs actual state and
+    reports discrepancies. Used only for writes (create, update, delete).
+    """
+    client = HubSpotClient(portal_config)
+    try:
+        intent = _parse_agent_intent(agent_name, request_text)
+
+        reconcile_fn = get_reconcile_dispatch(agent_name)
+        if reconcile_fn is not None:
+            return await reconcile_fn(
+                agent_name, intent, request_text, client, portal_id, expected_payload
+            )
+
+        return {
+            "status": "unknown",
+            "message": f"Reconciliation not implemented for agent {agent_name}.",
+            "expected": expected_payload,
+            "actual": None,
+        }
+    finally:
+        await client.close()

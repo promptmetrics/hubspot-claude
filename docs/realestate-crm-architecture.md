@@ -35,7 +35,7 @@ Every object below earns its place by being something one of these loops needs t
 
 ## 3. Object model overview
 
-The full object model uses the four standard HubSpot objects plus five custom objects. Standard objects are battle-tested by HubSpot and benefit from native integrations; custom objects exist where standard objects can't represent the domain cleanly.
+The full object model uses the four standard HubSpot objects plus four custom objects and one native object. Standard objects are battle-tested by HubSpot and benefit from native integrations; custom objects exist where standard objects can't represent the domain cleanly. HubSpot provides a native `listings` object (type ID `0-420`) as of 2025+ — this should be used rather than creating a custom listings object, because the native object already has 47 standard properties (address, price, beds/baths, etc.) and integrates with HubSpot's property search and mapping features.
 
 The object inventory is:
 
@@ -45,7 +45,7 @@ The object inventory is:
 | Company | Standard | Every organization — partner brokerages, builders, lenders, title companies, HOAs, vendors | 200–800 |
 | Deal | Standard | A specific transaction (buy-side, sell-side, lease) moving through a pipeline | 250–400 |
 | Ticket | Standard | Service requests — pre-close issues, post-close support, repair coordination, complaints | 100–300 |
-| Listing (custom) | Custom | A specific physical property — survives any single deal, can be relisted, rented, or sold multiple times across years | 200–300 |
+| Listing | Native (0-420) | A specific physical property — survives any single deal, can be relisted, rented, or sold multiple times across years | 200–300 |
 | Showing (custom) | Custom | One scheduled tour of one Listing by one or more Contacts | 1,000–3,000 |
 | Offer (custom) | Custom | A formal written offer on a Listing, with terms and status | 400–800 |
 | Open House (custom) | Custom | A scheduled open-house event tied to a Listing | 150–300 |
@@ -237,31 +237,33 @@ Standard fields (subject, content, hs_pipeline, hs_pipeline_stage, hubspot_owner
 
 Each custom object below assumes Sales/Service Hub Enterprise or Operations Hub Pro+, which is required to create custom objects. The objects are listed in dependency order — Listing comes first because it's referenced by all the others.
 
-### 5.1 Listing (custom object)
+### 5.1 Listing (native object, type ID 0-420)
 
 The Listing represents one specific physical property — a deed, an address, a parcel. It exists from the moment your brokerage starts tracking the property (which can be before it's listed; "coming soon" or "off market" Listings are common) and persists across multiple Deals over years.
 
-**Why it's a custom object:** A Listing has its own properties (address, beds/baths, square footage, MLS number, photos, public remarks) that don't belong on any standard object. It outlives Deals: 123 Main might be sold in 2018, listed and withdrawn in 2024, sold again in 2026 — that's three Deals on one Listing. Searching for a Listing by address is a primary daily activity that needs to be fast.
+**Why it's the native object, not custom:** HubSpot introduced a native `listings` object (type ID `0-420`) with 47 standard properties including `hs_address_1`, `hs_city`, `hs_state_province`, `hs_zip`, `hs_bedrooms`, `hs_bathrooms`, `hs_square_footage`, `hs_price`, `hs_year_built`, and `hs_listing_type`. The native object integrates with HubSpot's property search, mapping, and standard reporting. Custom properties are added via `/crm/v3/properties/0-420` to fill in brokerage-specific fields (MLS number, listing status, commission offered, off-market flags). Attempting to create a custom "listings" object will fail with a name-conflict error.
 
 **Key business questions this object answers:** What's our active inventory? What's the median DOM by neighborhood? Which Listings have stalled — high showings but no offers? What's the property history of any address I'm typing into?
 
 **Properties:**
 
-Identity properties: `mls_number` (text, primary unique-id field), `property_address` (text, also unique-id-eligible), `unit_number` (text), `city` (text), `state` (single-select), `zip` (text), `county` (text), `subdivision` (text), `parcel_id` (text), `latitude` (number), `longitude` (number), `google_place_id` (text — for embedding maps).
+**Native properties (47 built-in, do not recreate):** `hs_name` (required, use address as display name), `hs_address_1`, `hs_address_2`, `hs_city`, `hs_state_province`, `hs_zip`, `hs_bedrooms`, `hs_bathrooms`, `hs_square_footage`, `hs_price`, `hs_year_built`, `hs_listing_type` (valid values: `house`, `townhouse`, `multi_family`, `condos_co_ops`, `lots_land`, `apartments`, `manufactured`).
 
-Property-attribute properties: `property_type` (single-select: Single Family, Condo, Townhome, Multi-Family 2-4, Multi-Family 5+, Mobile/Manufactured, Land, Commercial, New Construction, Co-op), `bedrooms` (number), `bathrooms_full` (number), `bathrooms_half` (number), `square_feet_living` (number), `square_feet_lot` (number), `year_built` (number), `garage_spaces` (number), `stories` (number), `pool` (yes/no), `waterfront` (yes/no), `hoa_fee` (currency), `hoa_frequency` (single-select: Monthly, Quarterly, Annually, None), `taxes_annual` (currency), `flood_zone` (yes/no).
+**Custom properties to add via API:** `mls_number` (text, primary unique-id field), `unit_number` (text), `county` (text), `subdivision` (text), `parcel_id` (text), `latitude` (number), `longitude` (number), `google_place_id` (text).
 
-Listing-status properties: `listing_status` (single-select: Coming Soon, Active, Active Under Contract / Backup, Pending, Sold, Withdrawn, Expired, Off-Market — Pre-Listing, Off-Market — Investor, Cancelled), `list_price` (currency), `original_list_price` (currency — captured at listing, never changed), `list_date` (date), `expiration_date` (date — listing agreement expires), `withdrawal_date` (date), `sold_date` (date), `sold_price` (currency), `days_on_market` (calculated = today - list_date for active, sold_date - list_date for sold), `price_per_square_foot` (calculated).
+`listing_status` (single-select: Coming Soon, Active, Active Under Contract / Backup, Pending, Sold, Withdrawn, Expired, Off-Market — Pre-Listing, Off-Market — Investor, Cancelled), `original_list_price` (number), `list_date` (date), `expiration_date` (date), `withdrawal_date` (date), `sold_date` (date), `sold_price` (number), `days_on_market` (number), `price_per_square_foot` (number).
 
-Listing-agreement properties: `listing_agent_contact_id` (labeled association), `co_listing_agent_contact_id` (labeled association), `listing_brokerage_company_id` (labeled association — your own brokerage in most cases), `listing_commission_offered_buyer_side` (percent), `listing_commission_offered_seller_side` (percent), `seller_contact_id` (labeled association — the homeowner; multiple labels for joint owners).
+`listing_agent_contact_id` (text), `co_listing_agent_contact_id` (text), `listing_brokerage_company_id` (text), `listing_commission_offered_buyer_side` (number), `listing_commission_offered_seller_side` (number), `seller_contact_id` (text).
 
-Marketing properties: `professional_photos_url` (text, link to Dropbox/Google Drive folder), `virtual_tour_url` (text), `mls_remarks_public` (long-text), `mls_remarks_agent` (long-text), `marketing_started_date` (date), `signage_installed_date` (date).
+`professional_photos_url` (text), `virtual_tour_url` (text), `mls_remarks_public` (textarea), `mls_remarks_agent` (textarea), `marketing_started_date` (date), `signage_installed_date` (date).
 
-Activity rollup properties (populated by workflows): `total_showings_count` (number, rollup from Showings), `total_offers_count` (number, rollup from Offers), `last_showing_date` (date, rollup), `total_open_houses_count` (number, rollup), `last_price_change_date` (date), `price_changes_count` (number).
+`total_showings_count` (number), `total_offers_count` (number), `last_showing_date` (date), `total_open_houses_count` (number), `last_price_change_date` (date), `price_changes_count` (number).
 
-Investor / off-market properties: `is_off_market` (yes/no), `off_market_reason` (single-select: Pre-Listing, Pocket Listing, Investor Hold, FSBO Watch, Foreclosure Watch, Probate Watch, Distressed, Expired Listing — Working Owner), `estimated_arv` (currency, after-repair value for investors), `estimated_rehab_cost` (currency), `current_owner_contact_id` (labeled association — for off-market deals where the owner isn't yet a seller).
+`is_off_market` (bool), `off_market_reason` (single-select: Pre-Listing, Pocket Listing, Investor Hold, FSBO Watch, Foreclosure Watch, Probate Watch, Distressed, Expired Listing — Working Owner), `estimated_arv` (number), `estimated_rehab_cost` (number), `current_owner_contact_id` (text).
 
-### 5.2 Showing (custom object)
+**Important:** All custom properties must be created in property group `listing_information` (with underscore). The native object ships with zero custom property groups, so this group must be created first or the property creation will fail.
+
+### 5.2 Showing (custom object, type ID 2-202484491)
 
 A Showing is one event: one Listing, one or more Contacts, one specific date and time. Tracking each showing is what lets you measure conversion (showings per offer, showings per close), capture buyer feedback, and report on listing-agent activity.
 
@@ -279,7 +281,7 @@ Outcome properties: `feedback_received` (yes/no), `feedback_rating` (single-sele
 
 Conversion properties: `resulted_in_offer` (yes/no — set by workflow when an Offer is created on the same Listing by the same Contact), `resulted_in_offer_id` (labeled association to the Offer when applicable).
 
-### 5.3 Offer (custom object)
+### 5.3 Offer (custom object, type ID 2-202484492)
 
 An Offer is a formal written offer made on a Listing. Every Listing typically receives multiple Offers — many Listings receive 5–15 in hot markets — and only one becomes a Deal. Tracking each Offer separately gives the seller a full negotiation history and lets the brokerage report on offer activity that never converted.
 
@@ -301,7 +303,7 @@ Associations: `listing_id` (labeled association — the property being offered o
 
 Win/loss properties: `lost_to_competing_offer_id` (labeled association — when rejected because another offer won), `lost_reason` (single-select: Price Too Low, Bad Terms, Contingencies Too Heavy, Closing Date Mismatch, Buyer Not Pre-Approved, Other Offer Accepted, Withdrawn by Buyer, Other).
 
-### 5.4 Open House (custom object)
+### 5.4 Open House (custom object, type ID 2-202481647)
 
 An Open House is a scheduled event where a Listing is open to the public for a window of time. Each Open House has its own set of attendees and produces leads.
 
@@ -319,7 +321,7 @@ Outcomes: `attendee_count` (number), `sign_ins_collected` (number), `qualified_l
 
 Associations: `listing_id` (labeled association), `host_agent_contact_ids` (labeled association — hosting agent(s); on-floor agents often co-host), `attendee_contact_ids` (labeled association — every sign-in becomes a Contact and gets associated here).
 
-### 5.5 Commission (custom object)
+### 5.5 Commission (custom object, type ID 2-202481648)
 
 A Commission represents the money side of a closed Deal — the gross commission earned, how it's split among agents and the brokerage, and any referral fees deducted.
 
@@ -439,7 +441,9 @@ Contact ↔ Contact (labeled, M:N) captures relationships among people. Labels: 
 
 Contact ↔ Deal (labeled, M:N) captures every person involved in a transaction. Labels: Buyer, Co-Buyer, Seller, Co-Seller, Buyer's Agent, Listing Agent, Co-Listing Agent, Cooperating Agent, Buyer's Lender — Loan Officer, Buyer's Attorney, Seller's Attorney, Title Officer, Inspector, Appraiser, Photographer, Stager, Other Vendor. Multi-select labels allow one Contact to play multiple roles on one Deal (e.g., spouse who is also co-buyer).
 
-Contact ↔ Listing (labeled, M:N). Labels: Seller / Owner, Co-Owner, Listing Agent, Co-Listing Agent, Buyer Interested, Buyer Showed Property, Buyer Made Offer, Buyer Closed, Past Owner, Tenant. The Buyer Interested / Showed / Made Offer / Closed progression is what powers "show me everyone who has ever engaged with this property."
+Contact ↔ Listing (labeled, M:N). Labels: Seller / Owner, Co-Owner, Listing Agent, Co-Listing Agent, **Agent** (for internal agents representing the listing), **Buyer**, Buyer Interested, Buyer Showed Property, Buyer Made Offer, Buyer Closed, Past Owner, Tenant. The Buyer Interested / Showed / Made Offer / Closed progression is what powers "show me everyone who has ever engaged with this property."
+
+**Custom labels created during implementation:** `Agent` (typeId 197, contact→listing) / `Represented By Agent` (typeId 198, listing→contact); `Buyer` (typeId 199, contact→listing) / `Bought By` (typeId 200, listing→contact).
 
 Contact ↔ Ticket (labeled, M:N). Labels: Reporter, Subject Of, Vendor Assigned, Resolver.
 
@@ -492,7 +496,7 @@ Pipelines are stages that a Deal (or Ticket) moves through. Lifecycle stages are
 
 ### 8.1 Buyer Pipeline (Deal pipeline)
 
-Stages are linear; a Deal can move backward (e.g., from Under Contract back to Active Search if the deal falls through and the buyer keeps looking). Each stage has a probability used for forecasting, calibrated quarterly.
+Pipeline ID: `3802390752`. Stages are linear; a Deal can move backward (e.g., from Under Contract back to Active Search if the deal falls through and the buyer keeps looking). Each stage has a probability used for forecasting, calibrated quarterly.
 
 **New Buyer Lead** (5%) — Lead has been captured but no real conversation has happened. Workflow auto-creates a "first-contact-in-5-minutes" task.
 
@@ -522,6 +526,8 @@ Stages are linear; a Deal can move backward (e.g., from Under Contract back to A
 
 ### 8.2 Seller Pipeline (Deal pipeline)
 
+Pipeline ID: `3802299622`.
+
 **New Seller Lead** (5%) — Inbound seller interest.
 
 **Listing Appointment Scheduled** (15%) — Listing presentation on the calendar.
@@ -549,6 +555,8 @@ Stages are linear; a Deal can move backward (e.g., from Under Contract back to A
 Lower-stakes, higher-volume version of the Buyer Pipeline. Stages: New Tenant Lead → Application Received → Application Approved → Lease Signed → Move-In Scheduled → Active Lease → Renewed / Moved Out. The Active Lease stage is a long-running parking lot — a Deal can sit there for a year or more — which is unusual for HubSpot but acceptable; the alternative (closing the Deal and reopening at renewal) loses continuity.
 
 ### 8.4 Investor / Off-Market Pipeline (Deal pipeline, optional)
+
+Pipeline ID: `3802390753`.
 
 For brokerages that work investors. Stages: Investor Lead → Property Identified → LOI Submitted → Under Contract → Due Diligence → Closing → Closed.
 
@@ -584,7 +592,9 @@ The standard HubSpot lifecycle stages are kept, with brokerage-specific definiti
 
 ## 9. Automations and workflows
 
-Workflows are where the structured data above becomes operational leverage. The set below is the minimum recommended starting point; brokerages typically run 50–150 workflows once mature.
+**API limitation:** As of 2025–2026, HubSpot does **not** expose a public POST endpoint for creating workflows or reports via API. The V4 Flows API (`/automation/v4/flows`) exists for graph-based automations but requires an entirely different payload structure from the UI builder and is not production-ready for complex real estate workflows. All workflows must be built manually in the HubSpot UI.
+
+A companion document (`docs/WORKFLOWS_AND_REPORTS_SETUP_GUIDE.md`) provides the exact configuration for each workflow: trigger, enrollment criteria, actions, and branching logic, ready to be copied into the UI. The set below is the minimum recommended starting point; brokerages typically run 50–150 workflows once mature.
 
 ### 9.1 Lead-routing and speed-to-lead
 
@@ -640,7 +650,9 @@ Daily workflow: find Contacts with no `hubspot_owner_id` and route them. Weekly 
 
 ## 10. Reporting and dashboards
 
-A useful HubSpot real estate report set is built from properties on the objects above; nothing in this section requires custom code, only saved views and dashboards.
+**API limitation:** As of 2025–2026, HubSpot does **not** expose a public POST endpoint for creating custom reports or dashboards. The Custom Report Builder and Dashboard UI must be used. A companion document (`docs/WORKFLOWS_AND_REPORTS_SETUP_GUIDE.md`) provides the exact data source, metrics, filters, and visualization type for each report, ready to be recreated in the UI.
+
+A useful HubSpot real estate report set is built from properties on the objects above; nothing in this section requires custom code beyond the manual UI setup.
 
 The **Pipeline Health Dashboard** shows current weighted pipeline by Buyer Pipeline and Seller Pipeline, projected close in next 30/60/90 days, average days in each stage (a leading indicator of bottlenecks), conversion rate stage-to-stage, and reason-lost breakdown for the trailing 90 days.
 
@@ -708,4 +720,89 @@ A clear-eyed view of where HubSpot is the system of record vs. where it's a down
 
 ## 14. Summary
 
-This architecture extends HubSpot's standard four-object model with five custom objects (Listings, Showings, Offers, Open Houses, Commissions) to cover every aspect of a residential real estate brokerage's operation. The model treats *people* as Contacts with role-flagged personas, *organizations* as Companies, *transactions* as Deals across four pipelines (Buyer, Seller, Lease, Investor), *physical properties* as long-lived Listings that survive any single transaction, *touring* as Showings, *offer activity* as Offers (separate from Deals so the pipeline reflects only contract-stage transactions), *marketing events* as Open Houses, *money* as Commissions with split tracking, and *issues* as Tickets across two pipelines (Transaction Coordination and Client Service). Every object hangs the full HubSpot engagement set — Notes, Tasks, Calls, Meetings, Emails, SMS — with conventions documented per object, and labeled associations wire them into a navigable graph that supports reporting on pipeline health, listing performance, lead-source ROI, agent performance, service quality, and the referral engine. A 12-week phased rollout sequences standard objects first, custom objects second, and reports last, with explicit decision points called out for the brokerage's MLS integration, internal-agent representation, co-buyer modeling, commission complexity, investor practice, and compliance retention.
+This architecture extends HubSpot's standard four-object model with four custom objects (Showings, Offers, Open Houses, Commissions) and one native object (Listings) to cover every aspect of a residential real estate brokerage's operation. The model treats *people* as Contacts with role-flagged personas, *organizations* as Companies, *transactions* as Deals across four pipelines (Buyer, Seller, Lease, Investor), *physical properties* as long-lived Listings that survive any single transaction, *touring* as Showings, *offer activity* as Offers (separate from Deals so the pipeline reflects only contract-stage transactions), *marketing events* as Open Houses, *money* as Commissions with split tracking, and *issues* as Tickets across two pipelines (Transaction Coordination and Client Service). Every object hangs the full HubSpot engagement set — Notes, Tasks, Calls, Meetings, Emails, SMS — with conventions documented per object, and labeled associations wire them into a navigable graph that supports reporting on pipeline health, listing performance, lead-source ROI, agent performance, service quality, and the referral engine. A 12-week phased rollout sequences standard objects first, custom objects second, and reports last, with explicit decision points called out for the brokerage's MLS integration, internal-agent representation, co-buyer modeling, commission complexity, investor practice, and compliance retention.
+
+---
+
+## 15. Implementation Notes (Post-Build Corrections)
+
+This section captures corrections, discoveries, and decisions made during the actual build in portal `148408595` that differ from the original architecture document.
+
+### 15.1 Object Model
+
+- **Listing is native, not custom.** HubSpot object type ID `0-420`. It has 47 built-in properties. Do not attempt to create a custom "listings" object — it will conflict.
+- **Custom object type IDs assigned:** Showings `2-202484491`, Offers `2-202484492`, Open Houses `2-202481647`, Commissions `2-202481648`.
+
+### 15.2 Property Corrections
+
+- **Native listing properties** (do not recreate): `hs_name` (required), `hs_address_1`, `hs_address_2`, `hs_city`, `hs_state_province`, `hs_zip`, `hs_bedrooms`, `hs_bathrooms`, `hs_square_footage`, `hs_price`, `hs_year_built`, `hs_listing_type`.
+- **Valid `hs_listing_type` values** (lowercase): `house`, `townhouse`, `multi_family`, `condos_co_ops`, `lots_land`, `apartments`, `manufactured`.
+- **Custom property group** for listings: `listing_information` (underscore, not camelCase). The native object has zero custom property groups initially; this group must be created first.
+- **`contact_role` valid values** (enumeration): Buyer, Seller, Tenant, Landlord, Investor, Past Client, Sphere of Influence, Referral Partner, Vendor, Attorney, Lender Loan Officer, Title Officer, Inspector, Appraiser, Photographer, Stager, Contractor, Internal Agent. "Other Agent" is not valid — use "Internal Agent".
+- **`company_type` valid value** for brokerages: "Brokerage (Cooperating)" (not "Brokerage").
+- **`buyer_qualification_status` valid values**: Not Qualified, Pre-Qualified, Pre-Approved, Cash Buyer, Lost — Couldn't Qualify. "Not Started" is not valid.
+- **`ticket_category` valid values**: Transaction Document, Inspection Repair, Closing Issue, Post-Close Repair, Home Warranty Claim, Vendor Coordination, Client Complaint, Compliance Issue, Lead Routing Issue, Other. "Inspection Issue" is not valid.
+- **`offer_status` valid values**: Submitted, Countered, Counter-Submitted, Accepted, Rejected, Withdrawn, Expired. "Pending" is not valid.
+- **`offer_type` valid values**: Initial, Counter, Best-and-Final, Backup. "Purchase" is not valid.
+- **`showing_type` valid values**: Private Showing, Open House Attendance, Virtual Showing, Second Showing, Final Walkthrough, Inspection Walkthrough. "Open House" is not valid.
+- **`feedback_rating` valid values** (enumeration): Loved It, Liked It, Neutral, Didn't Like, Hated It. Numeric values like "4" are rejected.
+- **`commission_split_basis` valid values**: Gross, Net After Brokerage Cut. "50/50 Split" is not valid.
+- **`payment_status` valid values**: Pending Close, Awaiting CDA, Pending Disbursement, Paid, Disputed, Refunded. "Pending" is not valid.
+- **`event_type` valid values**: Public Open House, Broker's Open, Twilight Tour, Caravan. "Open House" is not valid.
+- **`marketing_channels_used` valid values** (multi-select): MLS, Zillow, Realtor.com, Facebook Ad, Instagram Post, Yard Signs, Direct Mail, Email Blast, Door Knocking. Free-text comma-separated values are rejected.
+
+### 15.3 Pipeline IDs (Portal 148408595)
+
+| Pipeline | ID |
+|---|---|
+| Buyer Pipeline | `3802390752` |
+| Seller Pipeline | `3802299622` |
+| Investor Pipeline | `3802390753` |
+| Ticket Pipeline | `0` (default) |
+
+### 15.4 Lists
+
+Created 18 lists via API (`/crm/v3/lists`):
+- 10 manual lists (`MANUAL` processing type): `[RE] All Buyers`, `[RE] All Sellers`, `[RE] Past Clients`, `[RE] Sphere of Influence`, `[RE] Investors`, `[RE] Referral Partners`, `[RE] Active Listings`, `[RE] Open House Attendees`, `[RE] Pending Commissions`, `[RE] Preferred Vendors`.
+- 8 dynamic lists (`DYNAMIC` processing type with `filterBranch`): `[RE] Active Buyers — Touring`, `[RE] Hot Leads — 0-30 Days`, `[RE] Nurture — 12+ Months`, `[RE] Stale Listings — 21+ DOM`, `[RE] Under Contract — Buyer Side`, `[RE] Under Contract — Seller Side`, `[RE] Closed Won — This Quarter`, `[RE] Customers for Anniversary`.
+
+**Key discovery:** The Lists API uses `MANUAL` (not `STATIC`) for static lists, and requires a root `filterBranchType: "OR"` wrapping nested `AND` branches.
+
+### 15.5 Workflows and Reports
+
+- **Workflows cannot be created via API.** The V4 Flows API (`/automation/v4/flows`) uses a graph-based format (nodes, edges, `actionTypeId`) that is completely different from the UI builder. All 15 workflows must be built manually in the HubSpot UI. A manual setup guide (`docs/WORKFLOWS_AND_REPORTS_SETUP_GUIDE.md`) documents each trigger, action, and branch.
+- **Reports and dashboards cannot be created via API.** No public POST endpoint exists. All 14 reports across 6 dashboards must be built manually in the Custom Report Builder UI. The setup guide documents data source, metrics, filters, and visualization for each.
+
+### 15.6 Associations
+
+**Custom association definitions created** (via `/crm/v4/associations/{from}/{to}/labels`):
+- Showings ↔ Listings: `Showing For Listing` / `Has Showing`
+- Contacts ↔ Showings: `Attended Showing` / `Attendee`
+- Offers ↔ Listings: `Offer For Listing` / `Has Offer`
+- Contacts ↔ Offers: `Made Offer` / `Offered By`
+- Commissions ↔ Deals: `Commission For Deal` / `Has Commission`
+- Open Houses ↔ Listings: `Open House For Listing` / `Has Open House`
+
+**New custom labels for contacts→listings:**
+- `Agent` (typeId 199, contact→listing) / `Represented By Agent` (typeId 200, listing→contact)
+- `Buyer` (typeId 201, contact→listing) / `Bought By` (typeId 202, listing→contact)
+
+### 15.7 Engagements
+
+All engagement types require `hs_timestamp` (datetime in ISO 8601 format). Without it, the API returns: `Error creating NOTE/TASK/MEETING_EVENT/CALL/EMAIL. Some required properties were not set. Properties: [hs_timestamp].`
+
+Valid `hs_meeting_outcome` values: `SCHEDULED`, `COMPLETED`, `RESCHEDULED`, `NO_SHOW`, `CANCELED` (all uppercase).
+
+### 15.8 Sample Data
+
+A sample data script (`scripts/build_sample_data.py`) creates 8 contacts, 2 companies, 2 listings, 3 deals, 2 tickets, 2 showings, 1 offer, 1 commission, 1 open house, 18 associations, and 5 engagements. It includes duplicate detection via the search API and uses only confirmed valid enum values.
+
+**Duplicate detection required:** Emily Davis and several other contacts existed from prior runs. The script skips existing records by searching via email, name, or MLS number before creation.
+
+### 15.9 Build Scripts
+
+All automation scripts live in `scripts/`:
+- `fix_native_listings_properties.py` — adds 40 custom properties to native listings
+- `build_realestate_lists.py` — creates 18 manual and dynamic lists
+- `build_sample_data.py` — creates sample records, associations, and engagements
+- `docs/WORKFLOWS_AND_REPORTS_SETUP_GUIDE.md` — manual setup instructions for 15 workflows and 14 reports

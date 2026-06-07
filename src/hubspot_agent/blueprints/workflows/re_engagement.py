@@ -6,32 +6,50 @@ from hubspot_agent.blueprints.workflows import WorkflowBlueprint, register_bluep
 
 
 def _build(params: dict[str, Any]) -> dict[str, Any]:
-    from_email = params.get("from_email", "")
     inactive_days = params.get("inactive_days", 90)
     subject = params.get("subject", "We miss you!")
     body = params.get("body", "It's been a while — here's what's new.")
-    actions: list[dict[str, Any]] = [
-        {
-            "type": "DELAY",
-            "properties": {"delay": {"unit": "DAYS", "amount": inactive_days}},
-        },
-        {
-            "type": "SEND_EMAIL",
-            "properties": {
-                "from_email": from_email,
-                "subject": subject,
-                "body": body,
+    return {
+        "ui_path": "Settings > Automation > Workflows > Create workflow",
+        "object_type": "Contact-based",
+        "enrollment": {
+            "type": "PROPERTY_BASED",
+            "filter_branch": {
+                "filterBranchType": "OR",
+                "filterBranches": [
+                    {
+                        "filterBranchType": "AND",
+                        "filters": [
+                            {
+                                "filterType": "PROPERTY",
+                                "property": "last_engagement_date",
+                                "operation": {
+                                    "operationType": "ALL_PROPERTY",
+                                    "operator": "IS_KNOWN",
+                                    "includeObjectsWithNoValueSet": False,
+                                },
+                            }
+                        ],
+                    }
+                ],
             },
         },
-    ]
-    return {
-        "name": params.get("name", "Re-engagement Campaign"),
-        "type": "CONTACT_FLOW",
-        "actions": actions,
-        "enrollment": {
-            "type": "LIST_BASED",
-            "list_id": params.get("list_id"),
-        },
+        "actions": [
+            {
+                "step": 1,
+                "ui_action": "Delay",
+                "fields": {"Delay for": f"{inactive_days} days"},
+            },
+            {
+                "step": 2,
+                "ui_action": "Send internal email notification",
+                "fields": {"Subject": subject, "Body": body},
+            },
+        ],
+        "prerequisites": [
+            "Contact property 'last_engagement_date' is active",
+        ],
+        "validation": ["Create a test contact with last_engagement_date set", "Verify email sent after delay"],
     }
 
 
@@ -42,11 +60,9 @@ register_blueprint(
         tags=["email", "contact", "retention"],
         parameter_schema={
             "name": {"type": "string", "default": "Re-engagement Campaign", "description": "Workflow name"},
-            "from_email": {"type": "string", "required": True, "description": "Sender email address"},
             "inactive_days": {"type": "integer", "default": 90, "description": "Days of inactivity before email is sent"},
             "subject": {"type": "string", "default": "We miss you!", "description": "Email subject line"},
             "body": {"type": "string", "default": "It's been a while — here's what's new.", "description": "Email body"},
-            "list_id": {"type": "string", "required": True, "description": "Enrollment list ID"},
         },
         build=_build,
     )

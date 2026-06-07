@@ -54,106 +54,92 @@ def test_register_blueprint():
 
 class TestWelcomeEmailBlueprint:
     def test_build_defaults(self):
-        payload = build_welcome_email({
-            "from_email": "noreply@example.com",
-            "list_id": "123",
-        })
-        assert payload["name"] == "Welcome Email"
-        assert payload["type"] == "CONTACT_FLOW"
-        assert len(payload["actions"]) == 2
-        assert payload["actions"][0]["type"] == "DELAY"
-        assert payload["actions"][1]["type"] == "SEND_EMAIL"
-        assert payload["enrollment"]["list_id"] == "123"
+        payload = build_welcome_email({})
+        assert payload["object_type"] == "Contact-based"
+        assert len(payload["actions"]) == 1
+        assert payload["actions"][0]["ui_action"] == "Send internal email notification"
+        assert payload["actions"][0]["fields"]["Subject"] == "Welcome!"
+        assert payload["enrollment"]["type"] == "EVENT_BASED"
 
     def test_build_custom_params(self):
         payload = build_welcome_email({
-            "name": "Custom Welcome",
-            "from_email": "hi@example.com",
             "delay_hours": 2,
             "subject": "Hello!",
             "body": "Welcome aboard.",
-            "list_id": "456",
         })
-        assert payload["name"] == "Custom Welcome"
-        assert payload["actions"][0]["properties"]["delay"]["amount"] == 2
-        assert payload["actions"][1]["properties"]["subject"] == "Hello!"
+        assert payload["object_type"] == "Contact-based"
+        assert len(payload["actions"]) == 2
+        assert payload["actions"][0]["ui_action"] == "Delay"
+        assert payload["actions"][0]["fields"]["Delay for"] == "2 hours"
+        assert payload["actions"][1]["ui_action"] == "Send internal email notification"
+        assert payload["actions"][1]["fields"]["Subject"] == "Hello!"
 
 
 class TestLeadScoringBlueprint:
     def test_build_defaults(self):
         payload = build_lead_scoring({})
-        assert payload["name"] == "Lead Scoring"
-        assert payload["type"] == "CONTACT_FLOW"
+        assert payload["object_type"] == "Contact-based"
         assert len(payload["actions"]) == 2
-        assert payload["actions"][0]["type"] == "SET_PROPERTY"
-        assert payload["actions"][1]["type"] == "BRANCH"
+        assert payload["actions"][0]["ui_action"] == "Set property value"
+        assert payload["actions"][1]["ui_action"] == "If/then branch"
 
     def test_build_no_threshold(self):
         payload = build_lead_scoring({"threshold": 0})
         assert len(payload["actions"]) == 1
-        assert payload["actions"][0]["type"] == "SET_PROPERTY"
+        assert payload["actions"][0]["ui_action"] == "Set property value"
 
     def test_build_custom_params(self):
         payload = build_lead_scoring({
             "score_property": "mycustomscore",
             "increment": 5,
             "threshold": 100,
-            "event": "FORM_SUBMISSION",
         })
         set_action = payload["actions"][0]
-        assert set_action["properties"]["property"] == "mycustomscore"
-        assert "+ 5" in set_action["properties"]["value"]
-        assert payload["enrollment"]["event"] == "FORM_SUBMISSION"
+        assert set_action["fields"]["Property"] == "mycustomscore"
+        assert set_action["fields"]["Value"] == "5"
+        assert payload["enrollment"]["type"] == "PROPERTY_BASED"
 
 
 class TestDealStageTaskBlueprint:
     def test_build_defaults(self):
         payload = build_deal_stage_task({})
-        assert payload["name"] == "Deal Stage Task"
-        assert payload["type"] == "DEAL_FLOW"
+        assert payload["object_type"] == "Deal-based"
         assert len(payload["actions"]) == 1
-        assert payload["actions"][0]["type"] == "CREATE_TASK"
-        assert payload["enrollment"]["property"] == "dealstage"
-        assert payload["enrollment"]["value"] == "qualifiedtobuy"
+        assert payload["actions"][0]["ui_action"] == "Create task"
+        assert payload["enrollment"]["type"] == "PROPERTY_BASED"
 
     def test_build_custom_params(self):
         payload = build_deal_stage_task({
             "stage": "closedwon",
             "task_title": "Close celebration",
             "due_days": 3,
-            "assignee": "user_42",
         })
-        assert payload["enrollment"]["value"] == "closedwon"
-        task = payload["actions"][0]["properties"]
-        assert task["title"] == "Close celebration"
-        assert task["due_date"] == "{timestamp + 3d}"
-        assert task["assignee"] == "user_42"
+        fb = payload["enrollment"]["filter_branch"]["filterBranches"][0]["filters"][0]
+        assert fb["property"] == "dealstage"
+        assert fb["operation"]["values"] == ["closedwon"]
+        task = payload["actions"][0]["fields"]
+        assert task["Title"] == "Close celebration"
+        assert task["Due date"] == "{timestamp + 3d}"
 
 
 class TestReEngagementBlueprint:
     def test_build_defaults(self):
-        payload = build_re_engagement({
-            "from_email": "team@example.com",
-            "list_id": "789",
-        })
-        assert payload["name"] == "Re-engagement Campaign"
-        assert payload["type"] == "CONTACT_FLOW"
+        payload = build_re_engagement({})
+        assert payload["object_type"] == "Contact-based"
         assert len(payload["actions"]) == 2
-        assert payload["actions"][0]["properties"]["delay"]["amount"] == 90
-        assert payload["actions"][1]["properties"]["subject"] == "We miss you!"
+        assert payload["actions"][0]["ui_action"] == "Delay"
+        assert payload["actions"][0]["fields"]["Delay for"] == "90 days"
+        assert payload["actions"][1]["fields"]["Subject"] == "We miss you!"
 
     def test_build_custom_params(self):
         payload = build_re_engagement({
-            "name": "Winback",
-            "from_email": "win@example.com",
             "inactive_days": 60,
             "subject": "Come back!",
             "body": "We have new features.",
-            "list_id": "999",
         })
-        assert payload["name"] == "Winback"
-        assert payload["actions"][0]["properties"]["delay"]["amount"] == 60
-        assert payload["actions"][1]["properties"]["body"] == "We have new features."
+        assert payload["object_type"] == "Contact-based"
+        assert payload["actions"][0]["fields"]["Delay for"] == "60 days"
+        assert payload["actions"][1]["fields"]["Body"] == "We have new features."
 
 
 class TestBlueprintContext:
@@ -167,7 +153,6 @@ class TestBlueprintContext:
 
     def test_build_blueprint_context_shows_parameters(self):
         ctx = build_blueprint_context()
-        assert "from_email" in ctx
         assert "delay_hours" in ctx
         assert "score_property" in ctx
 

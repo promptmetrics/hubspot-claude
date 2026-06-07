@@ -11,43 +11,64 @@ def _build(params: dict[str, Any]) -> dict[str, Any]:
     threshold = params.get("threshold", 50)
     actions: list[dict[str, Any]] = [
         {
-            "type": "SET_PROPERTY",
-            "properties": {
-                "property": score_property,
-                "value": f"{{contact.{score_property} + {increment}}}",
-            },
+            "step": 1,
+            "ui_action": "Set property value",
+            "fields": {"Property": score_property, "Value": str(increment)},
         },
     ]
     if threshold:
         actions.append(
             {
-                "type": "BRANCH",
-                "properties": {
-                    "condition": {
-                        "field": score_property,
-                        "operator": "IS_GREATER_THAN",
-                        "value": threshold,
-                    },
-                    "true_actions": [
-                        {
-                            "type": "SET_PROPERTY",
-                            "properties": {
-                                "property": "lifecyclestage",
-                                "value": "marketingqualifiedlead",
-                            },
-                        }
-                    ],
+                "step": 2,
+                "ui_action": "If/then branch",
+                "fields": {
+                    "Condition property": score_property,
+                    "Operator": "is greater than",
+                    "Value": str(threshold),
                 },
+                "true_branch": [
+                    {
+                        "ui_action": "Set property value",
+                        "fields": {
+                            "Property": "lifecyclestage",
+                            "Value": "marketingqualifiedlead",
+                        },
+                    }
+                ],
             }
         )
     return {
-        "name": params.get("name", "Lead Scoring"),
-        "type": "CONTACT_FLOW",
-        "actions": actions,
+        "ui_path": "Settings > Automation > Workflows > Create workflow",
+        "object_type": "Contact-based",
         "enrollment": {
-            "type": "EVENT_BASED",
-            "event": params.get("event", "PAGE_VIEW"),
+            "type": "PROPERTY_BASED",
+            "filter_branch": {
+                "filterBranchType": "OR",
+                "filterBranches": [
+                    {
+                        "filterBranchType": "AND",
+                        "filters": [
+                            {
+                                "filterType": "PROPERTY",
+                                "property": score_property,
+                                "operation": {
+                                    "operationType": "ALL_PROPERTY",
+                                    "operator": "IS_KNOWN",
+                                    "includeObjectsWithNoValueSet": False,
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
         },
+        "actions": actions,
+        "prerequisites": [],
+        "validation": [
+            "Create a test contact",
+            "Verify score property is set",
+            "Verify lifecycle stage promoted when threshold exceeded",
+        ],
     }
 
 
@@ -61,7 +82,6 @@ register_blueprint(
             "score_property": {"type": "string", "default": "hubspotscore", "description": "Contact property to increment"},
             "increment": {"type": "integer", "default": 10, "description": "Points to add per engagement"},
             "threshold": {"type": "integer", "default": 50, "description": "Score threshold to promote lifecycle stage (0 to disable)"},
-            "event": {"type": "string", "default": "PAGE_VIEW", "description": "Enrollment trigger event"},
         },
         build=_build,
     )

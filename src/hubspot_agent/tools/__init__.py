@@ -40,6 +40,7 @@ async def invoke_tool(name: str, portal_id: str, **kwargs: Any) -> Any:
     if tool_def is None:
         raise ValueError(f"Unknown tool: {name}")
 
+    kwargs["portal_id"] = portal_id
     if tool_def.is_async:
         result = await tool_def.func(**kwargs)
     else:

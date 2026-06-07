@@ -68,3 +68,6 @@ class AgentResult(BaseModel):
     corrected_payload: dict[str, Any] | None = None
     correction_reason: str | None = None
     reflection: dict[str, Any] | None = None
+    informing_sources: list[dict[str, Any]] = Field(default_factory=list)
+    category: str = ""
+    emoji: str = ""

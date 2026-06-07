@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HubSpot Agent Task Tracker</title>
+<style>
+:root {
+  --ivory: #FAF9F5;
+  --slate: #141413;
+  --clay: #D97757;
+  --clay-d: #B85C3E;
+  --oat: #E3DACC;
+  --olive: #788C5D;
+  --gray-50: #F0EEE6;
+  --gray-200: #D1CFC5;
+  --gray-500: #87867F;
+  --gray-800: #3D3D3A;
+  --white: #ffffff;
+  --serif: ui-serif, Georgia, "Times New Roman", serif;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; margin: 0; }
+body {
+  font-family: var(--sans);
+  background: var(--ivory);
+  color: var(--slate);
+  padding: 2rem;
+}
+
+header {
+  max-width: 1400px;
+  margin: 0 auto 2rem;
+}
+header h1 {
+  font-family: var(--serif);
+  font-size: 1.75rem;
+  margin-bottom: 0.5rem;
+}
+header p { color: var(--gray-500); }
+
+.toolbar {
+  max-width: 1400px;
+  margin: 0 auto 1.5rem;
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.toolbar button {
+  font-family: var(--sans);
+  font-size: 0.875rem;
+  padding: 0.5rem 1rem;
+  border: 1px solid var(--gray-200);
+  background: var(--white);
+  color: var(--slate);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.toolbar button:hover { border-color: var(--clay); color: var(--clay); }
+.toolbar button.primary { background: var(--clay); color: var(--white); border-color: var(--clay); }
+.toolbar button.primary:hover { background: var(--clay-d); }
+
+.board {
+  max-width: 1400px;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1.5rem;
+}
+
+@media (max-width: 1100px) {
+  .board { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 700px) {
+  .board { grid-template-columns: 1fr; }
+}
+
+.column {
+  background: var(--gray-50);
+  border-radius: 12px;
+  padding: 1rem;
+  min-height: 300px;
+  display: flex;
+  flex-direction: column;
+}
+.column-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+.column-title {
+  font-family: var(--serif);
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+.column-count {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  background: var(--white);
+  padding: 0.2rem 0.5rem;
+  border-radius: 999px;
+  color: var(--gray-500);
+}
+
+.drop-zone {
+  flex: 1;
+  min-height: 60px;
+  border: 2px dashed transparent;
+  border-radius: 8px;
+  transition: border-color 0.2s, background 0.2s;
+}
+.drop-zone.drag-over {
+  border-color: var(--clay);
+  background: rgba(217, 119, 87, 0.05);
+}
+
+.card {
+  background: var(--white);
+  border-radius: 10px;
+  padding: 1rem;
+  margin-bottom: 0.75rem;
+  border: 1px solid var(--gray-200);
+  cursor: grab;
+  transition: box-shadow 0.15s, transform 0.15s;
+  position: relative;
+}
+.card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.06); }
+.card.dragging { opacity: 0.5; transform: rotate(2deg); }
+
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 0.5rem;
+}
+.card-title {
+  font-weight: 600;
+  font-size: 0.95rem;
+  line-height: 1.3;
+}
+.card-menu {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--gray-500);
+  font-size: 1.1rem;
+  padding: 0;
+  line-height: 1;
+}
+.card-menu:hover { color: var(--clay); }
+
+.card-meta {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: var(--gray-500);
+  margin-bottom: 0.75rem;
+}
+
+.steps {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.steps li {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  font-size: 0.82rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--gray-50);
+}
+.steps li:last-child { border-bottom: none; }
+.steps input[type="checkbox"] {
+  margin-top: 0.15rem;
+  accent-color: var(--olive);
+  cursor: pointer;
+}
+.steps label {
+  flex: 1;
+  cursor: pointer;
+  line-height: 1.4;
+}
+.steps label.done {
+  text-decoration: line-through;
+  color: var(--gray-500);
+}
+
+.tag {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+  margin-top: 0.5rem;
+}
+.tag.create { background: rgba(120, 140, 93, 0.12); color: var(--olive); }
+.tag.modify { background: rgba(217, 119, 87, 0.12); color: var(--clay); }
+.tag.test { background: rgba(135, 134, 127, 0.12); color: var(--gray-800); }
+
+.progress-ring {
+  width: 48px;
+  height: 48px;
+}
+.progress-ring-bg { stroke: var(--gray-200); }
+.progress-ring-fill { stroke: var(--olive); transition: stroke-dashoffset 0.4s ease; }
+
+.column-stats {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: auto;
+  padding-top: 1rem;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(20, 20, 19, 0.4);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+.modal-overlay.open { display: flex; }
+
+.modal {
+  background: var(--white);
+  border-radius: 16px;
+  padding: 2rem;
+  width: 90%;
+  max-width: 520px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.15);
+}
+.modal h2 {
+  font-family: var(--serif);
+  margin-bottom: 1.25rem;
+}
+.modal label {
+  display: block;
+  font-size: 0.8rem;
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+  color: var(--gray-800);
+}
+.modal input, .modal textarea, .modal select {
+  width: 100%;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--gray-200);
+  border-radius: 8px;
+  font-family: var(--sans);
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
+  background: var(--white);
+}
+.modal textarea { min-height: 80px; resize: vertical; }
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+}
+
+.toast {
+  position: fixed;
+  bottom: 1.5rem;
+  right: 1.5rem;
+  background: var(--slate);
+  color: var(--ivory);
+  padding: 0.75rem 1.25rem;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  opacity: 0;
+  transform: translateY(10px);
+  transition: opacity 0.3s, transform 0.3s;
+  pointer-events: none;
+  z-index: 60;
+}
+.toast.show { opacity: 1; transform: translateY(0); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>HubSpot Agent Implementation Tracker</h1>
+  <p>Kanban board for the 8-phase rollout. Drag cards between columns, check off steps, edit tasks inline.</p>
+</header>
+
+<div class="toolbar">
+  <button class="primary" onclick="openModal()">+ Add Task</button>
+  <button onclick="exportMarkdown()">Copy as Markdown</button>
+  <button onclick="exportJSON()">Copy as JSON</button>
+  <button onclick="resetBoard()">Reset</button>
+</div>
+
+<div class="board" id="board"></div>
+
+<div class="modal-overlay" id="modal">
+  <div class="modal">
+    <h2 id="modalTitle">Add Task</h2>
+    <label>Task Name</label>
+    <input type="text" id="taskName" placeholder="e.g. Refactor orchestrator dispatch">
+    <label>Phase / Component</label>
+    <input type="text" id="taskPhase" placeholder="e.g. Phase 1: Orchestrator">
+    <label>Steps (one per line)</label>
+    <textarea id="taskSteps" placeholder="Write failing test&#10;Run to verify failure&#10;Implement minimal code&#10;Run to verify pass&#10;Commit"></textarea>
+    <label>File Tag</label>
+    <select id="taskTag">
+      <option value="create">create</option>
+      <option value="modify">modify</option>
+      <option value="test">test</option>
+    </select>
+    <div class="modal-actions">
+      <button onclick="closeModal()">Cancel</button>
+      <button class="primary" onclick="saveTask()">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast">Copied to clipboard</div>
+
+<script>
+const SEED = {
+  columns: [
+    { id: 'pending', title: 'Pending', tasks: [
+      { id: 't1', title: 'Phase 6: Forms Agent', phase: 'Forms', steps: ['Scaffold agent module','Register in agents/__init__.py','Add orchestrator wiring','Write tests','Commit'], tag: 'create', checks: [false,false,false,false,false] },
+      { id: 't2', title: 'Phase 7: Data Agent', phase: 'Data', steps: ['Scaffold agent module','Register in agents/__init__.py','Add orchestrator wiring','Write tests','Commit'], tag: 'create', checks: [false,false,false,false,false] },
+      { id: 't3', title: 'Phase 8: Commerce Agent', phase: 'Commerce', steps: ['Scaffold agent module','Register in agents/__init__.py','Add orchestrator wiring','Write tests','Commit'], tag: 'create', checks: [false,false,false,false,false] },
+      { id: 't9', title: 'Phase 9: Pipeline Objects', phase: 'Objects', steps: ['AppointmentsAgent scaffold','CoursesAgent scaffold','ListingsAgent scaffold','ServicesAgent scaffold','Register all in __init__.py','Write tests','Commit'], tag: 'create', checks: [false,false,false,false,false,false,false] },
+      { id: 't10', title: 'Phase 10: Commerce Objects', phase: 'Commerce', steps: ['CartsAgent scaffold','OrdersAgent scaffold','QuotesAgent scaffold','SubscriptionsAgent scaffold','InvoicesAgent scaffold','Register all in __init__.py','Write tests','Commit'], tag: 'create', checks: [false,false,false,false,false,false,false] },
+      { id: 't11', title: 'Phase 11: Financial & Goals', phase: 'Finance', steps: ['DealSplitsAgent scaffold (batch-only)','DiscountsAgent scaffold','FeesAgent scaffold','TaxesAgent scaffold','GoalsAgent scaffold','Register all in __init__.py','Write tests','Commit'], tag: 'create', checks: [false,false,false,false,false,false,false,false] },
+      { id: 't12', title: 'Phase 12: Engagement & Leads', phase: 'Engagement', steps: ['CommunicationsAgent scaffold','LeadsAgent scaffold','Register all in __init__.py','Write tests','Commit'], tag: 'create', checks: [false,false,false,false,false] },
+      { id: 't13', title: 'Phase 13: Projects & Library', phase: 'Projects', steps: ['ProjectsAgent scaffold','ObjectLibraryAgent scaffold','Register all in __init__.py','Write tests','Commit'], tag: 'create', checks: [false,false,false,false,false] },
+      { id: 't14', title: 'Phase 14: Automation & Scheduler', phase: 'Automation', steps: ['SequencesAgent scaffold (read + enroll)','SchedulerAgent scaffold (meeting links)','Register all in __init__.py','Write tests','Commit'], tag: 'create', checks: [false,false,false,false,false] },
+      { id: 't15', title: 'Phase 15: Account & Analytics', phase: 'Account', steps: ['AccountInfoAgent scaffold','AuditLogsAgent scaffold (Enterprise)','SecurityHistoryAgent scaffold','EmailEventsAgent scaffold','Register all in __init__.py','Write tests','Commit'], tag: 'create', checks: [false,false,false,false,false,false,false] },
+      { id: 't16', title: 'Phase 16: Forecasts (Beta)', phase: 'Forecasts', steps: ['ForecastsAgent scaffold (read-only beta)','Register in __init__.py','Write tests','Commit'], tag: 'create', checks: [false,false,false,false] }
+    ]},
+    { id: 'inprogress', title: 'In Progress', tasks: [
+      { id: 't4', title: 'Phase 1: Dispatch Table Refactor', phase: 'Orchestrator', steps: ['Replace _build_preview_for_intent with _PREVIEW_BUILDERS','Replace dispatch_agent with _EXECUTE_DISPATCH','Replace reconcile_after_timeout with _RECONCILE_DISPATCH','Write tests for all agent dispatch','Commit'], tag: 'modify', checks: [false,false,false,false,false] }
+    ]},
+    { id: 'blocked', title: 'Blocked', tasks: [
+      { id: 't5', title: 'Phase 5: CLI Subcommands', phase: 'CLI', steps: ['Add /hubspot status','Add /hubspot refresh','Add tests for CLI commands','Commit'], tag: 'modify', checks: [false,false,false,false] }
+    ]},
+    { id: 'done', title: 'Done', tasks: [
+      { id: 't6', title: 'Phase 0: Pending Preview Persistence', phase: 'Infrastructure', steps: ['JSON persistence module in ~/.hubspot-agent/','UUID-based filenames','Timeout reconciliation hook','Write tests with mocked filesystem','Commit'], tag: 'create', checks: [true,true,true,true,true] },
+      { id: 't7', title: 'Phase 2: Schema Cache Warmup', phase: 'Cache', steps: ['Initialize session calls warm + discover','Add SchemaCache tests','Commit'], tag: 'modify', checks: [true,true,true] }
+    ]}
+  ]
+};
+
+const STORAGE_KEY = 'hubspot-task-tracker-v1';
+
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  return JSON.parse(JSON.stringify(SEED));
+}
+
+function saveState(state) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+}
+
+let state = loadState();
+let draggedTask = null;
+let draggedFromCol = null;
+let editingTaskId = null;
+
+function render() {
+  const board = document.getElementById('board');
+  board.innerHTML = '';
+  state.columns.forEach(col => {
+    const colEl = document.createElement('div');
+    colEl.className = 'column';
+    colEl.dataset.colId = col.id;
+
+    const totalSteps = col.tasks.reduce((s, t) => s + t.steps.length, 0);
+    const doneSteps = col.tasks.reduce((s, t) => s + t.checks.filter(Boolean).length, 0);
+    const pct = totalSteps ? Math.round((doneSteps / totalSteps) * 100) : 0;
+    const radius = 18;
+    const circ = 2 * Math.PI * radius;
+    const offset = circ - (pct / 100) * circ;
+
+    colEl.innerHTML = `
+      <div class="column-header">
+        <span class="column-title">${col.title}</span>
+        <span class="column-count">${col.tasks.length}</span>
+      </div>
+      <div class="drop-zone" data-col-id="${col.id}">
+        ${col.tasks.map(t => renderCard(t, col.id)).join('')}
+      </div>
+      <div class="column-stats">
+        <svg class="progress-ring" viewBox="0 0 48 48">
+          <circle class="progress-ring-bg" cx="24" cy="24" r="${radius}" stroke-width="4" fill="none"/>
+          <circle class="progress-ring-fill" cx="24" cy="24" r="${radius}" stroke-width="4" fill="none"
+            stroke-dasharray="${circ}" stroke-dashoffset="${offset}" stroke-linecap="round"/>
+        </svg>
+        <span style="font-size:0.8rem;color:var(--gray-500)">${doneSteps}/${totalSteps} steps</span>
+      </div>
+    `;
+    board.appendChild(colEl);
+  });
+
+  bindDrag();
+}
+
+function renderCard(task, colId) {
+  const doneCount = task.checks.filter(Boolean).length;
+  return `
+    <div class="card" draggable="true" data-task-id="${task.id}" data-col-id="${colId}">
+      <div class="card-header">
+        <div class="card-title">${escapeHtml(task.title)}</div>
+        <button class="card-menu" onclick="taskMenu(event, '${task.id}', '${colId}')">&#x22EE;</button>
+      </div>
+      <div class="card-meta">${escapeHtml(task.phase)} &middot; ${doneCount}/${task.steps.length}</div>
+      <ul class="steps">
+        ${task.steps.map((step, i) => `
+          <li>
+            <input type="checkbox" id="${task.id}-${i}" ${task.checks[i] ? 'checked' : ''}
+              onchange="toggleCheck('${task.id}', ${i})">
+            <label for="${task.id}-${i}" class="${task.checks[i] ? 'done' : ''}">${escapeHtml(step)}</label>
+          </li>
+        `).join('')}
+      </ul>
+      <span class="tag ${task.tag}">${task.tag}</span>
+    </div>
+  `;
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function bindDrag() {
+  document.querySelectorAll('.card').forEach(card => {
+    card.addEventListener('dragstart', e => {
+      card.classList.add('dragging');
+      draggedTask = card.dataset.taskId;
+      draggedFromCol = card.dataset.colId;
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    card.addEventListener('dragend', () => {
+      card.classList.remove('dragging');
+      draggedTask = null;
+      draggedFromCol = null;
+      document.querySelectorAll('.drop-zone').forEach(z => z.classList.remove('drag-over'));
+    });
+  });
+  document.querySelectorAll('.drop-zone').forEach(zone => {
+    zone.addEventListener('dragover', e => {
+      e.preventDefault();
+      zone.classList.add('drag-over');
+    });
+    zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+    zone.addEventListener('drop', e => {
+      e.preventDefault();
+      zone.classList.remove('drag-over');
+      if (!draggedTask) return;
+      const toCol = zone.dataset.colId;
+      moveTask(draggedTask, draggedFromCol, toCol);
+    });
+  });
+}
+
+function moveTask(taskId, fromColId, toColId) {
+  if (fromColId === toColId) return;
+  const fromCol = state.columns.find(c => c.id === fromColId);
+  const toCol = state.columns.find(c => c.id === toColId);
+  const idx = fromCol.tasks.findIndex(t => t.id === taskId);
+  if (idx === -1) return;
+  const [task] = fromCol.tasks.splice(idx, 1);
+  toCol.tasks.push(task);
+  saveState(state);
+  render();
+}
+
+function toggleCheck(taskId, stepIdx) {
+  for (const col of state.columns) {
+    const task = col.tasks.find(t => t.id === taskId);
+    if (task) {
+      task.checks[stepIdx] = !task.checks[stepIdx];
+      saveState(state);
+      render();
+      return;
+    }
+  }
+}
+
+function taskMenu(event, taskId, colId) {
+  event.stopPropagation();
+  const action = prompt('Edit or Delete this task?\nType: edit / delete');
+  if (!action) return;
+  if (action.toLowerCase() === 'delete') {
+    const col = state.columns.find(c => c.id === colId);
+    col.tasks = col.tasks.filter(t => t.id !== taskId);
+    saveState(state);
+    render();
+  } else if (action.toLowerCase() === 'edit') {
+    const col = state.columns.find(c => c.id === colId);
+    const task = col.tasks.find(t => t.id === taskId);
+    editingTaskId = taskId;
+    document.getElementById('modalTitle').textContent = 'Edit Task';
+    document.getElementById('taskName').value = task.title;
+    document.getElementById('taskPhase').value = task.phase;
+    document.getElementById('taskSteps').value = task.steps.join('\n');
+    document.getElementById('taskTag').value = task.tag;
+    document.getElementById('modal').classList.add('open');
+  }
+}
+
+function openModal() {
+  editingTaskId = null;
+  document.getElementById('modalTitle').textContent = 'Add Task';
+  document.getElementById('taskName').value = '';
+  document.getElementById('taskPhase').value = '';
+  document.getElementById('taskSteps').value = '';
+  document.getElementById('taskTag').value = 'create';
+  document.getElementById('modal').classList.add('open');
+}
+
+function closeModal() {
+  document.getElementById('modal').classList.remove('open');
+}
+
+function saveTask() {
+  const title = document.getElementById('taskName').value.trim();
+  const phase = document.getElementById('taskPhase').value.trim();
+  const stepsRaw = document.getElementById('taskSteps').value.trim();
+  const tag = document.getElementById('taskTag').value;
+  if (!title || !stepsRaw) { alert('Name and Steps are required'); return; }
+  const steps = stepsRaw.split('\n').map(s => s.trim()).filter(Boolean);
+  const checks = steps.map(() => false);
+
+  if (editingTaskId) {
+    for (const col of state.columns) {
+      const task = col.tasks.find(t => t.id === editingTaskId);
+      if (task) {
+        task.title = title; task.phase = phase; task.steps = steps; task.tag = tag; task.checks = checks;
+        break;
+      }
+    }
+  } else {
+    const id = 't' + Date.now();
+    state.columns[0].tasks.push({ id, title, phase, steps, tag, checks });
+  }
+  saveState(state);
+  closeModal();
+  render();
+}
+
+function exportMarkdown() {
+  const lines = ['# HubSpot Agent Implementation Progress\n'];
+  state.columns.forEach(col => {
+    lines.push(`## ${col.title}`);
+    col.tasks.forEach(t => {
+      const done = t.checks.filter(Boolean).length;
+      lines.push(`- **${t.title}** (${t.phase}) — ${done}/${t.steps.length} steps`);
+      t.steps.forEach((s, i) => {
+        lines.push(`  - [${t.checks[i] ? 'x' : ' '}] ${s}`);
+      });
+    });
+    lines.push('');
+  });
+  const text = lines.join('\n');
+  copyToClipboard(text);
+}
+
+function exportJSON() {
+  copyToClipboard(JSON.stringify(state, null, 2));
+}
+
+function resetBoard() {
+  if (!confirm('Reset board to seed data? This clears local changes.')) return;
+  state = JSON.parse(JSON.stringify(SEED));
+  saveState(state);
+  render();
+}
+
+function copyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(showToast);
+  } else {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    showToast();
+  }
+}
+
+function showToast() {
+  const t = document.getElementById('toast');
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2000);
+}
+
+document.getElementById('modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('modal')) closeModal();
+});
+
+render();
+</script>
+</body>
+</html>

@@ -7,6 +7,8 @@ from hubspot_agent.orchestrator import (
     _parse_agent_intent,
 )
 
+import hubspot_agent.agents.objects  # noqa: F401 — registers preview/execute/reconcile handlers
+
 
 class TestPreviewEngineObjects:
     @pytest.mark.asyncio
@@ -20,7 +22,7 @@ class TestPreviewEngineObjects:
             }
 
         monkeypatch.setattr(
-            "hubspot_agent.orchestrator.invoke_tool",
+            "hubspot_agent.agents.objects.invoke_tool",
             mock_tool,
         )
 
@@ -54,7 +56,7 @@ class TestPreviewEngineObjects:
             return {"results": [{"id": "10", "properties": {"firstname": "Alice"}}]}
 
         monkeypatch.setattr(
-            "hubspot_agent.orchestrator.invoke_tool",
+            "hubspot_agent.agents.objects.invoke_tool",
             mock_tool,
         )
 
@@ -74,7 +76,7 @@ class TestPreviewEngineObjects:
             return {"results": [{"id": "99", "properties": {"firstname": "Old"}}]}
 
         monkeypatch.setattr(
-            "hubspot_agent.orchestrator.invoke_tool",
+            "hubspot_agent.agents.objects.invoke_tool",
             mock_tool,
         )
 
@@ -94,7 +96,7 @@ class TestPreviewEngineObjects:
             return {"error": "rate_limited"}
 
         monkeypatch.setattr(
-            "hubspot_agent.orchestrator.invoke_tool",
+            "hubspot_agent.agents.objects.invoke_tool",
             mock_tool,
         )
 
@@ -133,6 +135,16 @@ class TestPreviewEngineOtherAgents:
 
     @pytest.mark.asyncio
     async def test_analytics_preview(self, monkeypatch):
+        import hubspot_agent.agents.analytics  # noqa: F401 — registers preview handler
+
+        async def mock_tool(*a, **k):
+            return {"report": {}}
+
+        monkeypatch.setattr(
+            "hubspot_agent.agents.analytics.invoke_tool",
+            mock_tool,
+        )
+
         class FakeClient:
             async def close(self):
                 pass

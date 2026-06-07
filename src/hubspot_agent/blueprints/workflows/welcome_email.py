@@ -6,32 +6,35 @@ from hubspot_agent.blueprints.workflows import WorkflowBlueprint, register_bluep
 
 
 def _build(params: dict[str, Any]) -> dict[str, Any]:
-    from_email = params.get("from_email", "")
     delay_hours = params.get("delay_hours", 0)
     subject = params.get("subject", "Welcome!")
     body = params.get("body", "Thanks for joining us.")
-    actions: list[dict[str, Any]] = [
+    actions: list[dict[str, Any]] = []
+    if delay_hours:
+        actions.append(
+            {
+                "step": 1,
+                "ui_action": "Delay",
+                "fields": {"Delay for": f"{delay_hours} hours"},
+            }
+        )
+    actions.append(
         {
-            "type": "DELAY",
-            "properties": {"delay": {"unit": "HOURS", "amount": delay_hours}},
-        },
-        {
-            "type": "SEND_EMAIL",
-            "properties": {
-                "from_email": from_email,
-                "subject": subject,
-                "body": body,
-            },
-        },
-    ]
+            "step": 2 if delay_hours else 1,
+            "ui_action": "Send internal email notification",
+            "fields": {"Subject": subject, "Body": body},
+        }
+    )
     return {
-        "name": params.get("name", "Welcome Email"),
-        "type": "CONTACT_FLOW",
-        "actions": actions,
+        "ui_path": "Settings > Automation > Workflows > Create workflow",
+        "object_type": "Contact-based",
         "enrollment": {
-            "type": "LIST_BASED",
-            "list_id": params.get("list_id"),
+            "type": "EVENT_BASED",
+            "trigger": "Contact is created",
         },
+        "actions": actions,
+        "prerequisites": [],
+        "validation": ["Create a test contact", "Verify email is sent"],
     }
 
 
@@ -42,11 +45,9 @@ register_blueprint(
         tags=["email", "onboarding", "contact"],
         parameter_schema={
             "name": {"type": "string", "default": "Welcome Email", "description": "Workflow name"},
-            "from_email": {"type": "string", "required": True, "description": "Sender email address"},
             "delay_hours": {"type": "integer", "default": 0, "description": "Delay before sending email"},
             "subject": {"type": "string", "default": "Welcome!", "description": "Email subject line"},
             "body": {"type": "string", "default": "Thanks for joining us.", "description": "Email body"},
-            "list_id": {"type": "string", "required": True, "description": "Enrollment list ID"},
         },
         build=_build,
     )

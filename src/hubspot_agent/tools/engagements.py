@@ -47,9 +47,11 @@ async def hubspot_search_engagements(
 async def hubspot_create_note(
     body: str,
     associations: list[dict[str, Any]] | None = None,
-    client: HubSpotClient = None,
+    client: HubSpotClient | None = None,
     portal_id: str = "",
 ) -> dict[str, Any]:
+    if client is None:
+        return {"error": "HubSpotClient not provided", "tool": "hubspot_create_note"}
     try:
         properties = {"hs_engagement_type": "NOTE", "hs_note_body": body}
         payload: dict[str, Any] = {"properties": properties}
@@ -72,9 +74,11 @@ async def hubspot_create_task(
     status: str,
     timestamp: str,
     associations: list[dict[str, Any]] | None = None,
-    client: HubSpotClient = None,
+    client: HubSpotClient | None = None,
     portal_id: str = "",
 ) -> dict[str, Any]:
+    if client is None:
+        return {"error": "HubSpotClient not provided", "tool": "hubspot_create_task"}
     try:
         properties = {
             "hs_engagement_type": "TASK",
@@ -101,9 +105,11 @@ async def hubspot_create_email(
     subject: str,
     body: str,
     associations: list[dict[str, Any]] | None = None,
-    client: HubSpotClient = None,
+    client: HubSpotClient | None = None,
     portal_id: str = "",
 ) -> dict[str, Any]:
+    if client is None:
+        return {"error": "HubSpotClient not provided", "tool": "hubspot_create_email"}
     try:
         properties = {"hs_engagement_type": "EMAIL", "hs_email_subject": subject, "hs_email_body": body}
         payload: dict[str, Any] = {"properties": properties}
@@ -125,9 +131,11 @@ async def hubspot_create_meeting(
     title: str,
     start_time: str,
     associations: list[dict[str, Any]] | None = None,
-    client: HubSpotClient = None,
+    client: HubSpotClient | None = None,
     portal_id: str = "",
 ) -> dict[str, Any]:
+    if client is None:
+        return {"error": "HubSpotClient not provided", "tool": "hubspot_create_meeting"}
     try:
         properties = {"hs_engagement_type": "MEETING", "hs_meeting_title": title, "hs_meeting_start_time": start_time}
         payload: dict[str, Any] = {"properties": properties}
@@ -149,9 +157,11 @@ async def hubspot_create_call(
     title: str,
     duration_ms: int,
     associations: list[dict[str, Any]] | None = None,
-    client: HubSpotClient = None,
+    client: HubSpotClient | None = None,
     portal_id: str = "",
 ) -> dict[str, Any]:
+    if client is None:
+        return {"error": "HubSpotClient not provided", "tool": "hubspot_create_call"}
     try:
         properties = {"hs_engagement_type": "CALL", "hs_call_title": title, "hs_call_duration": duration_ms}
         payload: dict[str, Any] = {"properties": properties}

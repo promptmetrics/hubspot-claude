@@ -15,15 +15,13 @@ from hubspot_agent.config import (
     save_portal_config,
 )
 from hubspot_agent.maintenance import _validate_portal_id
+from hubspot_agent.agents import get_agent_category, get_agent_emoji, group_agents_by_category
 from hubspot_agent.models import AgentResult
 from hubspot_agent.setup import REQUIRED_SCOPES
 import asyncio
 
 from hubspot_agent.models import BatchApprovalMode
 from hubspot_agent.orchestrator import (
-    _clear_pending_preview,
-    _load_pending_preview,
-    _list_pending_previews,
     check_dispatch_readiness,
     dispatch_agent,
     dispatch_agents_parallel,
@@ -31,7 +29,13 @@ from hubspot_agent.orchestrator import (
     parse_batch_mode,
     route_request,
 )
+from hubspot_agent.persistence import (
+    clear as _clear_pending_preview,
+    list_pending as _list_pending_previews,
+    load as _load_pending_preview,
+)
 from hubspot_agent.trace import compute_status_aggregates, emit_trace, new_trace_id
+from hubspot_agent import audit
 
 
 def _run_async(async_fn, *args, **kwargs):
@@ -112,7 +116,17 @@ def hubspot_command(request: str, working_dir: str = ".") -> str:
         emit_trace(portal_id, "error", trace_id, {"error": readiness["decline_reason"]})
         return f"{_header(portal_id, portal_config.tier)}\n\n❌ {readiness['decline_reason']}"
 
-    lines = [f"{_header(portal_id, portal_config.tier)}", f"**Routing to:** {', '.join(agent_names)}", ""]
+    def _agent_label(name: str) -> str:
+        return f"{get_agent_emoji(name)} {name}"
+
+    routed_labels = [_agent_label(n) for n in agent_names]
+    lines = [f"{_header(portal_id, portal_config.tier)}", f"**Routing to:** {', '.join(routed_labels)}", ""]
+
+    if "associations" in agent_names and "objects" in agent_names:
+        lines.append(
+            "_This query spans multiple object types; results from each agent are shown below._"
+        )
+        lines.append("")
 
     results = _run_async(
         dispatch_agents_parallel,
@@ -124,16 +138,28 @@ def hubspot_command(request: str, working_dir: str = ".") -> str:
         batch_mode=batch_mode,
     )
     for result in results:
-        lines.append(f"### {result.agent_name}")
+        emoji = result.emoji or get_agent_emoji(result.agent_name)
+        lines.append(f"### {emoji} {result.agent_name}")
         if result.status == "error":
             lines.append(f"❌ {result.error_message}")
         elif result.status == "preview":
             lines.append(f"⚠️  Preview (action: {result.data.get('action_id')})")
-            lines.append(f"Risk: {result.data.get('risk_level', 'unknown')}")
+            risk = result.data.get("risk_level", "unknown")
+            risk_badge = {"destructive": "🚨", "high": "⚠️", "medium": "⚠️", "low": ""}.get(risk, "")
+            lines.append(f"{risk_badge} Risk: {risk}" if risk_badge else f"Risk: {risk}")
             lines.append(f"Impact: {result.data.get('impact_count', 'unknown')} records")
             preview_text = result.data.get("preview", "")
             if preview_text:
                 lines.append(preview_text)
+            sources = result.informing_sources or result.data.get("informing_sources", [])
+            if sources:
+                lines.append("")
+                lines.append("**Sources:**")
+                for src in sources:
+                    tier = src.get("trust_tier", "unknown")
+                    url = src.get("url", "")
+                    title = src.get("title", url)
+                    lines.append(f"- [{title}]({url}) — {tier}")
             lines.append("")
             lines.append("Approve with `y` or `approve <id>`, reject with `n`.")
         else:
@@ -355,16 +381,46 @@ def _handle_status(working_dir: str) -> str:
     if not portal_config:
         return f"Portal {portal_id} has no token configured."
 
+    from hubspot_agent.dispatch import list_execute_agents, list_preview_agents, list_reconcile_agents
+    from hubspot_agent.persistence import list_pending
+
     agg = compute_status_aggregates(portal_id, window_hours=24)
+    pending = list_pending(portal_id)
+    preview_agents = list_preview_agents()
+    execute_agents = list_execute_agents()
+    reconcile_agents = list_reconcile_agents()
+
     lines = [
         f"📍 Portal: {portal_id} ({portal_config.tier})",
+        "",
+        "**Agents by Category**",
+    ]
+
+    def _category_block(title: str, agents: list[str]) -> list[str]:
+        if not agents:
+            return []
+        groups = group_agents_by_category(agents)
+        block: list[str] = [f"### {title}"]
+        for category, names in groups.items():
+            emoji = get_agent_emoji(names[0])
+            block.append(f"- {emoji} **{category}**: {', '.join(names)}")
+        return block
+
+    lines.extend(_category_block("Preview ready", preview_agents))
+    lines.extend(_category_block("Execute ready", execute_agents))
+    lines.extend(_category_block("Reconcile ready", reconcile_agents))
+
+    lines.extend([
+        "",
+        "**Pending approvals**",
+        f"- {len(pending)} preview(s) awaiting approval",
         "",
         "**Last 24 Hours**",
         f"- Requests: {agg['total_requests']}",
         f"- Avg latency: {agg['avg_latency_ms']} ms",
         f"- Error rate: {agg['error_rate'] * 100:.1f}%",
         f"- Est. cost: ${agg['total_estimated_usd']:.4f}",
-    ]
+    ])
     if agg["tool_call_counts"]:
         lines.append("- Tool calls:")
         for tool_name, count in agg["tool_call_counts"].items():
@@ -373,15 +429,12 @@ def _handle_status(working_dir: str) -> str:
 
 
 def _handle_refresh(working_dir: str) -> str:
-    from hubspot_agent.cache import SchemaCache
-
     portal_id = detect_default_portal(working_dir)
     if not portal_id:
         return "No default portal found to refresh."
 
-    cache = SchemaCache(portal_id)
-    cache.refresh_all()
-    return f"Cache refreshed for portal {portal_id}."
+    _run_async(initialize_session, portal_id)
+    return f"✅ Cache refreshed and schemas re-warmed for portal {portal_id}."
 
 
 def _handle_approve(action_id: str, working_dir: str) -> str:
@@ -412,6 +465,14 @@ def _handle_approve(action_id: str, working_dir: str) -> str:
 
     if result.status == "error":
         return f"❌ Execution failed: {result.error_message}"
+
+    audit.log_write(
+        portal_id=portal_id,
+        action=f"approve:{action_id}",
+        agent=preview_data["agent_name"],
+        result_summary={"request": preview_data["request_text"], "status": "success"},
+        informing_sources=preview_data.get("informing_sources"),
+    )
 
     return f"✅ Approved and executed action {action_id}.\n\n{result.data.get('message', '')}"
 

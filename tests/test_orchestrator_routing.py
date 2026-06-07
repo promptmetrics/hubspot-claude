@@ -39,3 +39,33 @@ def test_route_non_fast_path_agents():
     result = route_request("link records to companies")
     assert set(result) == {"objects", "associations"}
     assert route_request("use raw api for custom endpoint") == ["raw_api"]
+
+
+def test_route_cross_object_associated_with():
+    result = route_request("contacts associated with companies")
+    assert "associations" in result
+    assert "objects" in result
+
+
+def test_route_cross_object_linked_to():
+    result = route_request("deals linked to companies")
+    assert "associations" in result
+    assert "objects" in result
+
+
+def test_route_cross_object_related_to():
+    result = route_request("tickets related to contacts")
+    assert "associations" in result
+    assert "objects" in result
+
+
+def test_route_cross_object_at_companies():
+    result = route_request("contacts at companies")
+    assert "associations" in result
+    assert "objects" in result
+
+
+def test_route_cross_object_for_company():
+    result = route_request("deals for company")
+    assert "associations" in result
+    assert "objects" in result

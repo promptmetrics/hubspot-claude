@@ -4,10 +4,13 @@ from hubspot_agent.models import BatchApprovalMode, RiskLevel, TaskIntent
 from hubspot_agent.orchestrator import (
     _build_preview_for_intent,
     _extract_search_term,
+    _normalize_informing_sources,
     _parse_agent_intent,
     dispatch_agent,
     dispatch_agents_parallel,
 )
+
+import hubspot_agent.agents.objects  # noqa: F401 — registers preview/execute/reconcile handlers
 
 
 class TestParseAgentIntent:
@@ -74,7 +77,7 @@ class TestBuildPreviewForIntent:
             return {"results": []}
 
         monkeypatch.setattr(
-            "hubspot_agent.orchestrator.invoke_tool",
+            "hubspot_agent.agents.objects.invoke_tool",
             mock_tool,
         )
 
@@ -105,7 +108,7 @@ class TestBuildPreviewForIntent:
             }
 
         monkeypatch.setattr(
-            "hubspot_agent.orchestrator.invoke_tool",
+            "hubspot_agent.agents.objects.invoke_tool",
             mock_tool,
         )
 
@@ -130,7 +133,7 @@ class TestBuildPreviewForIntent:
             return {"error": "scope_missing"}
 
         monkeypatch.setattr(
-            "hubspot_agent.orchestrator.invoke_tool",
+            "hubspot_agent.agents.objects.invoke_tool",
             mock_tool,
         )
 
@@ -175,7 +178,7 @@ class TestDispatchAgent:
             return {"results": []}
 
         monkeypatch.setattr(
-            "hubspot_agent.orchestrator.invoke_tool",
+            "hubspot_agent.agents.objects.invoke_tool",
             mock_tool,
         )
 
@@ -198,7 +201,7 @@ class TestDispatchAgent:
             return {"results": [{"id": "1"}]}
 
         monkeypatch.setattr(
-            "hubspot_agent.orchestrator.invoke_tool",
+            "hubspot_agent.agents.objects.invoke_tool",
             mock_tool,
         )
 
@@ -220,7 +223,7 @@ class TestDispatchAgent:
             return {"id": "1", "properties": {}}
 
         monkeypatch.setattr(
-            "hubspot_agent.orchestrator.invoke_tool",
+            "hubspot_agent.agents.objects.invoke_tool",
             mock_tool,
         )
 
@@ -242,7 +245,7 @@ class TestDispatchAgent:
             return {"results": []}
 
         monkeypatch.setattr(
-            "hubspot_agent.orchestrator.invoke_tool",
+            "hubspot_agent.agents.objects.invoke_tool",
             mock_tool,
         )
 
@@ -284,7 +287,7 @@ class TestDispatchAgentsParallel:
             return {"results": []}
 
         monkeypatch.setattr(
-            "hubspot_agent.orchestrator.invoke_tool",
+            "hubspot_agent.agents.objects.invoke_tool",
             mock_tool,
         )
 
@@ -299,3 +302,53 @@ class TestDispatchAgentsParallel:
         )
         assert len(results) == 2
         assert all(r.status == "preview" for r in results)
+
+
+class TestNormalizeInformingSources:
+    def test_official_url_unchanged(self):
+        sources = [
+            {
+                "source": "official",
+                "trust_tier": "official",
+                "title": "Contacts API",
+                "url": "https://developers.hubspot.com/docs/api/crm/contacts",
+                "last_updated": "2026-05-01",
+            }
+        ]
+        result = _normalize_informing_sources(sources)
+        assert result[0]["trust_tier"] == "official"
+        assert result[0]["source"] == "official"
+
+    def test_community_url_downgrades_official_claim(self):
+        sources = [
+            {
+                "source": "official",
+                "trust_tier": "official",
+                "title": "Random blog",
+                "url": "https://random.example.com/post",
+                "last_updated": None,
+            }
+        ]
+        result = _normalize_informing_sources(sources)
+        assert result[0]["trust_tier"] == "community-unverified"
+        assert result[0]["source"] == "community"
+
+    def test_community_url_unchanged(self):
+        sources = [
+            {
+                "source": "community",
+                "trust_tier": "community-accepted",
+                "title": "Community post",
+                "url": "https://community.hubspot.com/t5/Lists/foo/td-p/12345",
+                "last_updated": None,
+            }
+        ]
+        result = _normalize_informing_sources(sources)
+        assert result[0]["trust_tier"] == "community-accepted"
+        assert result[0]["source"] == "community"
+
+    def test_empty_list(self):
+        assert _normalize_informing_sources([]) == []
+
+    def test_none(self):
+        assert _normalize_informing_sources(None) == []

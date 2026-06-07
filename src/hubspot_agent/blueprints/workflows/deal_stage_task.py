@@ -9,28 +9,47 @@ def _build(params: dict[str, Any]) -> dict[str, Any]:
     stage = params.get("stage", "qualifiedtobuy")
     task_title = params.get("task_title", "Follow up on deal stage change")
     due_days = params.get("due_days", 1)
-    assignee = params.get("assignee", "{{deal.hubspot_owner_id}}")
-    actions: list[dict[str, Any]] = [
-        {
-            "type": "CREATE_TASK",
-            "properties": {
-                "title": task_title,
-                "due_date": f"{{timestamp + {due_days}d}}",
-                "assignee": assignee,
-                "notes": f"Deal moved to stage: {stage}",
-            },
-        },
-    ]
     return {
-        "name": params.get("name", "Deal Stage Task"),
-        "type": "DEAL_FLOW",
-        "actions": actions,
+        "ui_path": "Settings > Automation > Workflows > Create workflow",
+        "object_type": "Deal-based",
         "enrollment": {
             "type": "PROPERTY_BASED",
-            "property": "dealstage",
-            "operator": "IS_EQUAL_TO",
-            "value": stage,
+            "filter_branch": {
+                "filterBranchType": "OR",
+                "filterBranches": [
+                    {
+                        "filterBranchType": "AND",
+                        "filters": [
+                            {
+                                "filterType": "PROPERTY",
+                                "property": "dealstage",
+                                "operation": {
+                                    "operationType": "ENUMERATION",
+                                    "operator": "IS_ANY_OF",
+                                    "values": [stage],
+                                    "includeObjectsWithNoValueSet": False,
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
         },
+        "actions": [
+            {
+                "step": 1,
+                "ui_action": "Create task",
+                "fields": {
+                    "Title": task_title,
+                    "Due date": f"{{timestamp + {due_days}d}}",
+                    "Assigned to": "{{deal.hubspot_owner_id}}",
+                    "Priority": "Medium",
+                    "Notes": f"Deal moved to stage: {stage}",
+                },
+            }
+        ],
+        "prerequisites": [],
+        "validation": ["Move a deal to the target stage", "Verify task is created"],
     }
 
 
@@ -44,7 +63,6 @@ register_blueprint(
             "stage": {"type": "string", "default": "qualifiedtobuy", "description": "Deal stage internal ID to trigger on"},
             "task_title": {"type": "string", "default": "Follow up on deal stage change", "description": "Task title"},
             "due_days": {"type": "integer", "default": 1, "description": "Days until task is due"},
-            "assignee": {"type": "string", "default": "{{deal.hubspot_owner_id}}", "description": "User ID or token to assign the task to"},
         },
         build=_build,
     )

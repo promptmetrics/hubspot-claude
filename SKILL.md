@@ -25,7 +25,10 @@ Type `/hubspot` followed by a request. Examples:
 /hubspot portal token <portal_id>      # Private App token setup
 /hubspot portal list                   # Show configured portals
 /hubspot portal switch <portal_id>     # Switch default portal
+/hubspot setup <id> oauth              # Full portal setup with OAuth
+/hubspot setup <id> token <pat>        # Full portal setup with Private App token
 /hubspot refresh                       # Refresh schema cache
+/hubspot status                        # Show portal status, agent readiness, and pending approvals
 ```
 
 ## Authentication Setup
@@ -47,17 +50,24 @@ save_portal_config(PortalConfig(portal_id='...', token='pat-na1-...', auth_type=
 
 ## Architecture
 
-Requests are routed to specialist sub-agents:
-- **ObjectsAgent** — contacts, companies, deals, tickets (CRUD + search)
-- **PropertiesAgent** — custom fields and schema management
-- **WorkflowsAgent** — automation, enrollment, triggers
-- **ListsAgent** — static/dynamic lists, memberships
-- **PipelinesAgent** — deal/ticket pipeline stages
-- **UsersAgent** — team members, roles, permissions
-- **HygieneAgent** — duplicates, merges, bulk updates
-- **AnalyticsAgent** — reports, metrics, velocity
-- **AssociationsAgent** — record relationships
-- **EngagementsAgent** — notes, tasks, emails, meetings, calls
-- **RawAPIAgent** — direct API escape hatch
+Requests are routed to 42 specialist sub-agents, grouped by category:
 
-All write operations require human-in-the-loop approval.
+| Category | Emoji | Agents |
+|----------|-------|--------|
+| Core CRM | 🧩 | objects, properties, custom_objects, associations |
+| Core CRM | 📋 | lists |
+| Automation | ⚙️ | workflows, pipelines, sequences, scheduler |
+| Engagement | 💬 | engagements, communications, leads |
+| Users & Access | 👤 | users |
+| Analytics & Data | 📊 | analytics, hygiene, forecasts, data |
+| Service Hub | 🛎️ | service, forms |
+| Commerce | 🛒 | commerce, carts, orders, quotes, subscriptions, invoices, deal_splits, discounts, fees, taxes, services |
+| Content & Projects | 📝 | projects, object_library, courses, listings, appointments, goals |
+| System & Audit | 🔒 | raw_api, account_info, audit_logs, security_history, email_events, timeline_events |
+
+## Human-in-the-Loop
+
+All write operations require approval:
+- After a preview is shown, type `y` or `yes` to approve
+- Type `n`, `no`, or `reject` to reject
+- Or use `approve <action_id>` for a specific action

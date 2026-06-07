@@ -28,9 +28,11 @@ async def hubspot_get_list(
 @tool(name="hubspot_list_lists", description="List all HubSpot lists.")
 async def hubspot_list_lists(
     object_type: str | None = None,
-    client: HubSpotClient = None,
+    client: HubSpotClient | None = None,
     portal_id: str = "",
 ) -> dict[str, Any]:
+    if client is None:
+        return {"error": "HubSpotClient not provided", "tool": "hubspot_list_lists"}
     try:
         params = {}
         if object_type:

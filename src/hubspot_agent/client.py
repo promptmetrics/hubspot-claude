@@ -80,7 +80,7 @@ class HubSpotClient:
         method: str,
         path: str,
         portal_id: str,
-        body: dict[str, Any] | None = None,
+        body: Any | None = None,
         expected_scopes: list[str] | None = None,
         data: dict[str, Any] | None = None,
         files: dict[str, Any] | None = None,
@@ -158,7 +158,7 @@ class HubSpotClient:
         self,
         path: str,
         portal_id: str,
-        body: dict[str, Any] | None = None,
+        body: Any | None = None,
         expected_scopes: list[str] | None = None,
     ) -> APIResponse:
         return await self._request("POST", path, portal_id, body, expected_scopes)
@@ -167,7 +167,7 @@ class HubSpotClient:
         self,
         path: str,
         portal_id: str,
-        body: dict[str, Any] | None = None,
+        body: Any | None = None,
         expected_scopes: list[str] | None = None,
     ) -> APIResponse:
         return await self._request("PATCH", path, portal_id, body, expected_scopes)
@@ -176,7 +176,7 @@ class HubSpotClient:
         self,
         path: str,
         portal_id: str,
-        body: dict[str, Any] | None = None,
+        body: Any | None = None,
         expected_scopes: list[str] | None = None,
     ) -> APIResponse:
         return await self._request("PUT", path, portal_id, body, expected_scopes)
