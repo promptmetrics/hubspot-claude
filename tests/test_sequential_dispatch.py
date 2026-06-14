@@ -1,0 +1,173 @@
+from unittest.mock import patch
+
+from hubspot_agent.models import AgentResult, LoopPlan, PlanStep, RiskLevel, StepArtifact, VerificationResult
+from hubspot_agent.sequential_dispatch import execute_plan, verify_step
+
+
+def _make_plan() -> LoopPlan:
+    return LoopPlan(
+        goal="Create a property and a workflow",
+        steps=[
+            PlanStep(
+                step_number=1,
+                agent="properties",
+                action="create property renewal_date",
+                description="Create property",
+                expected_artifact_keys=["property_id"],
+                risk_level=RiskLevel.MEDIUM,
+            ),
+            PlanStep(
+                step_number=2,
+                agent="workflows",
+                action="create workflow enrollment rule",
+                description="Create workflow",
+                prerequisites=["1"],
+                expected_artifact_keys=["workflow_id"],
+                risk_level=RiskLevel.MEDIUM,
+            ),
+        ],
+        overall_risk=RiskLevel.MEDIUM,
+    )
+
+
+def test_execute_plan_passes_artifacts_between_steps():
+    plan = _make_plan()
+
+    def fake_dispatch(agent_name, user_request, portal_config=None, mode="preview", payload=None):
+        if agent_name == "properties":
+            return AgentResult(
+                agent_name="properties",
+                status="preview" if mode == "preview" else "success",
+                data={"artifacts": {"property_id": "prop-123"}},
+            )
+        if agent_name == "workflows":
+            # Assert the property_id was passed through the request
+            assert "prop-123" in user_request
+            return AgentResult(
+                agent_name="workflows",
+                status="preview" if mode == "preview" else "success",
+                data={"artifacts": {"workflow_id": "wf-456"}},
+            )
+        return AgentResult(agent_name=agent_name, status="error", error_message="unknown agent")
+
+    with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
+        artifacts = execute_plan(plan, "create property and workflow", None, "trace-1")
+
+    assert len(artifacts) == 2
+    assert artifacts[0].outputs["property_id"] == "prop-123"
+    assert artifacts[1].outputs["workflow_id"] == "wf-456"
+
+
+def test_execute_plan_stops_on_error():
+    plan = _make_plan()
+
+    def fake_dispatch(agent_name, user_request, portal_config=None, mode="preview", payload=None):
+        return AgentResult(
+            agent_name=agent_name,
+            status="error",
+            error_message="boom",
+        )
+
+    with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
+        try:
+            execute_plan(plan, "create property and workflow", None, "trace-1")
+        except RuntimeError as exc:
+            assert "preview failed" in str(exc)
+        else:
+            raise AssertionError("Expected RuntimeError")
+
+
+def test_execute_plan_respects_rejected_approval():
+    plan = _make_plan()
+
+    def fake_dispatch(agent_name, user_request, portal_config=None, mode="preview", payload=None):
+        return AgentResult(
+            agent_name=agent_name,
+            status="preview" if mode == "preview" else "success",
+            data={"artifacts": {"property_id": "prop-123"}},
+        )
+
+    with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
+        try:
+            execute_plan(
+                plan,
+                "create property and workflow",
+                None,
+                "trace-1",
+                approve_callback=lambda _: False,
+            )
+        except RuntimeError as exc:
+            assert "not approved" in str(exc)
+        else:
+            raise AssertionError("Expected RuntimeError")
+
+
+def test_execute_plan_captures_created_ids():
+    plan = LoopPlan(
+        goal="Create a contact",
+        steps=[
+            PlanStep(
+                step_number=1,
+                agent="objects",
+                action="create contact",
+                expected_artifact_keys=["object_id"],
+            )
+        ],
+    )
+
+    def fake_dispatch(agent_name, user_request, portal_config=None, mode="preview", payload=None):
+        return AgentResult(
+            agent_name=agent_name,
+            status="preview" if mode == "preview" else "success",
+            data={"artifacts": {"object_id": "contact-789"}},
+        )
+
+    with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
+        artifacts = execute_plan(plan, "create a contact", None, "trace-1")
+
+    assert artifacts[0].created_ids == ["contact-789"]
+
+
+def test_verify_step_decides_verified():
+    step = PlanStep(step_number=1, agent="properties", action="create property")
+    artifact = StepArtifact(step_number=1, agent="properties", outputs={"property_id": "prop-123"})
+    raw = '{"status": "verified", "checked_count": 1, "verified_count": 1, "message": "ok"}'
+
+    with patch("hubspot_agent.sequential_dispatch.spawn_agent", return_value=raw):
+        decision, result = verify_step(step, artifact, None)
+
+    assert decision == "verified"
+    assert result.status == VerificationResult.Status.VERIFIED
+
+
+def test_verify_step_decides_retry_on_mismatch():
+    step = PlanStep(step_number=1, agent="properties", action="update property")
+    artifact = StepArtifact(step_number=1, agent="properties", outputs={"property_id": "prop-123"})
+    raw = '{"status": "mismatch", "mismatches": [{"field": "name", "expected": "A", "actual": "B"}]}'
+
+    with patch("hubspot_agent.sequential_dispatch.spawn_agent", return_value=raw):
+        decision, result = verify_step(step, artifact, None)
+
+    assert decision == "retry"
+    assert result.status == VerificationResult.Status.MISMATCH
+
+
+def test_verify_step_decides_escalate_on_error():
+    step = PlanStep(step_number=1, agent="properties", action="create property")
+    artifact = StepArtifact(step_number=1, agent="properties", outputs={"property_id": "prop-123"})
+
+    with patch("hubspot_agent.sequential_dispatch.spawn_agent", return_value="garbage"):
+        decision, result = verify_step(step, artifact, None)
+
+    assert decision == "escalate"
+    assert result.status == VerificationResult.Status.ERROR
+
+
+def test_verify_step_no_runtime_assumes_verified():
+    step = PlanStep(step_number=1, agent="properties", action="create property")
+    artifact = StepArtifact(step_number=1, agent="properties", outputs={"property_id": "prop-123"})
+
+    with patch("hubspot_agent.sequential_dispatch.spawn_agent", return_value="[agent:verify:no_runtime]"):
+        decision, result = verify_step(step, artifact, None)
+
+    assert decision == "verified"

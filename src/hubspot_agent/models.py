@@ -26,10 +26,13 @@ class PlanStep(BaseModel):
     step_number: int
     agent: str
     action: str
+    description: str | None = None
     hubspot_endpoint: str | None = None
     payload_summary: dict[str, Any] = Field(default_factory=dict)
     validation_rules: list[str] = Field(default_factory=list)
+    expected_artifact_keys: list[str] = Field(default_factory=list)
     prerequisites: list[str] = Field(default_factory=list)
+    risk_level: RiskLevel | None = None
 
 
 class ExecutionPlan(BaseModel):
@@ -39,6 +42,38 @@ class ExecutionPlan(BaseModel):
     overall_risk: RiskLevel
     rollback_available: bool
     estimated_duration_seconds: int
+
+
+class LoopPlan(BaseModel):
+    goal: str
+    success_criteria: list[str] = Field(default_factory=list)
+    steps: list[PlanStep]
+    overall_risk: RiskLevel = RiskLevel.LOW
+    max_iterations: int = 3
+    artifact_schema: dict[str, Any] = Field(default_factory=dict)
+
+
+class StepArtifact(BaseModel):
+    step_number: int
+    agent: str
+    outputs: dict[str, Any] = Field(default_factory=dict)
+    created_ids: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class VerificationResult(BaseModel):
+    class Status(str, Enum):
+        VERIFIED = "verified"
+        MISMATCH = "mismatch"
+        ERROR = "error"
+        PARTIAL = "partial"
+
+    status: Status
+    mismatches: list[dict[str, Any]] = Field(default_factory=list)
+    missing_fields: list[str] = Field(default_factory=list)
+    checked_count: int = 0
+    verified_count: int = 0
+    message: str | None = None
 
 
 class PreviewResult(BaseModel):
@@ -52,7 +87,7 @@ class PreviewResult(BaseModel):
 
 class AgentResult(BaseModel):
     agent_name: str
-    status: str  # "success", "error", "preview", "needs_approval"
+    status: str  # "success", "error", "preview", "needs_approval", "corrected"
     data: dict[str, Any] = Field(default_factory=dict)
     error_message: str | None = None
     retryable: bool = False
