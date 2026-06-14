@@ -7,6 +7,9 @@ from typing import Any
 from hubspot_agent.cache import SchemaCache
 
 
+from hubspot_agent.scope_registry import get_required_scopes_for_agent
+
+
 class ValidationError(Exception):
     def __init__(self, message: str, suggestions: list[str] | None = None):
         super().__init__(message)
@@ -111,3 +114,40 @@ def validate_properties(
         "errors": errors,
         "refreshed": False,
     }
+
+
+def validate_scopes(
+    agent_names: list[str],
+    portal_scopes: list[str],
+    target_object: str | None = None,
+) -> dict[str, list[str]]:
+    """Return missing HubSpot OAuth scopes per agent.
+
+    Args:
+        agent_names: Agents requested for dispatch.
+        portal_scopes: Scopes granted to the current portal.
+        target_object: Optional object type to narrow object-specific scopes.
+
+    Returns:
+        Mapping from agent name to sorted list of missing scopes. Empty dict
+        means all required scopes are present.
+    """
+    granted = set(portal_scopes or [])
+    blocked: dict[str, list[str]] = {}
+    for agent in agent_names:
+        required = get_required_scopes_for_agent(agent, target_object)
+        missing = sorted(required - granted)
+        if missing:
+            blocked[agent] = missing
+    return blocked
+
+
+def format_scope_error(blocked: dict[str, list[str]]) -> str:
+    """Format missing-scope errors for CLI display."""
+    if not blocked:
+        return ""
+    lines: list[str] = ["Missing HubSpot OAuth scopes:"]
+    for agent, scopes in sorted(blocked.items()):
+        for scope in scopes:
+            lines.append(f"- {agent}: {scope}")
+    return "\n".join(lines)

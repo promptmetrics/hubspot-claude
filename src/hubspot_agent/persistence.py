@@ -71,3 +71,21 @@ def reap_expired(portal_id: str, max_age_hours: int = 24) -> int:
         except (json.JSONDecodeError, ValueError, OSError):
             continue
     return removed
+
+
+def confirm(portal_id: str, action_id: str, count: int) -> bool:
+    """Record a count-based confirmation for a destructive pending preview.
+
+    Returns True if the provided count matches the preview's required
+    confirmation value and the confirmation is persisted.
+    """
+    file_path = _pending_previews_dir(portal_id) / f"{action_id}.json"
+    if not file_path.exists():
+        return False
+    data = json.loads(file_path.read_text())
+    required = data.get("required_confirmation")
+    if required is None or int(required) != int(count):
+        return False
+    data["confirmed_count"] = count
+    file_path.write_text(json.dumps(data, indent=2, default=str))
+    return True

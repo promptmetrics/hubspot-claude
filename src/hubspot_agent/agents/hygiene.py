@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from typing import Any
+
 import hubspot_agent.tools.hygiene  # noqa: F401 — registers tools
 from hubspot_agent.agents._base import AgentPrompt, build_agent_prompt
 from hubspot_agent.config import PortalConfig
 from hubspot_agent.dispatch import register_execute, register_preview, register_reconcile
-from hubspot_agent.models import PreviewResult
+from hubspot_agent.models import PreviewResult, TaskIntent
 from hubspot_agent.tools import get_tool, invoke_tool
 
 _TOOL_NAMES = [
@@ -76,7 +78,7 @@ async def _build_hygiene_preview(
         )
 
     if intent.intent_type == "update":
-        payload = proposed_payload or {}
+        payload: dict[str, Any] = {}
         try:
             result = await invoke_tool(
                 "hubspot_preview_segment",

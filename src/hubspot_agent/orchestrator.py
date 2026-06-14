@@ -25,6 +25,7 @@ from hubspot_agent.tools import invoke_tool
 from hubspot_agent.agent_dispatch import build_triage_prompt, spawn_agent
 from hubspot_agent.planning import parse_plan, plan_to_markdown, validate_plan
 from hubspot_agent.sequential_dispatch import execute_plan
+from hubspot_agent.validation import format_scope_error, validate_scopes
 
 
 def _normalize_informing_sources(sources: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -370,6 +371,21 @@ async def dispatch_agent(
         )
 
     intent = _parse_agent_intent(agent_name, request_text)
+
+    # Scope validation (Group 2). Skip if no scope list is recorded.
+    if portal_config.scopes_granted:
+        blocked = validate_scopes(
+            [agent_name], portal_config.scopes_granted, target_object=intent.target_object
+        )
+        if blocked:
+            return AgentResult(
+                agent_name=agent_name,
+                status="error",
+                error_message=format_scope_error(blocked),
+                category=get_agent_category(agent_name),
+                emoji=get_agent_emoji(agent_name),
+            )
+
     client = HubSpotClient(portal_config)
 
     try:
@@ -389,6 +405,8 @@ async def dispatch_agent(
                 "batch_mode": batch_mode.value,
                 "proposed_payload": proposed_payload or {},
                 "informing_sources": normalized_sources,
+                "required_confirmation": preview.impact_count,
+                "confirmed_count": None,
             }
             _store_pending_preview(portal_config.portal_id, action_id, preview_data)
 
@@ -420,7 +438,10 @@ async def dispatch_agent(
                     "action_id": action_id,
                     "preview": preview_text,
                     "risk_level": preview.risk_level.value,
+                    "impact_type": intent.intent_type,
+                    "target_object": intent.target_object,
                     "impact_count": preview.impact_count,
+                    "original_values": preview.original_values,
                     "full_prompt": prompt.system_prompt,
                 },
                 informing_sources=normalized_sources,
@@ -439,6 +460,16 @@ async def dispatch_agent(
                     agent_name=agent_name,
                     status="error",
                     error_message=result_data.get("message", "Execution failed"),
+                    category=get_agent_category(agent_name),
+                    emoji=get_agent_emoji(agent_name),
+                )
+            if result_data.get("status") == "corrected":
+                return AgentResult(
+                    agent_name=agent_name,
+                    status="corrected",
+                    data=result_data.get("data", {}),
+                    corrected_payload=result_data.get("corrected_payload"),
+                    correction_reason=result_data.get("correction_reason"),
                     category=get_agent_category(agent_name),
                     emoji=get_agent_emoji(agent_name),
                 )

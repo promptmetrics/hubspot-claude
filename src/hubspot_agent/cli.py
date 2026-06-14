@@ -16,7 +16,7 @@ from hubspot_agent.config import (
 )
 from hubspot_agent.maintenance import _validate_portal_id
 from hubspot_agent.agents import get_agent_category, get_agent_emoji, group_agents_by_category
-from hubspot_agent.models import AgentResult
+from hubspot_agent.models import AgentResult, RiskLevel
 from hubspot_agent.setup import REQUIRED_SCOPES
 import asyncio
 
@@ -33,9 +33,17 @@ from hubspot_agent.orchestrator import (
 )
 from hubspot_agent.persistence import (
     clear as _clear_pending_preview,
+    confirm as _confirm_pending_preview,
     list_pending as _list_pending_previews,
     load as _load_pending_preview,
 )
+from hubspot_agent.snapshot import (
+    delete_undo_snapshot,
+    load_undo_snapshot,
+    save_undo_snapshot,
+    update_undo_snapshot,
+)
+from hubspot_agent.tools import invoke_tool
 from hubspot_agent.trace import compute_status_aggregates, emit_trace, new_trace_id
 from hubspot_agent import audit
 
@@ -90,6 +98,20 @@ def hubspot_command(request: str, working_dir: str = ".") -> str:
 
     if request.lower() in ("n", "no", "reject"):
         return _handle_reject_last(working_dir)
+
+    if request.isdigit():
+        return _handle_confirm(request, working_dir)
+
+    if request.lower().startswith("confirm "):
+        return _handle_confirm(request[8:].strip(), working_dir)
+
+    if request.lower().startswith("undo"):
+        subcommand = request[4:].strip()
+        if subcommand.lower() == "list":
+            return _handle_undo_list(working_dir)
+        if subcommand:
+            return _handle_undo(subcommand, working_dir)
+        return "Usage: /hubspot undo <action_id> or /hubspot undo list"
 
     portal_id = detect_default_portal(working_dir)
     if not portal_id:
@@ -455,6 +477,56 @@ def _handle_refresh(working_dir: str) -> str:
     return f"✅ Cache refreshed and schemas re-warmed for portal {portal_id}."
 
 
+def _snapshot_dir_for_portal(portal_id: str) -> str:
+    return str(CONFIG_DIR / portal_id / "undo_snapshots")
+
+
+def _is_destructive_preview(preview_data: dict[str, Any]) -> bool:
+    preview = preview_data.get("preview") or {}
+    intent = preview_data.get("intent") or {}
+    risk = preview.get("risk_level") or intent.get("risk_level")
+    return risk == RiskLevel.DESTRUCTIVE.value
+
+
+def _present_destructive_preview(action_id: str, impact_count: int) -> str:
+    return (
+        f"🚨 This action is destructive and will affect **{impact_count}** records.\n\n"
+        f"To confirm, type one of:\n"
+        f"- `approve {action_id} {impact_count}`\n"
+        f"- `{impact_count}`\n"
+        f"- `confirm {impact_count}`"
+    )
+
+
+def _save_undo_snapshot_for_action(
+    portal_id: str,
+    action_id: str,
+    preview_data: dict[str, Any],
+    created_ids: list[str] | None = None,
+) -> None:
+    intent = preview_data.get("intent") or {}
+    intent_type = intent.get("intent_type", "unknown")
+    target_object = intent.get("target_object")
+    preview = preview_data.get("preview") or {}
+    original_values = preview.get("original_values", {})
+
+    undoable = intent_type in ("create", "update")
+    metadata: dict[str, Any] = {
+        "intent_type": intent_type,
+        "target_object": target_object,
+        "undoable": undoable,
+    }
+    if created_ids:
+        metadata["created_ids"] = created_ids
+
+    save_undo_snapshot(
+        _snapshot_dir_for_portal(portal_id),
+        action_id,
+        original_values,
+        metadata=metadata,
+    )
+
+
 def _handle_approve(action_id: str, working_dir: str) -> str:
     portal_id = detect_default_portal(working_dir)
     if not portal_id:
@@ -464,9 +536,31 @@ def _handle_approve(action_id: str, working_dir: str) -> str:
     if not portal_config:
         return f"Portal {portal_id} has no token configured."
 
+    # Accept "approve <id> <count>" as well as a bare action id.
+    confirm_count: int | None = None
+    parts = action_id.split()
+    if len(parts) >= 2 and parts[-1].isdigit():
+        confirm_count = int(parts[-1])
+        action_id = parts[0]
+
     preview_data = _load_pending_preview(portal_id, action_id)
     if not preview_data:
         return f"No pending preview found with ID {action_id}."
+
+    is_destructive = _is_destructive_preview(preview_data)
+    required = preview_data.get("required_confirmation")
+
+    if is_destructive:
+        if confirm_count is not None:
+            if not _confirm_pending_preview(portal_id, action_id, confirm_count):
+                return _present_destructive_preview(action_id, required or 0)
+        elif preview_data.get("confirmed_count") != required:
+            return _present_destructive_preview(action_id, required or 0)
+
+    # Persist an undo snapshot before executing any write.
+    intent = preview_data.get("intent") or {}
+    if intent.get("intent_type") in ("create", "update", "delete"):
+        _save_undo_snapshot_for_action(portal_id, action_id, preview_data)
 
     result = _run_async(
         dispatch_agent,
@@ -482,7 +576,23 @@ def _handle_approve(action_id: str, working_dir: str) -> str:
     _clear_pending_preview(portal_id, action_id)
 
     if result.status == "error":
+        # Remove the snapshot so a failed action cannot be "undone".
+        delete_undo_snapshot(_snapshot_dir_for_portal(portal_id), action_id)
         return f"❌ Execution failed: {result.error_message}"
+
+    # For creates, capture the IDs we just created so undo can delete them.
+    if intent.get("intent_type") == "create":
+        created_ids: list[str] = []
+        result_payload = result.data.get("result", {})
+        if isinstance(result_payload, dict):
+            created_id = result_payload.get("id")
+            if created_id:
+                created_ids.append(str(created_id))
+        update_undo_snapshot(
+            _snapshot_dir_for_portal(portal_id),
+            action_id,
+            metadata={"created_ids": created_ids},
+        )
 
     audit.log_write(
         portal_id=portal_id,
@@ -505,7 +615,142 @@ def _handle_approve_last(working_dir: str) -> str:
         return "No pending previews to approve."
 
     action_id = files[0].stem
+    preview_data = _load_pending_preview(portal_id, action_id)
+    if preview_data and _is_destructive_preview(preview_data):
+        required = preview_data.get("required_confirmation", 0)
+        return _present_destructive_preview(action_id, required)
+
     return _handle_approve(action_id, working_dir)
+
+
+def _handle_confirm(count_str: str, working_dir: str) -> str:
+    portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return "No default portal found."
+
+    files = _list_pending_previews(portal_id)
+    if not files:
+        return "No pending previews to confirm."
+
+    if not count_str.isdigit():
+        return f"Invalid confirmation count: {count_str}"
+
+    action_id = files[0].stem
+    count = int(count_str)
+    preview_data = _load_pending_preview(portal_id, action_id)
+    if preview_data and _is_destructive_preview(preview_data):
+        if not _confirm_pending_preview(portal_id, action_id, count):
+            required = preview_data.get("required_confirmation", 0)
+            return _present_destructive_preview(action_id, required)
+
+    return _handle_approve(action_id, working_dir)
+
+
+async def _undo_action(snapshot: dict[str, Any], portal_id: str, portal_config) -> str:
+    from hubspot_agent.client import HubSpotClient
+
+    metadata = snapshot.get("metadata", {})
+    intent_type = metadata.get("intent_type")
+    object_type = metadata.get("target_object")
+
+    if intent_type == "delete":
+        return "❌ Deletes are not undoable through HubSpot."
+
+    if not metadata.get("undoable", False):
+        return "❌ This action is not undoable."
+
+    client = HubSpotClient(portal_config)
+    try:
+        if intent_type == "update":
+            original_values = snapshot.get("original_values", {})
+            if not original_values:
+                return "❌ No original values recorded; cannot undo update."
+            for object_id, properties in original_values.items():
+                await invoke_tool(
+                    "hubspot_update_object",
+                    portal_id,
+                    object_id=str(object_id),
+                    object_type=str(object_type),
+                    properties=properties,
+                    client=client,
+                )
+            return f"✅ Restored {len(original_values)} {object_type or 'record(s)'} to their original values."
+
+        if intent_type == "create":
+            created_ids = metadata.get("created_ids", [])
+            if not created_ids:
+                return "❌ No created IDs recorded; cannot undo create."
+            for object_id in created_ids:
+                await invoke_tool(
+                    "hubspot_delete_object",
+                    portal_id,
+                    object_id=str(object_id),
+                    object_type=str(object_type),
+                    client=client,
+                )
+            return f"✅ Deleted {len(created_ids)} created {object_type or 'record(s)'} to undo the create."
+
+        return "❌ Unknown action type; cannot undo."
+    finally:
+        await client.close()
+
+
+def _handle_undo(action_id: str, working_dir: str) -> str:
+    portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return "No default portal found."
+
+    portal_config = load_portal_config(portal_id)
+    if not portal_config:
+        return f"Portal {portal_id} has no token configured."
+
+    snapshot = load_undo_snapshot(_snapshot_dir_for_portal(portal_id), action_id)
+    if not snapshot:
+        return f"No undo snapshot found for action {action_id}."
+
+    result = _run_async(_undo_action, snapshot, portal_id, portal_config)
+    delete_undo_snapshot(_snapshot_dir_for_portal(portal_id), action_id)
+
+    audit.log_write(
+        portal_id=portal_id,
+        action=f"undo:{action_id}",
+        agent=snapshot.get("metadata", {}).get("intent_type", "unknown"),
+        result_summary={"message": result},
+    )
+
+    return result
+
+
+def _handle_undo_list(working_dir: str) -> str:
+    portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return "No default portal found."
+
+    snapshot_dir = Path(_snapshot_dir_for_portal(portal_id))
+    if not snapshot_dir.exists():
+        return "No undo snapshots available."
+
+    files = sorted(snapshot_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        return "No undo snapshots available."
+
+    lines = ["**Undoable actions**", ""]
+    for file_path in files:
+        try:
+            snapshot = json.loads(file_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        metadata = snapshot.get("metadata", {})
+        action_id = snapshot.get("action_id", file_path.stem)
+        intent_type = metadata.get("intent_type", "unknown")
+        target = metadata.get("target_object", "unknown")
+        undoable = metadata.get("undoable", False)
+        lines.append(
+            f"- `{action_id}` — {intent_type} on {target} "
+            f"({'undoable' if undoable else 'not undoable'})"
+        )
+
+    return "\n".join(lines)
 
 
 def _handle_reject_last(working_dir: str) -> str:

@@ -28,7 +28,7 @@ from hubspot_agent.blueprints.workflows import (  # noqa: F401
     welcome_email,
 )
 from hubspot_agent.dispatch import register_execute, register_preview, register_reconcile
-from hubspot_agent.models import PreviewResult
+from hubspot_agent.models import PreviewResult, TaskIntent
 from hubspot_agent.tools import get_tool, invoke_tool
 
 _TOOL_NAMES = [

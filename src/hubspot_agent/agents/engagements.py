@@ -4,7 +4,7 @@ import hubspot_agent.tools.engagements  # noqa: F401 — registers tools
 from hubspot_agent.agents._base import AgentPrompt, build_agent_prompt
 from hubspot_agent.config import PortalConfig
 from hubspot_agent.dispatch import register_execute, register_preview, register_reconcile
-from hubspot_agent.models import PreviewResult
+from hubspot_agent.models import PreviewResult, TaskIntent
 from hubspot_agent.tools import get_tool, invoke_tool
 
 _TOOL_NAMES = [

@@ -4,7 +4,7 @@ import hubspot_agent.tools.deal_splits  # noqa: F401 — registers tools
 from hubspot_agent.agents._base import AgentPrompt, build_agent_prompt
 from hubspot_agent.config import PortalConfig
 from hubspot_agent.dispatch import register_execute, register_preview, register_reconcile
-from hubspot_agent.models import PreviewResult
+from hubspot_agent.models import PreviewResult, TaskIntent
 from hubspot_agent.tools import get_tool, invoke_tool
 
 _TOOL_NAMES = [
@@ -36,12 +36,12 @@ def get_deal_splits_agent_prompt(portal_config: PortalConfig | None = None) -> A
 @register_preview("deal_splits")
 async def _build_deal_splits_preview(
     agent_name: str,
-    intent,
+    intent: TaskIntent,
     client,
     portal_id: str,
 ) -> PreviewResult:
     if intent.intent_type in ("search", "list", "get"):
-        deal_ids = []
+        deal_ids: list[str] = []
         result = await invoke_tool(
             "hubspot_batch_read_deal_splits",
             portal_id,
@@ -85,14 +85,14 @@ async def _build_deal_splits_preview(
 @register_execute("deal_splits")
 async def _execute_deal_splits(
     agent_name: str,
-    intent,
+    intent: TaskIntent,
     request_text: str,
     client,
     portal_id: str,
     proposed_payload: dict | None,
 ) -> dict:
     if intent.intent_type in ("search", "list", "get"):
-        deal_ids = []
+        deal_ids: list[str] = []
         result = await invoke_tool(
             "hubspot_batch_read_deal_splits",
             portal_id,
@@ -122,7 +122,7 @@ async def _execute_deal_splits(
 @register_reconcile("deal_splits")
 async def _reconcile_deal_splits(
     agent_name: str,
-    intent,
+    intent: TaskIntent,
     request_text: str,
     client,
     portal_id: str,

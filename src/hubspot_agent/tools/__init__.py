@@ -35,10 +35,10 @@ def list_tools() -> list[ToolDef]:
     return list(registry.values())
 
 
-async def invoke_tool(name: str, portal_id: str, **kwargs: Any) -> Any:
-    tool_def = get_tool(name)
+async def invoke_tool(tool_name: str, portal_id: str, **kwargs: Any) -> Any:
+    tool_def = get_tool(tool_name)
     if tool_def is None:
-        raise ValueError(f"Unknown tool: {name}")
+        raise ValueError(f"Unknown tool: {tool_name}")
 
     kwargs["portal_id"] = portal_id
     if tool_def.is_async:

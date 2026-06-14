@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Callable
 
 from hubspot_agent.agent_dispatch import build_verify_prompt, spawn_agent
@@ -13,6 +14,7 @@ from hubspot_agent.models import (
     VerificationResult,
 )
 from hubspot_agent.planning import parse_verification_result
+from hubspot_agent.snapshot import save_undo_snapshot, update_undo_snapshot
 
 
 ApprovalCallback = Callable[[dict[str, Any]], bool]
@@ -112,19 +114,52 @@ async def verify_step(
         )
         return "verified", result
 
-    result = parse_verification_result(raw)
-    if result is None:
+    parsed = parse_verification_result(raw)
+    if parsed is None:
         result = VerificationResult(
             status=VerificationResult.Status.ERROR,
             message=f"Could not parse verification result: {raw[:200]}",
         )
         return "escalate", result
 
-    if result.status == VerificationResult.Status.VERIFIED:
-        return "verified", result
-    if result.status in {VerificationResult.Status.MISMATCH, VerificationResult.Status.PARTIAL}:
-        return "retry", result
-    return "escalate", result
+    if parsed.status == VerificationResult.Status.VERIFIED:
+        return "verified", parsed
+    if parsed.status in {VerificationResult.Status.MISMATCH, VerificationResult.Status.PARTIAL}:
+        return "retry", parsed
+    return "escalate", parsed
+
+
+def _snapshot_dir(portal_config: Any) -> str | None:
+    portal_id = getattr(portal_config, "portal_id", None)
+    if not portal_id:
+        return None
+    return str(Path.home() / ".claude" / "hubspot" / str(portal_id) / "undo_snapshots")
+
+
+def _save_step_undo_snapshot(
+    portal_config: Any,
+    action_id: str,
+    preview_data: dict[str, Any],
+) -> None:
+    snapshot_dir = _snapshot_dir(portal_config)
+    if not snapshot_dir:
+        return
+
+    intent_type = preview_data.get("intent_type", "unknown")
+    target_object = preview_data.get("target_object")
+    original_values = preview_data.get("original_values", {})
+
+    undoable = intent_type in ("create", "update")
+    save_undo_snapshot(
+        snapshot_dir,
+        action_id,
+        original_values,
+        metadata={
+            "intent_type": intent_type,
+            "target_object": target_object,
+            "undoable": undoable,
+        },
+    )
 
 
 async def execute_plan(
@@ -176,6 +211,14 @@ async def execute_plan(
         if is_write and not approve_callback(preview_result.data):
             raise RuntimeError(f"Step {step.step_number} ({step.agent}) was not approved.")
 
+        # Persist an undo snapshot before executing writes.
+        if is_write:
+            _save_step_undo_snapshot(
+                portal_config,
+                preview_result.data.get("action_id", "unknown"),
+                preview_result.data,
+            )
+
         # Execute
         payload = preview_result.data.get("proposed_payload")
         execute_result = await dispatch_agent(
@@ -185,9 +228,49 @@ async def execute_plan(
             mode="execute",
             proposed_payload=payload if isinstance(payload, dict) else None,
         )
+
+        # Self-correction: if the executor returns a corrected payload, require
+        # re-approval and execute the corrected version.
+        if execute_result.status == "corrected":
+            corrected_payload = execute_result.corrected_payload or {}
+            corrected_preview = {
+                "action_id": preview_result.data.get("action_id"),
+                "risk_level": preview_result.data.get("risk_level", "medium"),
+                "impact_count": preview_result.data.get("impact_count", 1),
+                "proposed_payload": corrected_payload,
+                "original_values": preview_result.data.get("original_values", {}),
+                "intent_type": preview_result.data.get("intent_type", "unknown"),
+                "target_object": preview_result.data.get("target_object"),
+            }
+            if is_write and not approve_callback(corrected_preview):
+                raise RuntimeError(
+                    f"Step {step.step_number} ({step.agent}) corrected payload was not approved."
+                )
+            execute_result = await dispatch_agent(
+                step.agent,
+                step_request,
+                portal_config=portal_config,
+                mode="execute",
+                proposed_payload=corrected_payload,
+            )
+
         if execute_result.status == "error":
             raise RuntimeError(
                 f"Step {step.step_number} ({step.agent}) execution failed: {execute_result.error_message}"
+            )
+
+        # For creates, record the IDs that were created so the snapshot can undo them.
+        if is_write and preview_result.data.get("intent_type") == "create":
+            created_ids: list[str] = []
+            result_payload = execute_result.data.get("result", {})
+            if isinstance(result_payload, dict):
+                created_id = result_payload.get("id")
+                if created_id:
+                    created_ids.append(str(created_id))
+            update_undo_snapshot(
+                _snapshot_dir(portal_config) or ".",
+                preview_result.data.get("action_id", "unknown"),
+                metadata={"created_ids": created_ids},
             )
 
         artifact = _capture_artifacts(execute_result, step)
