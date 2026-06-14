@@ -9,5 +9,6 @@ def test_associations_agent_prompt_has_correct_tools():
         "hubspot_create_association_schema",
         "hubspot_associate_records",
         "hubspot_disassociate_records",
+        "hubspot_list_associated_records",
     ]
     assert sorted(prompt.tool_names) == sorted(expected)

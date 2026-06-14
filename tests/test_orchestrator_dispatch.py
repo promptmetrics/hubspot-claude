@@ -1,26 +1,354 @@
-from hubspot_agent.orchestrator import dispatch_agent
+import pytest
+
+from hubspot_agent.models import BatchApprovalMode, RiskLevel, TaskIntent
+from hubspot_agent.orchestrator import (
+    _build_preview_for_intent,
+    _extract_search_term,
+    _normalize_informing_sources,
+    _parse_agent_intent,
+    dispatch_agent,
+    dispatch_agents_parallel,
+)
+
+import hubspot_agent.agents.objects  # noqa: F401 — registers preview/execute/reconcile handlers
 
 
-def test_dispatch_agent_unknown():
-    result = dispatch_agent("nonexistent", "do something")
-    assert result.status == "error"
-    assert "Unknown agent" in result.error_message
+class TestParseAgentIntent:
+    def test_search_intent(self):
+        intent = _parse_agent_intent("objects", "find contacts in northeast")
+        assert intent.intent_type == "search"
+        assert intent.target_object == "contacts"
+        assert intent.risk_level == RiskLevel.LOW
+
+    def test_create_intent(self):
+        intent = _parse_agent_intent("objects", "create a new company")
+        assert intent.intent_type == "create"
+        assert intent.target_object == "companies"
+        assert intent.risk_level == RiskLevel.MEDIUM
+
+    def test_update_intent(self):
+        intent = _parse_agent_intent("objects", "update deal stage")
+        assert intent.intent_type == "update"
+        assert intent.target_object == "deals"
+        assert intent.risk_level == RiskLevel.MEDIUM
+
+    def test_delete_intent(self):
+        intent = _parse_agent_intent("objects", "delete old tickets")
+        assert intent.intent_type == "delete"
+        assert intent.target_object == "tickets"
+        assert intent.risk_level == RiskLevel.DESTRUCTIVE
+
+    def test_unknown_intent(self):
+        intent = _parse_agent_intent("objects", "hello world")
+        assert intent.intent_type == "unknown"
+
+    def test_non_objects_agent(self):
+        intent = _parse_agent_intent("workflows", "create a workflow")
+        assert intent.intent_type == "create"
+        assert intent.target_object is None
 
 
-def test_dispatch_agent_preview_mode():
-    result = dispatch_agent("objects", "find contacts in northeast")
-    assert result.status == "preview"
-    assert "find contacts in northeast" in result.data["full_prompt"]
-    assert "Mode: preview" in result.data["full_prompt"]
+class TestExtractSearchTerm:
+    def test_basic_extraction(self):
+        intent = TaskIntent(
+            intent_type="search",
+            target_object="contacts",
+            description="find contacts in northeast",
+            risk_level=RiskLevel.LOW,
+        )
+        term = _extract_search_term(intent)
+        assert "northeast" in term
+
+    def test_empty_after_stop_words(self):
+        intent = TaskIntent(
+            intent_type="search",
+            target_object="contacts",
+            description="find the contact",
+            risk_level=RiskLevel.LOW,
+        )
+        term = _extract_search_term(intent)
+        assert term == "*"
 
 
-def test_dispatch_agent_execute_mode():
-    result = dispatch_agent(
-        "objects",
-        "create a contact",
-        mode="execute",
-        payload={"properties": {"email": "test@example.com"}},
-    )
-    assert result.status == "ready"
-    assert "Execute the following payload" in result.data["full_prompt"]
-    assert "test@example.com" in result.data["full_prompt"]
+class TestBuildPreviewForIntent:
+    @pytest.mark.asyncio
+    async def test_objects_create_preview(self, monkeypatch):
+        async def mock_tool(*a, **k):
+            return {"results": []}
+
+        monkeypatch.setattr(
+            "hubspot_agent.agents.objects.invoke_tool",
+            mock_tool,
+        )
+
+        class FakeClient:
+            async def close(self):
+                pass
+
+        intent = TaskIntent(
+            intent_type="create",
+            target_object="contacts",
+            description="create a contact",
+            risk_level=RiskLevel.MEDIUM,
+            estimated_impact=1,
+        )
+        preview = await _build_preview_for_intent("objects", intent, FakeClient(), "123")
+        assert preview.impact_count == 1
+        assert preview.risk_level == RiskLevel.MEDIUM
+        assert "create" in preview.preview.get("message", "")
+
+    @pytest.mark.asyncio
+    async def test_objects_search_preview(self, monkeypatch):
+        async def mock_tool(*a, **k):
+            return {
+                "results": [
+                    {"id": "1", "properties": {"firstname": "Alice"}},
+                    {"id": "2", "properties": {"firstname": "Bob"}},
+                ]
+            }
+
+        monkeypatch.setattr(
+            "hubspot_agent.agents.objects.invoke_tool",
+            mock_tool,
+        )
+
+        class FakeClient:
+            async def close(self):
+                pass
+
+        intent = TaskIntent(
+            intent_type="search",
+            target_object="contacts",
+            description="find contacts",
+            risk_level=RiskLevel.LOW,
+        )
+        preview = await _build_preview_for_intent("objects", intent, FakeClient(), "123")
+        assert preview.impact_count == 2
+        assert preview.risk_level == RiskLevel.LOW
+        assert "1" in preview.original_values
+
+    @pytest.mark.asyncio
+    async def test_objects_search_error(self, monkeypatch):
+        async def mock_tool(*a, **k):
+            return {"error": "scope_missing"}
+
+        monkeypatch.setattr(
+            "hubspot_agent.agents.objects.invoke_tool",
+            mock_tool,
+        )
+
+        class FakeClient:
+            async def close(self):
+                pass
+
+        intent = TaskIntent(
+            intent_type="search",
+            target_object="contacts",
+            description="find contacts",
+            risk_level=RiskLevel.LOW,
+        )
+        preview = await _build_preview_for_intent("objects", intent, FakeClient(), "123")
+        assert preview.impact_count == 0
+        assert "error" in preview.preview
+
+    @pytest.mark.asyncio
+    async def test_other_agent_preview(self, monkeypatch):
+        class FakeClient:
+            async def close(self):
+                pass
+
+        intent = TaskIntent(
+            intent_type="create",
+            description="create a workflow",
+            risk_level=RiskLevel.MEDIUM,
+        )
+        preview = await _build_preview_for_intent("workflows", intent, FakeClient(), "123")
+        assert preview.impact_count == 1
+
+
+class TestDispatchAgent:
+    @pytest.mark.asyncio
+    async def test_preview_mode_returns_preview(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "hubspot_agent.orchestrator._store_pending_preview",
+            lambda pid, aid, data: None,
+        )
+
+        async def mock_tool(*a, **k):
+            return {"results": []}
+
+        monkeypatch.setattr(
+            "hubspot_agent.agents.objects.invoke_tool",
+            mock_tool,
+        )
+
+        from hubspot_agent.config import PortalConfig
+
+        portal = PortalConfig(portal_id="123", token="test-token")
+        result = await dispatch_agent(
+            "objects",
+            "find contacts",
+            portal,
+            mode="preview",
+        )
+        assert result.status == "preview"
+        assert "action_id" in result.data
+        assert result.data.get("risk_level") == "low"
+
+    @pytest.mark.asyncio
+    async def test_execute_mode_search(self, monkeypatch):
+        async def mock_tool(*a, **k):
+            return {"results": [{"id": "1"}]}
+
+        monkeypatch.setattr(
+            "hubspot_agent.agents.objects.invoke_tool",
+            mock_tool,
+        )
+
+        from hubspot_agent.config import PortalConfig
+
+        portal = PortalConfig(portal_id="123", token="test-token")
+        result = await dispatch_agent(
+            "objects",
+            "find contacts",
+            portal,
+            mode="execute",
+        )
+        assert result.status == "success"
+        assert "result" in result.data
+
+    @pytest.mark.asyncio
+    async def test_execute_mode_create(self, monkeypatch):
+        async def mock_tool(*a, **k):
+            return {"id": "1", "properties": {}}
+
+        monkeypatch.setattr(
+            "hubspot_agent.agents.objects.invoke_tool",
+            mock_tool,
+        )
+
+        from hubspot_agent.config import PortalConfig
+
+        portal = PortalConfig(portal_id="123", token="test-token")
+        result = await dispatch_agent(
+            "objects",
+            "create a contact",
+            portal,
+            mode="execute",
+            proposed_payload={"properties": {"firstname": "Alice"}},
+        )
+        assert result.status == "success"
+
+    @pytest.mark.asyncio
+    async def test_execute_mode_update_no_records(self, monkeypatch):
+        async def mock_tool(*a, **k):
+            return {"results": []}
+
+        monkeypatch.setattr(
+            "hubspot_agent.agents.objects.invoke_tool",
+            mock_tool,
+        )
+
+        from hubspot_agent.config import PortalConfig
+
+        portal = PortalConfig(portal_id="123", token="test-token")
+        result = await dispatch_agent(
+            "objects",
+            "update contact",
+            portal,
+            mode="execute",
+        )
+        assert result.status == "error"
+        assert "No matching records" in result.error_message
+
+    @pytest.mark.asyncio
+    async def test_unknown_agent(self):
+        from hubspot_agent.config import PortalConfig
+
+        portal = PortalConfig(portal_id="123", token="test-token")
+        result = await dispatch_agent(
+            "nonexistent",
+            "do something",
+            portal,
+        )
+        assert result.status == "error"
+        assert "Unknown agent" in result.error_message
+
+
+class TestDispatchAgentsParallel:
+    @pytest.mark.asyncio
+    async def test_parallel_dispatch(self, monkeypatch):
+        monkeypatch.setattr(
+            "hubspot_agent.orchestrator._store_pending_preview",
+            lambda pid, aid, data: None,
+        )
+
+        async def mock_tool(*a, **k):
+            return {"results": []}
+
+        monkeypatch.setattr(
+            "hubspot_agent.agents.objects.invoke_tool",
+            mock_tool,
+        )
+
+        from hubspot_agent.config import PortalConfig
+
+        portal = PortalConfig(portal_id="123", token="test-token")
+        results = await dispatch_agents_parallel(
+            ["objects", "properties"],
+            "find contacts",
+            portal,
+            mode="preview",
+        )
+        assert len(results) == 2
+        assert all(r.status == "preview" for r in results)
+
+
+class TestNormalizeInformingSources:
+    def test_official_url_unchanged(self):
+        sources = [
+            {
+                "source": "official",
+                "trust_tier": "official",
+                "title": "Contacts API",
+                "url": "https://developers.hubspot.com/docs/api/crm/contacts",
+                "last_updated": "2026-05-01",
+            }
+        ]
+        result = _normalize_informing_sources(sources)
+        assert result[0]["trust_tier"] == "official"
+        assert result[0]["source"] == "official"
+
+    def test_community_url_downgrades_official_claim(self):
+        sources = [
+            {
+                "source": "official",
+                "trust_tier": "official",
+                "title": "Random blog",
+                "url": "https://random.example.com/post",
+                "last_updated": None,
+            }
+        ]
+        result = _normalize_informing_sources(sources)
+        assert result[0]["trust_tier"] == "community-unverified"
+        assert result[0]["source"] == "community"
+
+    def test_community_url_unchanged(self):
+        sources = [
+            {
+                "source": "community",
+                "trust_tier": "community-accepted",
+                "title": "Community post",
+                "url": "https://community.hubspot.com/t5/Lists/foo/td-p/12345",
+                "last_updated": None,
+            }
+        ]
+        result = _normalize_informing_sources(sources)
+        assert result[0]["trust_tier"] == "community-accepted"
+        assert result[0]["source"] == "community"
+
+    def test_empty_list(self):
+        assert _normalize_informing_sources([]) == []
+
+    def test_none(self):
+        assert _normalize_informing_sources(None) == []

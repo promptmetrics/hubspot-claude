@@ -41,3 +41,6 @@ The existing `agent2` project at `/Users/izzy/Documents/agent2` contains reusabl
 - `src/hive/hubspot/client.py` — async HTTP client with rate limiting
 - `src/hive/tools/hubspot/objects.py` — object CRUD tools (pattern to follow)
 - `src/hive/agent/coordinator.py` — intent parsing logic (to be replaced, not reused)
+
+## Skills
+  - Load skill from `~/.claude/skills/autolog`

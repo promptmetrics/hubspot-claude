@@ -60,9 +60,11 @@ async def hubspot_create_property(
     property_type: str,
     field_type: str,
     group_name: str = "contactinformation",
-    client: HubSpotClient = None,
+    client: HubSpotClient | None = None,
     portal_id: str = "",
 ) -> dict[str, Any]:
+    if client is None:
+        return {"error": "HubSpotClient not provided", "tool": "hubspot_create_property"}
     _validate_object_type(object_type)
     try:
         resp = await client.post(

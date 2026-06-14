@@ -49,3 +49,205 @@ async def test_client_hubspot_error(respx_mock):
     with pytest.raises(HubSpotError):
         await client.get("/crm/v3/objects/contacts/1", portal_id="123")
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_401_triggers_refresh(respx_mock, monkeypatch, tmp_path):
+    import time
+    from pathlib import Path
+    monkeypatch.setattr("hubspot_agent.config.CONFIG_DIR", tmp_path)
+
+    client = HubSpotClient(PortalConfig(
+        portal_id="123",
+        token="expired-token",
+        auth_type="oauth",
+        refresh_token="refresh-123",
+        expires_at=time.time() + 10000,
+    ))
+
+    call_count = {"n": 0}
+    def handler(request):
+        auth = request.headers.get("Authorization", "")
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            assert "expired-token" in auth
+            return httpx.Response(401, json={"message": "Token expired"})
+        assert "valid-token" in auth
+        return httpx.Response(200, json={"id": "1"})
+
+    respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(side_effect=handler)
+    respx_mock.post("https://api.hubapi.com/oauth/v1/token").mock(
+        return_value=httpx.Response(200, json={
+            "access_token": "valid-token",
+            "refresh_token": "refresh-123",
+            "expires_in": 21600,
+        })
+    )
+
+    resp = await client.get("/crm/v3/objects/contacts/1", portal_id="123")
+    assert resp.body["id"] == "1"
+    assert call_count["n"] == 2
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_401_after_refresh_raises(respx_mock, monkeypatch, tmp_path):
+    import time
+    from hubspot_agent.errors import HubSpotError
+
+    monkeypatch.setattr("hubspot_agent.config.CONFIG_DIR", tmp_path)
+
+    client = HubSpotClient(PortalConfig(
+        portal_id="123",
+        token="bad-token",
+        auth_type="oauth",
+        refresh_token="refresh-123",
+        expires_at=time.time() - 100,
+    ))
+
+    respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(
+        return_value=httpx.Response(401, json={"message": "Token expired"})
+    )
+    respx_mock.post("https://api.hubapi.com/oauth/v1/token").mock(
+        return_value=httpx.Response(200, json={
+            "access_token": "still-bad-token",
+            "refresh_token": "refresh-123",
+            "expires_in": 21600,
+        })
+    )
+
+    with pytest.raises(HubSpotError, match="Token invalid after refresh"):
+        await client.get("/crm/v3/objects/contacts/1", portal_id="123")
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_400_validation_with_field_errors(respx_mock):
+    from hubspot_agent.errors import HubSpotError, ErrorCategory
+    client = HubSpotClient(PortalConfig(portal_id="123", token="test-token"))
+    respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(
+        return_value=httpx.Response(
+            400,
+            json={"errors": [{"field": "email", "message": "invalid"}]},
+        )
+    )
+    with pytest.raises(HubSpotError) as exc_info:
+        await client.get("/crm/v3/objects/contacts/1", portal_id="123")
+    assert exc_info.value.category == ErrorCategory.VALIDATION
+    assert exc_info.value.field_errors == [{"field": "email", "message": "invalid"}]
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_400_validation_without_errors_key(respx_mock):
+    from hubspot_agent.errors import HubSpotError, ErrorCategory
+    client = HubSpotClient(PortalConfig(portal_id="123", token="test-token"))
+    respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(
+        return_value=httpx.Response(400, json={"message": "Bad request"})
+    )
+    with pytest.raises(HubSpotError) as exc_info:
+        await client.get("/crm/v3/objects/contacts/1", portal_id="123")
+    assert exc_info.value.category == ErrorCategory.VALIDATION
+    assert exc_info.value.field_errors is None
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_401_auth_category(respx_mock, monkeypatch, tmp_path):
+    import time
+    from hubspot_agent.errors import HubSpotError, ErrorCategory
+
+    monkeypatch.setattr("hubspot_agent.config.CONFIG_DIR", tmp_path)
+
+    client = HubSpotClient(PortalConfig(
+        portal_id="123",
+        token="bad-token",
+        auth_type="oauth",
+        refresh_token="refresh-123",
+        expires_at=time.time() - 100,
+    ))
+
+    respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(
+        return_value=httpx.Response(401, json={"message": "Token expired"})
+    )
+    respx_mock.post("https://api.hubapi.com/oauth/v1/token").mock(
+        return_value=httpx.Response(200, json={
+            "access_token": "still-bad-token",
+            "refresh_token": "refresh-123",
+            "expires_in": 21600,
+        })
+    )
+
+    with pytest.raises(HubSpotError) as exc_info:
+        await client.get("/crm/v3/objects/contacts/1", portal_id="123")
+    assert exc_info.value.category == ErrorCategory.AUTH
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_403_scope_category(respx_mock):
+    from hubspot_agent.errors import ScopeError, ErrorCategory
+    client = HubSpotClient(PortalConfig(portal_id="123", token="test-token"))
+    respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(
+        return_value=httpx.Response(403, json={"message": "Forbidden"})
+    )
+    with pytest.raises(ScopeError) as exc_info:
+        await client.get(
+            "/crm/v3/objects/contacts/1",
+            portal_id="123",
+            expected_scopes=["crm.objects.contacts.read"],
+        )
+    assert exc_info.value.category == ErrorCategory.SCOPE
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_403_scope_without_expected_scopes(respx_mock):
+    from hubspot_agent.errors import HubSpotError, ErrorCategory
+    client = HubSpotClient(PortalConfig(portal_id="123", token="test-token"))
+    respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(
+        return_value=httpx.Response(403, json={"message": "Forbidden"})
+    )
+    with pytest.raises(HubSpotError) as exc_info:
+        await client.get("/crm/v3/objects/contacts/1", portal_id="123")
+    assert exc_info.value.category == ErrorCategory.SCOPE
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_404_not_found_category(respx_mock):
+    from hubspot_agent.errors import HubSpotError, ErrorCategory
+    client = HubSpotClient(PortalConfig(portal_id="123", token="test-token"))
+    respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(
+        return_value=httpx.Response(404, json={"message": "Not found"})
+    )
+    with pytest.raises(HubSpotError) as exc_info:
+        await client.get("/crm/v3/objects/contacts/1", portal_id="123")
+    assert exc_info.value.category == ErrorCategory.NOT_FOUND
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_409_conflict_category(respx_mock):
+    from hubspot_agent.errors import HubSpotError, ErrorCategory
+    client = HubSpotClient(PortalConfig(portal_id="123", token="test-token"))
+    respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(
+        return_value=httpx.Response(409, json={"message": "Conflict"})
+    )
+    with pytest.raises(HubSpotError) as exc_info:
+        await client.get("/crm/v3/objects/contacts/1", portal_id="123")
+    assert exc_info.value.category == ErrorCategory.CONFLICT
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_500_server_category(respx_mock):
+    from hubspot_agent.errors import HubSpotError, ErrorCategory
+    client = HubSpotClient(PortalConfig(portal_id="123", token="test-token"))
+    respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(
+        return_value=httpx.Response(500, text="Internal Server Error")
+    )
+    with pytest.raises(HubSpotError) as exc_info:
+        await client.get("/crm/v3/objects/contacts/1", portal_id="123")
+    assert exc_info.value.category == ErrorCategory.SERVER
+    await client.close()

@@ -4,6 +4,9 @@ __pycache__/
 .env
 *.egg-info/
 dist/
-.claude/hubspot/
+.claude/
+.codex/
 .pytest_cache/
 .DS_Store
+.coverage
+.hubspot-portal

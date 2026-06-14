@@ -8,6 +8,7 @@ def test_workflows_agent_prompt_has_correct_tools():
         "hubspot_get_workflow",
         "hubspot_list_workflows",
         "hubspot_create_workflow",
+        "hubspot_create_workflow_from_blueprint",
         "hubspot_update_workflow",
         "hubspot_enroll_workflow",
         "hubspot_toggle_workflow",

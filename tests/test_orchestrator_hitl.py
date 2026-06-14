@@ -1,76 +1,74 @@
-from hubspot_agent.orchestrator import needs_approval, present_preview, store_preview_for_execution
-from hubspot_agent.models import PreviewResult, RiskLevel
+import pytest
+
+from hubspot_agent.orchestrator import _normalize_informing_sources
 
 
-def test_needs_approval_low():
-    assert needs_approval(RiskLevel.LOW) is False
+class TestNormalizeInformingSources:
+    def test_empty_returns_empty(self):
+        assert _normalize_informing_sources(None) == []
+        assert _normalize_informing_sources([]) == []
 
+    def test_official_url_corrected_to_official(self):
+        sources = [
+            {
+                "source": "community",
+                "trust_tier": "community-unverified",
+                "title": "Contacts API",
+                "url": "https://developers.hubspot.com/docs/api/crm/contacts",
+                "last_updated": "2026-05-01",
+            }
+        ]
+        result = _normalize_informing_sources(sources)
+        assert result[0]["source"] == "official"
+        assert result[0]["trust_tier"] == "official"
 
-def test_needs_approval_medium():
-    assert needs_approval(RiskLevel.MEDIUM) is True
+    def test_community_url_downgraded_from_official(self):
+        sources = [
+            {
+                "source": "official",
+                "trust_tier": "official",
+                "title": "Random Post",
+                "url": "https://community.hubspot.com/t5/abc",
+                "last_updated": "2026-05-01",
+            }
+        ]
+        result = _normalize_informing_sources(sources)
+        assert result[0]["source"] == "community"
+        assert result[0]["trust_tier"] == "community-unverified"
 
+    def test_mixed_sources_preserved(self):
+        sources = [
+            {
+                "source": "official",
+                "trust_tier": "official",
+                "title": "Docs",
+                "url": "https://developers.hubspot.com/docs",
+                "last_updated": "2026-05-01",
+            },
+            {
+                "source": "community",
+                "trust_tier": "community-accepted",
+                "title": "Forum Post",
+                "url": "https://community.hubspot.com/t5/abc",
+                "last_updated": "2026-04-01",
+            },
+        ]
+        result = _normalize_informing_sources(sources)
+        assert result[0]["source"] == "official"
+        assert result[0]["trust_tier"] == "official"
+        assert result[1]["source"] == "community"
+        assert result[1]["trust_tier"] == "community-accepted"
 
-def test_needs_approval_high():
-    assert needs_approval(RiskLevel.HIGH) is True
-
-
-def test_needs_approval_destructive():
-    assert needs_approval(RiskLevel.DESTRUCTIVE) is True
-
-
-def test_present_preview_summary():
-    result = PreviewResult(
-        preview={"affected": [{"id": "1", "name": "Test"}]},
-        impact_count=1,
-        risk_level=RiskLevel.MEDIUM,
-        proposed_payload={"endpoint": "/crm/v3/objects/contacts"},
-        original_values={},
-    )
-    text = present_preview(result)
-    assert "1 records" in text
-    assert "MEDIUM" in text
-    assert "Approve?" in text
-
-
-def test_present_preview_destructive():
-    result = PreviewResult(
-        preview={"affected": [{"id": "1", "name": "Test"}]},
-        impact_count=5,
-        risk_level=RiskLevel.DESTRUCTIVE,
-        proposed_payload={},
-        original_values={},
-    )
-    text = present_preview(result)
-    assert "DESTRUCTIVE" in text
-    assert "Type `5` to confirm" in text
-
-
-def test_present_preview_details():
-    result = PreviewResult(
-        preview={"affected": [{"id": "1", "name": "Test"}]},
-        impact_count=1,
-        risk_level=RiskLevel.HIGH,
-        proposed_payload={"endpoint": "/api/test"},
-        original_values={},
-    )
-    text = present_preview(result, mode="details")
-    assert "Affected records:" in text
-    assert "Exact API call:" in text
-
-
-def test_store_preview_for_execution(tmp_path, monkeypatch):
-    from pathlib import Path
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-    result = PreviewResult(
-        preview={},
-        impact_count=1,
-        risk_level=RiskLevel.MEDIUM,
-        proposed_payload={},
-        original_values={"contacts": [{"id": "1"}]},
-    )
-    path = store_preview_for_execution("123", "act-1", result)
-    assert path.exists()
-    import json
-    data = json.loads(path.read_text())
-    assert data["original_values"]["contacts"][0]["id"] == "1"
+    def test_unknown_domain_defaults_to_community_unverified(self):
+        sources = [
+            {
+                "source": "official",
+                "trust_tier": "official",
+                "title": "Stack Overflow",
+                "url": "https://stackoverflow.com/questions/123",
+                "last_updated": "2026-05-01",
+            }
+        ]
+        result = _normalize_informing_sources(sources)
+        assert result[0]["source"] == "community"
+        assert result[0]["trust_tier"] == "community-unverified"

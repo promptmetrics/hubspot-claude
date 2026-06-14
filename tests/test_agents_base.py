@@ -42,3 +42,40 @@ def test_build_agent_prompt_with_portal():
     )
     assert "Portal ID: 123" in prompt.system_prompt
     assert "Tier: Professional" in prompt.system_prompt
+
+
+def test_build_agent_prompt_contains_self_correction_block():
+    tools = []
+    prompt = build_agent_prompt(
+        agent_name="Test Agent",
+        domain_description="Testing domain.",
+        available_tools=tools,
+    )
+    assert "Self-correction rules" in prompt.system_prompt
+    assert "VALIDATION errors" in prompt.system_prompt
+
+
+def test_build_agent_prompt_contains_research_block():
+    tools = []
+    prompt = build_agent_prompt(
+        agent_name="Test Agent",
+        domain_description="Testing domain.",
+        available_tools=tools,
+    )
+    assert "Research guidance" in prompt.system_prompt
+    assert "site:developers.hubspot.com" in prompt.system_prompt
+    assert "informing_sources" in prompt.system_prompt
+
+
+def test_build_agent_prompt_research_block_before_reflection_block():
+    tools = [
+        ToolDef(name="create_thing", description="Create a thing", func=lambda: None, is_async=False),
+    ]
+    prompt = build_agent_prompt(
+        agent_name="Test Agent",
+        domain_description="Testing domain.",
+        available_tools=tools,
+    )
+    research_idx = prompt.system_prompt.index("Research guidance")
+    reflection_idx = prompt.system_prompt.index("Write verification")
+    assert research_idx < reflection_idx

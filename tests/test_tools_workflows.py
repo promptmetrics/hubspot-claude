@@ -16,7 +16,7 @@ from hubspot_agent.tools.workflows import (
 @pytest.mark.asyncio
 async def test_hubspot_get_workflow(respx_mock):
     c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
-    respx_mock.get("https://api.hubapi.com/automation/v4/workflows/1").mock(
+    respx_mock.get("https://api.hubapi.com/automation/v4/flows/1").mock(
         return_value=httpx.Response(200, json={"id": "1", "name": "Test"})
     )
     result = await hubspot_get_workflow(workflow_id="1", client=c, portal_id="123")
@@ -27,7 +27,7 @@ async def test_hubspot_get_workflow(respx_mock):
 @pytest.mark.asyncio
 async def test_hubspot_list_workflows(respx_mock):
     c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
-    respx_mock.get("https://api.hubapi.com/automation/v4/workflows").mock(
+    respx_mock.get("https://api.hubapi.com/automation/v4/flows").mock(
         return_value=httpx.Response(200, json={"results": [{"id": "1", "name": "Test"}]})
     )
     result = await hubspot_list_workflows(client=c, portal_id="123")
@@ -38,7 +38,7 @@ async def test_hubspot_list_workflows(respx_mock):
 @pytest.mark.asyncio
 async def test_hubspot_create_workflow(respx_mock):
     c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
-    respx_mock.post("https://api.hubapi.com/automation/v4/workflows").mock(
+    respx_mock.post("https://api.hubapi.com/automation/v4/flows").mock(
         return_value=httpx.Response(201, json={"id": "2"})
     )
     result = await hubspot_create_workflow(name="New", workflow_type="CONTACT_FLOW", actions=[], enrollment={}, client=c, portal_id="123")
@@ -49,7 +49,7 @@ async def test_hubspot_create_workflow(respx_mock):
 @pytest.mark.asyncio
 async def test_hubspot_update_workflow(respx_mock):
     c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
-    respx_mock.patch("https://api.hubapi.com/automation/v4/workflows/1").mock(
+    respx_mock.patch("https://api.hubapi.com/automation/v4/flows/1").mock(
         return_value=httpx.Response(200, json={"id": "1"})
     )
     result = await hubspot_update_workflow(workflow_id="1", updates={"name": "Updated"}, client=c, portal_id="123")
@@ -60,7 +60,7 @@ async def test_hubspot_update_workflow(respx_mock):
 @pytest.mark.asyncio
 async def test_hubspot_enroll_workflow(respx_mock):
     c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
-    respx_mock.post("https://api.hubapi.com/automation/v4/workflows/1/enrollments").mock(
+    respx_mock.post("https://api.hubapi.com/automation/v4/flows/1/enrollments").mock(
         return_value=httpx.Response(200)
     )
     result = await hubspot_enroll_workflow(workflow_id="1", object_ids=["101"], client=c, portal_id="123")
@@ -71,7 +71,7 @@ async def test_hubspot_enroll_workflow(respx_mock):
 @pytest.mark.asyncio
 async def test_hubspot_toggle_workflow(respx_mock):
     c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
-    respx_mock.post("https://api.hubapi.com/automation/v4/workflows/1/toggle").mock(
+    respx_mock.post("https://api.hubapi.com/automation/v4/flows/1/toggle").mock(
         return_value=httpx.Response(200)
     )
     result = await hubspot_toggle_workflow(workflow_id="1", enabled=False, client=c, portal_id="123")

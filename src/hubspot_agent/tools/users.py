@@ -46,9 +46,11 @@ async def hubspot_create_user(
     email: str,
     role_id: str,
     send_welcome_email: bool = True,
-    client: HubSpotClient = None,
+    client: HubSpotClient | None = None,
     portal_id: str = "",
 ) -> dict[str, Any]:
+    if client is None:
+        return {"error": "HubSpotClient not provided", "tool": "hubspot_create_user"}
     try:
         resp = await client.post(
             "/settings/v3/users",

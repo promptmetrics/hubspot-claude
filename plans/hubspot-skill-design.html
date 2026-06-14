@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HubSpot CRM Admin Skill — Design Spec</title>
+<style>
+:root {
+  --ivory: #FAF9F5;
+  --slate: #141413;
+  --clay: #D97757;
+  --clay-d: #B85C3E;
+  --oat: #E3DACC;
+  --olive: #788C5D;
+  --gray-50: #F0EEE6;
+  --gray-200: #D1CFC5;
+  --gray-500: #87867F;
+  --gray-800: #3D3D3A;
+  --white: #ffffff;
+  --serif: ui-serif, Georgia, "Times New Roman", serif;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--ivory);
+  color: var(--slate);
+  font-family: var(--sans);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+.container {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 3rem 1.5rem;
+}
+
+h1, h2, h3, h4 {
+  font-family: var(--serif);
+  color: var(--slate);
+  margin-top: 2.5rem;
+  margin-bottom: 0.75rem;
+  line-height: 1.25;
+}
+
+h1 { font-size: 2.2rem; margin-top: 0; }
+h2 { font-size: 1.6rem; border-bottom: 2px solid var(--oat); padding-bottom: 0.3rem; }
+h3 { font-size: 1.2rem; }
+h4 { font-size: 1rem; font-family: var(--sans); font-weight: 600; }
+
+p { margin: 0.75rem 0; }
+
+a { color: var(--clay); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.meta {
+  display: flex;
+  gap: 1.5rem;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  color: var(--gray-500);
+  margin-bottom: 2rem;
+  flex-wrap: wrap;
+}
+
+.status-badge {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  background: var(--olive);
+  color: var(--white);
+}
+
+.toc {
+  background: var(--gray-50);
+  border: 1px solid var(--oat);
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+  margin: 2rem 0;
+}
+
+.toc h3 {
+  margin-top: 0;
+  font-size: 1rem;
+}
+
+.toc ul {
+  margin: 0;
+  padding-left: 1.2rem;
+  font-size: 0.9rem;
+}
+
+.toc li { margin: 0.35rem 0; }
+
+.code-block {
+  background: var(--slate);
+  color: var(--ivory);
+  padding: 1rem 1.25rem;
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  overflow-x: auto;
+  margin: 1rem 0;
+}
+
+.code-block code { background: transparent; color: inherit; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.25rem 0;
+  font-size: 0.9rem;
+}
+
+th, td {
+  text-align: left;
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid var(--gray-200);
+  vertical-align: top;
+}
+
+th {
+  font-weight: 600;
+  color: var(--slate);
+  border-bottom-width: 2px;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+tr:last-child td { border-bottom: none; }
+
+tbody tr:hover { background: var(--gray-50); }
+
+.caveat {
+  background: #fff8e6;
+  border-left: 3px solid #d4a017;
+  padding: 0.75rem 1rem;
+  margin: 1rem 0;
+  border-radius: 0 6px 6px 0;
+  font-size: 0.9rem;
+}
+
+.caveat strong { color: #8a6d0b; }
+
+.yes { color: var(--olive); font-weight: 600; }
+.no  { color: var(--clay-d); font-weight: 600; }
+.partial { color: #c77f00; font-weight: 600; }
+
+.agent-card {
+  border: 1px solid var(--oat);
+  border-radius: 8px;
+  padding: 1.25rem;
+  margin: 1.25rem 0;
+  background: var(--white);
+}
+
+.agent-card h4 {
+  margin-top: 0;
+  color: var(--clay);
+}
+
+.agent-meta {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--gray-500);
+  margin-bottom: 0.75rem;
+}
+
+.risk-high { color: var(--clay-d); font-weight: 600; }
+.risk-med  { color: #c77f00; font-weight: 600; }
+.risk-low  { color: var(--olive); font-weight: 600; }
+
+.footer {
+  margin-top: 4rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--oat);
+  font-size: 0.85rem;
+  color: var(--gray-500);
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>HubSpot CRM Admin Skill</h1>
+<div class="meta">
+  <span>Version: 2026-05-20</span>
+  <span>Format: Claude Code Skill (<code>/hubspot</code>)</span>
+  <span><span class="status-badge">Design</span></span>
+</div>
+
+<p>A Claude Code skill that administers HubSpot CRM via natural language. Dispatches 14 specialist sub-agents to perform CRUD, automation, analytics, and data operations. All write operations require human-in-the-loop (HITL) approval.</p>
+
+<div class="toc">
+<h3>Contents</h3>
+<ul>
+  <li><a href="#scope">1. Scope — In and Out</a></li>
+  <li><a href="#architecture">2. Architecture</a></li>
+  <li><a href="#agents">3. Agent Definitions (14)</a></li>
+  <li><a href="#api-constraints">4. API Constraints & Caveats</a></li>
+  <li><a href="#hitl">5. HITL & Safety</a></li>
+  <li><a href="#existing-code">6. Existing Code — What’s Real</a></li>
+  <li><a href="#impl">7. Implementation Approach</a></li>
+  <li><a href="#verify">8. Verification Rubric</a></li>
+</ul>
+</div>
+
+<h2 id="scope">1. Scope — In and Out</h2>
+
+<h3>In scope (API-supported)</h3>
+<table>
+<thead>
+<tr><th>Domain</th><th>Ops</th><th>Agent</th></tr>
+</thead>
+<tbody>
+<tr><td>Contacts, companies, deals, tickets, custom objects</td><td>CRUD, search, batch</td><td>ObjectsAgent</td></tr>
+<tr><td>Custom properties, property groups, validations</td><td>CRUD</td><td>PropertiesAgent</td></tr>
+<tr><td>Workflows, enrollment triggers, actions</td><td>CRUD, toggle</td><td>WorkflowsAgent</td></tr>
+<tr><td>Static/dynamic lists, memberships</td><td>CRUD</td><td>ListsAgent</td></tr>
+<tr><td>Deal/ticket pipelines and stages</td><td>CRUD, reorder</td><td>PipelinesAgent</td></tr>
+<tr><td>Users, owners, roles</td><td>Create, get, delete, update profile</td><td>UsersAgent</td></tr>
+<tr><td>Teams (read-only)</td><td>List</td><td>UsersAgent</td></tr>
+<tr><td>Audit logs, login history</td><td>Read (Enterprise)</td><td>UsersAgent</td></tr>
+<tr><td>Data hygiene</td><td>Dedupe, merge, bulk update</td><td>HygieneAgent</td></tr>
+<tr><td>Reports, metrics, velocity</td><td>Read, calculate</td><td>AnalyticsAgent</td></tr>
+<tr><td>Record relationships, association schemas</td><td>CRUD</td><td>AssociationsAgent</td></tr>
+<tr><td>Notes, tasks, emails, meetings, calls</td><td>CRUD</td><td>EngagementsAgent</td></tr>
+<tr><td>Forms</td><td>List, create, get, delete (update with caveat)</td><td>FormsAgent</td></tr>
+<tr><td>Bulk imports, exports</td><td>CSV upload, download URL</td><td>DataAgent</td></tr>
+<tr><td>File Manager</td><td>Upload, list</td><td>DataAgent</td></tr>
+<tr><td>Line items, products</td><td>CRUD, search</td><td>CommerceAgent</td></tr>
+<tr><td>Any endpoint directly</td><td>Read/write</td><td>RawAPIAgent</td></tr>
+</tbody>
+</table>
+
+<h3>Out of scope (no API or incomplete)</h3>
+<table>
+<thead>
+<tr><th>Feature</th><th>Why excluded</th></tr>
+</thead>
+<tbody>
+<tr><td>Sequence authoring</td><td>Sequences API (beta) is read/enroll only. No create/update.</td></tr>
+<tr><td>Lead scoring rule definition</td><td>Score properties readable via API; rules must be created in-app.</td></tr>
+<tr><td>Integration health / connected apps</td><td>No API endpoint exists to list connected apps or sync status.</td></tr>
+<tr><td>Team creation / user reassignment to teams</td><td>HubSpot Settings API supports reading teams but not creating or reassigning.</td></tr>
+<tr><td>Form submissions</td><td>Separate legacy API; out of scope for this revision.</td></tr>
+<tr><td>CMS / blog / landing pages</td><td>Not CRM admin work.</td></tr>
+</tbody>
+</table>
+
+<h2 id="architecture">2. Architecture</h2>
+
+<p>Two layers, no custom orchestration framework:</p>
+
+<table>
+<thead>
+<tr><th>Layer</th><th>Responsibility</th><th>Code location</th></tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Parent Orchestrator</strong></td>
+<td>Parse intent → route to agent(s) → collect results → present preview → HITL approval → execute</td>
+<td><code>src/hubspot_agent/orchestrator.py</code></td>
+</tr>
+<tr>
+<td><strong>14 Domain Sub-Agents</strong></td>
+<td>Each owns a narrow toolset (~4–7 tools) + system prompt. Stateless. Dispatched via Claude Code native <code>Agent</code> tool.</td>
+<td><code>src/hubspot_agent/agents/</code></td>
+</tr>
+</tbody>
+</table>
+
+<h3>State management</h3>
+<p>No custom state framework. Three locations:</p>
+<ol>
+<li><strong>Conversation context</strong> — parent session carries routing decisions and proposed payloads.</li>
+<li><strong>Pending previews</strong> — <code>~/.hubspot-agent/{portal_id}/pending_previews/{action_id}.json</code></li>
+<li><strong>Schema cache</strong> — <code>~/.hubspot-agent/{portal_id}/cache/</code> (custom objects, properties, pipelines)</li>
+</ol>
+
+<h3>Auth</h3>
+<p>OAuth 2.0 or Private App token only. Portal auto-detected from <code>.hubspot-portal</code> file in working directory. Multi-portal support with isolated state directories.</p>
+
+<h2 id="agents">3. Agent Definitions (14)</h2>
+
+<div class="agent-card">
+<h4>1. ObjectsAgent</h4>
+<div class="agent-meta">Core CRM records — contacts, companies, deals, tickets, custom objects</div>
+<p><strong>Tools:</strong> search, get, create, update, delete, batch_upsert, batch_read</p>
+<p><strong>Risk:</strong> <span class="risk-med">Medium</span> (create/update/delete). Search is read-only, low risk.</p>
+<p><strong>Notes:</strong> Custom objects supported via schema cache. Uses object-type-aware property fetching.</p>
+</div>
+
+<div class="agent-card">
+<h4>2. PropertiesAgent</h4>
+<div class="agent-meta">Schema — custom fields, property groups, validation rules</div>
+<p><strong>Tools:</strong> list, get, create, update, delete property</p>
+<p><strong>Risk:</strong> <span class="risk-med">Medium</span></p>
+<p><strong>Notes:</strong> Score properties readable but not creatable via API. Calculation properties created via API cannot be edited in HubSpot UI.</p>
+</div>
+
+<div class="agent-card">
+<h4>3. WorkflowsAgent</h4>
+<div class="agent-meta">Automation — workflows, enrollment triggers, actions</div>
+<p><strong>Tools:</strong> list, get, create, update, toggle_status, delete</p>
+<p><strong>Risk:</strong> <span class="risk-med">Medium</span></p>
+<p><strong>Notes:</strong> Workflow authoring is complex; agent builds JSON payloads from natural language intent.</p>
+</div>
+
+<div class="agent-card">
+<h4>4. ListsAgent</h4>
+<div class="agent-meta">Segmentation — static/dynamic lists, memberships</div>
+<p><strong>Tools:</strong> list, get, create, update, add_members, remove_members</p>
+<p><strong>Risk:</strong> <span class="risk-med">Medium</span></p>
+</div>
+
+<div class="agent-card">
+<h4>5. PipelinesAgent</h4>
+<div class="agent-meta">Pipeline architecture — deal/ticket pipeline stages</div>
+<p><strong>Tools:</strong> list, get, create, update, reorder_stages</p>
+<p><strong>Risk:</strong> <span class="risk-med">Medium</span></p>
+<p><strong>Notes:</strong> Reordering stages affects all deals in the pipeline — high-impact preview.</p>
+</div>
+
+<div class="agent-card">
+<h4>6. UsersAgent</h4>
+<div class="agent-meta">User management, owners, teams (read), audit logs</div>
+<p><strong>Tools:</strong> list_owners, get_user, create_user, delete_user, update_user_profile, list_teams, get_audit_logs, get_login_history</p>
+<p><strong>Risk:</strong> <span class="risk-high">High</span> (user deletion)</p>
+<p><strong>Notes:</strong> Team creation and user reassignment to teams are UI-only. Audit logs require Enterprise.</p>
+</div>
+
+<div class="agent-card">
+<h4>7. HygieneAgent</h4>
+<div class="agent-meta">Data quality — deduplication, merges, bulk updates</div>
+<p><strong>Tools:</strong> find_duplicates, merge_objects, bulk_update, preview_segment</p>
+<p><strong>Risk:</strong> <span class="risk-high">High</span> (merge is destructive)</p>
+<p><strong>Notes:</strong> Dupe detection uses search + fuzzy matching on email/domain/phone.</p>
+</div>
+
+<div class="agent-card">
+<h4>8. AnalyticsAgent</h4>
+<div class="agent-meta">Reporting — metrics, velocity, funnel calculations</div>
+<p><strong>Tools:</strong> get_report, calculate_metrics, pipeline_velocity</p>
+<p><strong>Risk:</strong> <span class="risk-low">Low</span> (read-only)</p>
+<p><strong>Notes:</strong> Pipeline velocity calculated from deal stage timestamps, not a native API metric.</p>
+</div>
+
+<div class="agent-card">
+<h4>9. AssociationsAgent</h4>
+<div class="agent-meta">Record relationships — association schemas, links</div>
+<p><strong>Tools:</strong> get_schema, create_association, delete_association, get_associated</p>
+<p><strong>Risk:</strong> <span class="risk-med">Medium</span></p>
+</div>
+
+<div class="agent-card">
+<h4>10. EngagementsAgent</h4>
+<div class="agent-meta">Activity logging — notes, tasks, emails, meetings, calls</div>
+<p><strong>Tools:</strong> search, get, create_note, create_task, create_email, create_meeting, create_call</p>
+<p><strong>Risk:</strong> <span class="risk-med">Medium</span></p>
+</div>
+
+<div class="agent-card">
+<h4>11. FormsAgent</h4>
+<div class="agent-meta">Marketing forms — list, create, get, update (caveated), delete</div>
+<p><strong>Tools:</strong> list, get, create, update, delete</p>
+<p><strong>Risk:</strong> <span class="risk-med">Medium</span></p>
+<div class="caveat">
+<strong>Caveat:</strong> Forms created in HubSpot’s new web UI editor ("v4 forms") return <code>"BANNED"</code> when updated via API. There is no reliable way to detect v4 vs v3 from the API response. Update tool must document this limitation and suggest UI fallback.
+</div>
+</div>
+
+<div class="agent-card">
+<h4>12. DataAgent</h4>
+<div class="agent-meta">Bulk data operations — imports, exports, file manager</div>
+<p><strong>Tools:</strong> import_csv, get_import_status, export_records, get_export_url, upload_file, list_files</p>
+<p><strong>Risk:</strong> <span class="risk-high">High</span> (imports can overwrite data)</p>
+<p><strong>Notes:</strong> Imports require CSV file path + column mapping. Exports are async; returns download URL when ready.</p>
+</div>
+
+<div class="agent-card">
+<h4>13. CommerceAgent</h4>
+<div class="agent-meta">Commerce objects — line items, products</div>
+<p><strong>Tools:</strong> search, get, create, update, delete (for both line_items and products)</p>
+<p><strong>Risk:</strong> <span class="risk-med">Medium</span></p>
+<p><strong>Notes:</strong> Line items can be associated with deals and quotes. Products serve as templates for line items.</p>
+</div>
+
+<div class="agent-card">
+<h4>14. RawAPIAgent</h4>
+<div class="agent-meta">Escape hatch — direct API endpoint access</div>
+<p><strong>Tools:</strong> hubspot_raw_api</p>
+<p><strong>Risk:</strong> <span class="risk-high">High</span></p>
+<p><strong>Notes:</strong> Bypasses all agent-specific safety rails. HITL approval is mandatory. Scope validation checks OAuth scopes before dispatch.</p>
+</div>
+
+<h2 id="api-constraints">4. API Constraints & Caveats</h2>
+
+<table>
+<thead>
+<tr><th>Constraint</th><th>Impact</th><th>Agent handling</th></tr>
+</thead>
+<tbody>
+<tr>
+<td>Forms v4 (new-editor) cannot be updated via API</td>
+<td>Update fails with <code>"BANNED"</code>; no way to detect beforehand</td>
+<td>FormsAgent: document caveat, suggest UI fallback on error</td>
+</tr>
+<tr>
+<td>Teams cannot be created or reassigned via API</td>
+<td>User create supports <code>primaryTeamId</code> but only if team already exists</td>
+<td>UsersAgent: read teams, document UI-only operations</td>
+</tr>
+<tr>
+<td>Audit logs are Enterprise-only</td>
+<td>Non-Enterprise portals get 403</td>
+<td>UsersAgent: capability probe before dispatch; graceful decline</td>
+</tr>
+<tr>
+<td>Score property rules are in-app only</td>
+<td>Cannot create or edit scoring criteria via API</td>
+<td>PropertiesAgent: read score properties, document UI-only</td>
+</tr>
+<tr>
+<td>Sequences API is beta, read/enroll only</td>
+<td>No create/update; no per-sequence email events</td>
+<td>Out of scope for this revision</td>
+</tr>
+<tr>
+<td>Connected apps / integration health has no API</td>
+<td>Cannot list app connections or sync status</td>
+<td>Out of scope</td>
+</tr>
+</tbody>
+</table>
+
+<h2 id="hitl">5. HITL & Safety</h2>
+
+<p>All write operations require human approval. The flow is identical for all 14 agents:</p>
+
+<ol>
+<li><strong>Preview phase</strong> — sub-agent returns proposed action + impact count + sample records</li>
+<li><strong>Parent presents</strong> — "Will update 47 contacts. Approve? (y/n/review)"</li>
+<li><strong>Approval modes</strong> — Single (one at a time) or Batch (<code>--batch</code> flag)</li>
+<li><strong>Timeout reconciliation</strong> — If a write times out, parent auto-dispatches a read to verify state</li>
+<li><strong>Audit log</strong> — Every approved write is logged to <code>~/.hubspot-agent/{portal_id}/audit/</code></li>
+</ol>
+
+<h3>Risk levels</h3>
+<table>
+<thead>
+<tr><th>Level</th><th>Triggers</th><th>Preview requirement</th></tr>
+</thead>
+<tbody>
+<tr><td class="risk-low">Low</td><td>Search, read, list, get</td><td>Optional summary</td></tr>
+<tr><td class="risk-med">Medium</td><td>Create, update, toggle</td><td>Impact count + sample records</td></tr>
+<tr><td class="risk-high">High</td><td>Delete, merge, bulk update, import</td><td>Full record list + explicit confirmation</td></tr>
+</tbody>
+</table>
+
+<h2 id="existing-code">6. Existing Code — What’s Real</h2>
+
+<p>The repo has ~5,500 lines of Python already. This is the ground truth:</p>
+
+<table>
+<thead>
+<tr><th>Component</th><th>Status</th><th>Files</th></tr>
+</thead>
+<tbody>
+<tr><td>Async HTTP client + rate limiting</td><td><span class="yes">Complete</span></td><td><code>client.py</code></td></tr>
+<tr><td>OAuth refresh + error categorization</td><td><span class="yes">Complete</span></td><td><code>client.py</code>, <code>auth.py</code>, <code>errors.py</code></td></tr>
+<tr><td>Intent parsing + routing</td><td><span class="partial">Partial</span></td><td><code>orchestrator.py</code>, <code>routing.py</code></td></tr>
+<tr><td>Preview engine + HITL flow</td><td><span class="partial">Partial</span></td><td><code>orchestrator.py</code>, <code>preview.py</code></td></tr>
+<tr><td>Timeout reconciliation</td><td><span class="partial">Partial</span></td><td><code>orchestrator.py</code></td></tr>
+<tr><td>Tool registry + dispatch</td><td><span class="partial">Partial</span></td><td><code>tools/__init__.py</code></td></tr>
+<tr><td>11 tool modules</td><td><span class="partial">Mixed</span></td><td><code>tools/*.py</code> — some complete, some stubs</td></tr>
+<tr><td>Agent prompt definitions</td><td><span class="no">Missing</span></td><td><code>agents/</code> directory does not exist</td></tr>
+<tr><td>CLI entry point</td><td><span class="no">Missing</span></td><td><code>cli.py</code> is stubbed</td></tr>
+<tr><td>Tests (70+ files)</td><td><span class="partial">Mixed</span></td><td>Many are scaffolded but not exercising real logic</td></tr>
+</tbody>
+</table>
+
+<h2 id="impl">7. Implementation Approach</h2>
+
+<p>Not a from-scratch rebuild. The task is to <strong>complete and align</strong> existing code to this spec.</p>
+
+<table>
+<thead>
+<tr><th>Phase</th><th>Task</th><th>Files</th></tr>
+</thead>
+<tbody>
+<tr><td>1. Inventory</td><td>Audit every file: what works, what’s stub, what’s dead</td><td>All <code>src/</code> and <code>tests/</code></td></tr>
+<tr><td>2. Foundation</td><td>Stabilize client, auth, errors, config, models</td><td><code>client.py</code>, <code>auth.py</code>, <code>errors.py</code>, <code>config.py</code>, <code>models.py</code></td></tr>
+<tr><td>3. Tool completion</td><td>Finish 14 tool modules + registry wiring</td><td><code>tools/*.py</code>, <code>tools/__init__.py</code></td></tr>
+<tr><td>4. Agent prompts</td><td>Create <code>agents/</code> directory with 14 system prompts + tool binding</td><td><code>agents/*.py</code></td></tr>
+<tr><td>5. Orchestrator</td><td>Complete routing, preview, HITL, timeout reconciliation</td><td><code>orchestrator.py</code></td></tr>
+<tr><td>6. CLI</td><td>Wire <code>/hubspot</code> entry point</td><td><code>cli.py</code>, <code>__init__.py</code></td></tr>
+<tr><td>7. Tests</td><td>Bring 70+ tests to passing; add integration tests</td><td><code>tests/</code></td></tr>
+<tr><td>8. Docs</td><td>Usage guide, example commands, caveat reference</td><td><code>SKILL.md</code>, <code>README.md</code></td></tr>
+</tbody>
+</table>
+
+<h2 id="verify">8. Verification Rubric</h2>
+
+<p>This skill is done when:</p>
+
+<ul>
+<li><input type="checkbox"> Every agent in §3 has a system prompt and working tool bindings</li>
+<li><input type="checkbox"> All 14 tool modules execute against HubSpot API without unhandled errors</li>
+<li><input type="checkbox"> Write operations across all agents trigger HITL preview + approval</li>
+<li><input type="checkbox"> Timeout reconciliation correctly verifies state after write timeouts</li>
+<li><input type="checkbox"> Audit log writes every approved action to disk</li>
+<li><input type="checkbox"> <code>/hubspot</code> command parses natural language and routes to the correct agent(s)</li>
+<li><input type="checkbox"> Multi-portal support works (isolated state, switchable default)</li>
+<li><input type="checkbox"> All caveats in §4 are documented in agent prompts and user-facing docs</li>
+<li><input type="checkbox"> 90%+ test coverage on non-UI code</li>
+</ul>
+
+<div class="footer">
+<p>Design spec for the HubSpot CRM Admin Skill. Last updated 2026-05-20.</p>
+<p>Next step: invoke <code>superpowers:write-plan</code> to produce the implementation plan.</p>
+</div>
+
+</div>
+</body>
+</html>

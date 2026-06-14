@@ -88,3 +88,22 @@ async def hubspot_disassociate_records(
         return resp.body
     except (HubSpotError, RateLimitError, ScopeError) as exc:
         return {"error": str(exc), "tool": "hubspot_disassociate_records"}
+
+
+@tool(name="hubspot_list_associated_records", description="List all records of a target type associated with a given source record.")
+async def hubspot_list_associated_records(
+    from_object_type: str,
+    from_object_id: str,
+    to_object_type: str,
+    client: HubSpotClient,
+    portal_id: str,
+) -> dict[str, Any]:
+    try:
+        resp = await client.get(
+            f"/crm/v4/objects/{from_object_type}/{quote(from_object_id, safe='')}/associations/{to_object_type}",
+            portal_id=portal_id,
+            expected_scopes=[f"crm.objects.{from_object_type}.read"],
+        )
+        return resp.body
+    except (HubSpotError, RateLimitError, ScopeError) as exc:
+        return {"error": str(exc), "tool": "hubspot_list_associated_records"}

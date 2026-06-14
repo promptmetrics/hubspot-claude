@@ -84,4 +84,8 @@ async def test_hubspot_batch_upsert_objects(respx_mock):
         portal_id="123",
     )
     assert result["succeeded"] == 1
+    assert "progress" in result
+    assert result["progress"]["action_id"] == result["action_id"]
+    assert result["progress"]["total_chunks"] == 1
+    assert result["progress"]["completed_chunks"] == 1
     await c.close()

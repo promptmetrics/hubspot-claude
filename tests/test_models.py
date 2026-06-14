@@ -37,6 +37,20 @@ def test_preview_result_creation():
     )
     assert result.impact_count == 1
     assert result.risk_level == RiskLevel.DESTRUCTIVE
+    assert result.informing_sources == []
+
+
+def test_preview_result_informing_sources():
+    result = PreviewResult(
+        preview={"affected": [{"id": "1"}]},
+        impact_count=1,
+        risk_level=RiskLevel.MEDIUM,
+        informing_sources=[
+            {"source": "official", "trust_tier": "official", "title": "Docs", "url": "https://developers.hubspot.com/docs"},
+        ],
+    )
+    assert len(result.informing_sources) == 1
+    assert result.informing_sources[0]["source"] == "official"
 
 
 def test_agent_result_creation():

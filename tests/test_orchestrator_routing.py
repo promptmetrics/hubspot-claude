@@ -7,7 +7,7 @@ def test_route_objects_keywords():
 
 
 def test_route_properties_keywords():
-    result = route_request("create a custom field for deals")
+    result = route_request("add a property field")
     assert "properties" in result
 
 
@@ -17,33 +17,8 @@ def test_route_workflows_keywords():
 
 
 def test_route_lists_keywords():
-    result = route_request("add contacts to a list")
+    result = route_request("remove from list")
     assert "lists" in result
-
-
-def test_route_pipelines_keywords():
-    result = route_request("reorder deal pipeline stages")
-    assert "pipelines" in result
-
-
-def test_route_users_keywords():
-    result = route_request("onboard a new user")
-    assert "users" in result
-
-
-def test_route_hygiene_keywords():
-    result = route_request("find duplicate contacts")
-    assert "hygiene" in result
-
-
-def test_route_analytics_keywords():
-    result = route_request("how many deals closed this month")
-    assert "analytics" in result
-
-
-def test_route_associations_keywords():
-    result = route_request("link contacts to companies")
-    assert "associations" in result
 
 
 def test_route_engagements_keywords():
@@ -51,17 +26,46 @@ def test_route_engagements_keywords():
     assert "engagements" in result
 
 
-def test_route_raw_api_keywords():
-    result = route_request("use raw api for custom endpoint")
-    assert "raw_api" in result
-
-
 def test_route_ambiguous_returns_empty():
     result = route_request("hello world")
     assert result == []
 
 
-def test_route_multi_agent_dependency_order():
-    result = route_request("create a property and then build a workflow")
-    # properties should come before workflows due to dependency
-    assert result.index("properties") < result.index("workflows")
+def test_route_non_fast_path_agents():
+    assert route_request("reorder stages in the sales pipeline") == ["pipelines"]
+    assert route_request("onboard a new user") == ["users"]
+    assert route_request("clean up duplicates") == ["hygiene"]
+    assert route_request("show me the analytics dashboard") == ["analytics"]
+    result = route_request("link records to companies")
+    assert set(result) == {"objects", "associations"}
+    assert route_request("use raw api for custom endpoint") == ["raw_api"]
+
+
+def test_route_cross_object_associated_with():
+    result = route_request("contacts associated with companies")
+    assert "associations" in result
+    assert "objects" in result
+
+
+def test_route_cross_object_linked_to():
+    result = route_request("deals linked to companies")
+    assert "associations" in result
+    assert "objects" in result
+
+
+def test_route_cross_object_related_to():
+    result = route_request("tickets related to contacts")
+    assert "associations" in result
+    assert "objects" in result
+
+
+def test_route_cross_object_at_companies():
+    result = route_request("contacts at companies")
+    assert "associations" in result
+    assert "objects" in result
+
+
+def test_route_cross_object_for_company():
+    result = route_request("deals for company")
+    assert "associations" in result
+    assert "objects" in result

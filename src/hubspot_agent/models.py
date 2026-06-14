@@ -13,6 +13,12 @@ class RiskLevel(str, Enum):
     DESTRUCTIVE = "destructive"
 
 
+class BatchApprovalMode(str, Enum):
+    SINGLE = "single"
+    BATCH = "batch"
+    PATTERN = "pattern"
+
+
 class TaskIntent(BaseModel):
     intent_type: str
     target_object: str | None = None
@@ -83,6 +89,9 @@ class PreviewResult(BaseModel):
     risk_level: RiskLevel
     proposed_payload: dict[str, Any] = Field(default_factory=dict)
     original_values: dict[str, Any] = Field(default_factory=dict)
+    informing_sources: list[dict[str, Any]] = Field(default_factory=list)
+    batch_mode: BatchApprovalMode = BatchApprovalMode.SINGLE
+    pattern_sample_size: int = 3
 
 
 class AgentResult(BaseModel):
@@ -91,3 +100,9 @@ class AgentResult(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
     error_message: str | None = None
     retryable: bool = False
+    corrected_payload: dict[str, Any] | None = None
+    correction_reason: str | None = None
+    reflection: dict[str, Any] | None = None
+    informing_sources: list[dict[str, Any]] = Field(default_factory=list)
+    category: str = ""
+    emoji: str = ""

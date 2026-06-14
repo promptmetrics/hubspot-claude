@@ -4,7 +4,60 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from hubspot_agent.config import PortalConfig
+from hubspot_agent.research import RESEARCH_PROMPT_BLOCK
 from hubspot_agent.tools import ToolDef, list_tools
+
+SELF_CORRECTION_PROMPT_BLOCK = """\
+## Self-correction rules
+
+When a tool call returns an error, attempt to resolve it before giving up:
+
+1. **VALIDATION errors** — examine the failing fields. If a property name is
+   rejected, check for typos against known schema fields and retry with the
+   corrected name. If a value has the wrong type, cast or reformat it.
+
+2. **CONFLICT errors** — search for existing records that may be causing the
+   conflict. If a duplicate is found, suggest a merge strategy or update the
+   existing record instead of creating a new one.
+
+3. **NOT_FOUND errors** — search for alternatives (e.g., similar object IDs,
+   related records, or lists/workflows by a similar name). Report missing
+   prerequisites clearly if no alternative exists.
+
+If you produce a corrected payload after resolving an error, return it in
+your response as structured JSON with these fields:
+
+  {
+    "status": "corrected",
+    "correction_reason": "<brief explanation of what was wrong and how it was fixed>",
+    "corrected_payload": { <the fixed payload> }
+  }
+
+Corrected payloads must re-enter the human-in-the-loop approval flow. Do not
+execute a corrected write without user approval.
+"""
+
+REFLECTION_PROMPT_BLOCK = """\
+## Write verification (reflection)
+
+After executing any CREATE, UPDATE, or BATCH write operation, you MUST
+verify the write succeeded before reporting success to the user:
+
+1. Re-fetch the affected record using the read tool (e.g. `hubspot_get_object`
+   or the equivalent read operation for the domain).
+2. Compare the returned properties against the values you intended to write.
+3. Report any mismatches or missing fields clearly.
+4. If verification fails, surface the discrepancy and do not claim success.
+
+Return verification results as structured JSON when available:
+
+  {
+    "status": "verified" | "mismatch",
+    "verified": true | false,
+    "mismatches": [{"field": "...", "expected": "...", "actual": "..."}],
+    "missing_fields": ["..."]
+  }
+"""
 
 
 @dataclass
@@ -12,6 +65,7 @@ class AgentPrompt:
     agent_name: str
     system_prompt: str
     tool_names: list[str] = field(default_factory=list)
+    domain_description: str = ""
 
 
 def format_tool_descriptions(tools: list[ToolDef]) -> str:
@@ -36,6 +90,11 @@ def build_agent_prompt(
             f"- Tier: {portal_config.tier}\n"
         )
 
+    has_write_tools = any(
+        any(kw in t.name for kw in ("create", "update", "delete", "batch"))
+        for t in available_tools
+    )
+
     system_prompt = (
         f"You are the {agent_name} for HubSpot CRM.\n\n"
         f"{domain_description}\n\n"
@@ -47,10 +106,15 @@ def build_agent_prompt(
         f"- If a tool returns an error, surface it clearly with the tool name.\n"
         f"- For write operations, confirm the action before executing.\n"
         f"- If the request is ambiguous, ask for clarification.\n"
+        f"\n{SELF_CORRECTION_PROMPT_BLOCK}\n"
+        f"\n{RESEARCH_PROMPT_BLOCK}\n"
     )
+    if has_write_tools:
+        system_prompt += f"\n{REFLECTION_PROMPT_BLOCK}\n"
 
     return AgentPrompt(
         agent_name=agent_name,
         system_prompt=system_prompt,
         tool_names=[t.name for t in available_tools],
+        domain_description=domain_description,
     )

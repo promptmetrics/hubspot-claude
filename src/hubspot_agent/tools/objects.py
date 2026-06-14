@@ -3,19 +3,42 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import quote
 
+from hubspot_agent.checkpoint import CheckpointManager
 from hubspot_agent.client import HubSpotClient
 from hubspot_agent.errors import HubSpotError, RateLimitError, ScopeError
+from hubspot_agent.progress import ProgressTracker
 from hubspot_agent.tools import tool
+from hubspot_agent.cache import SchemaCache
+from hubspot_agent.validation import validate_properties
 
-_VALID_OBJECT_TYPES = frozenset({"contacts", "companies", "deals", "tickets"})
+_VALID_OBJECT_TYPES = frozenset({
+    "contacts",
+    "companies",
+    "deals",
+    "tickets",
+    "carts",
+    "order",
+    "quotes",
+    "subscriptions",
+    "invoices",
+    "discount",
+    "fees",
+    "taxes",
+    "goal_targets",
+})
 
 
-def _validate_object_type(object_type: str) -> None:
-    if object_type not in _VALID_OBJECT_TYPES:
-        raise ValueError(
-            f"Invalid object_type '{object_type}'. "
-            f"Must be one of: {', '.join(sorted(_VALID_OBJECT_TYPES))}"
-        )
+def _validate_object_type(object_type: str, portal_id: str) -> None:
+    if object_type in _VALID_OBJECT_TYPES:
+        return
+    cache = SchemaCache(portal_id)
+    if cache.get(object_type) is not None:
+        return
+    raise ValueError(
+        f"Invalid object_type '{object_type}'. "
+        f"Must be one of: {', '.join(sorted(_VALID_OBJECT_TYPES))} "
+        f"or a discovered custom object type."
+    )
 
 
 @tool(name="hubspot_get_object", description="Retrieve a HubSpot object by ID.")
@@ -25,7 +48,7 @@ async def hubspot_get_object(
     client: HubSpotClient,
     portal_id: str,
 ) -> dict[str, Any]:
-    _validate_object_type(object_type)
+    _validate_object_type(object_type, portal_id)
     try:
         resp = await client.get(
             f"/crm/v3/objects/{object_type}/{quote(object_id, safe='')}",
@@ -44,7 +67,7 @@ async def hubspot_search_objects(
     client: HubSpotClient,
     portal_id: str,
 ) -> dict[str, Any]:
-    _validate_object_type(object_type)
+    _validate_object_type(object_type, portal_id)
     try:
         resp = await client.post(
             f"/crm/v3/objects/{object_type}/search",
@@ -64,7 +87,15 @@ async def hubspot_create_object(
     client: HubSpotClient,
     portal_id: str,
 ) -> dict[str, Any]:
-    _validate_object_type(object_type)
+    _validate_object_type(object_type, portal_id)
+    validation = validate_properties(object_type, properties, portal_id)
+    if not validation["valid"]:
+        return {
+            "error": "validation_failed",
+            "tool": "hubspot_create_object",
+            "validation_errors": validation["errors"],
+            "refreshed": validation.get("refreshed", False),
+        }
     try:
         resp = await client.post(
             f"/crm/v3/objects/{object_type}",
@@ -85,7 +116,15 @@ async def hubspot_update_object(
     client: HubSpotClient,
     portal_id: str,
 ) -> dict[str, Any]:
-    _validate_object_type(object_type)
+    _validate_object_type(object_type, portal_id)
+    validation = validate_properties(object_type, properties, portal_id)
+    if not validation["valid"]:
+        return {
+            "error": "validation_failed",
+            "tool": "hubspot_update_object",
+            "validation_errors": validation["errors"],
+            "refreshed": validation.get("refreshed", False),
+        }
     try:
         resp = await client.patch(
             f"/crm/v3/objects/{object_type}/{quote(object_id, safe='')}",
@@ -105,7 +144,7 @@ async def hubspot_delete_object(
     client: HubSpotClient,
     portal_id: str,
 ) -> dict[str, Any]:
-    _validate_object_type(object_type)
+    _validate_object_type(object_type, portal_id)
     try:
         resp = await client.delete(
             f"/crm/v3/objects/{object_type}/{quote(object_id, safe='')}",
@@ -151,16 +190,28 @@ async def hubspot_batch_upsert_objects(
     client: HubSpotClient,
     portal_id: str,
     unique_key: str = "email",
+    action_id: str | None = None,
 ) -> dict[str, Any]:
-    _validate_object_type(object_type)
+    _validate_object_type(object_type, portal_id)
     _, creates, updates = _partition_records(records, unique_key)
+
+    import uuid
+    aid = action_id or str(uuid.uuid4())[:8]
+    checkpoint = CheckpointManager(portal_id, aid)
+
+    create_chunks = _chunk(creates, _BATCH_SIZE)
+    update_chunks = _chunk(updates, _BATCH_SIZE)
+    total_chunks = len(create_chunks) + len(update_chunks)
+    progress = ProgressTracker(portal_id, aid, len(records), total_chunks)
 
     created_count = 0
     updated_count = 0
     errors: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
 
-    for chunk in _chunk(creates, _BATCH_SIZE):
+    for idx, chunk in enumerate(create_chunks):
+        chunk_errors: list[dict[str, Any]] = []
+        chunk_succeeded = 0
         try:
             resp = await client.post(
                 f"/crm/v3/objects/{object_type}/batch/create",
@@ -169,13 +220,20 @@ async def hubspot_batch_upsert_objects(
                 expected_scopes=[f"crm.objects.{object_type}.write"],
             )
             body = resp.body
-            created_count += len(body.get("results", []))
+            chunk_succeeded = len(body.get("results", []))
+            created_count += chunk_succeeded
             results.extend(body.get("results", []))
-            errors.extend(body.get("errors", []))
+            chunk_errors.extend(body.get("errors", []))
         except (HubSpotError, RateLimitError, ScopeError) as exc:
-            errors.append({"message": str(exc), "category": "BATCH_CREATE"})
+            chunk_errors.append({"message": str(exc), "category": "BATCH_CREATE"})
+        errors.extend(chunk_errors)
+        last_error = chunk_errors[0].get("message") if chunk_errors else None
+        checkpoint.record_chunk(idx, "batch_create", len(chunk) - len(chunk_errors), len(chunk_errors), chunk_errors)
+        progress.record_chunk(idx, chunk_succeeded, len(chunk_errors), last_error)
 
-    for chunk in _chunk(updates, _BATCH_SIZE):
+    for idx, chunk in enumerate(update_chunks):
+        chunk_errors = []
+        chunk_succeeded = 0
         try:
             resp = await client.post(
                 f"/crm/v3/objects/{object_type}/batch/update",
@@ -184,11 +242,19 @@ async def hubspot_batch_upsert_objects(
                 expected_scopes=[f"crm.objects.{object_type}.write"],
             )
             body = resp.body
-            updated_count += len(body.get("results", []))
+            chunk_succeeded = len(body.get("results", []))
+            updated_count += chunk_succeeded
             results.extend(body.get("results", []))
-            errors.extend(body.get("errors", []))
+            chunk_errors.extend(body.get("errors", []))
         except (HubSpotError, RateLimitError, ScopeError) as exc:
-            errors.append({"message": str(exc), "category": "BATCH_UPDATE"})
+            chunk_errors.append({"message": str(exc), "category": "BATCH_UPDATE"})
+        errors.extend(chunk_errors)
+        last_error = chunk_errors[0].get("message") if chunk_errors else None
+        checkpoint.record_chunk(idx, "batch_update", len(chunk) - len(chunk_errors), len(chunk_errors), chunk_errors)
+        progress.record_chunk(len(create_chunks) + idx, chunk_succeeded, len(chunk_errors), last_error)
+
+    checkpoint.finalize()
+    progress.finalize()
 
     return {
         "succeeded": created_count + updated_count,
@@ -196,4 +262,7 @@ async def hubspot_batch_upsert_objects(
         "total": len(records),
         "results": results,
         "errors": errors,
+        "action_id": aid,
+        "checkpoint": checkpoint.get_resume_state(),
+        "progress": progress.snapshot(),
     }

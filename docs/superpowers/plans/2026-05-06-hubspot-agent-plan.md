@@ -53,6 +53,7 @@
 │       │   ├── associations.py    # AssociationsAgent system prompt + tool binding
 │       │   ├── engagements.py     # EngagementsAgent system prompt + tool binding
 │       │   └── raw_api.py         # RawAPIAgent system prompt + tool binding
+│       ├── research.py            # Research prompt block + URL → source/trust_tier classifier
 │       └── orchestrator.py        # Parent: routing, HITL approval, state passing, scope validation
 ├── tests/
 │   ├── conftest.py                # Shared fixtures (test client, mock portal)
@@ -69,6 +70,7 @@
 │   ├── test_tools_associations.py # Association tool tests
 │   ├── test_tools_engagements.py  # Engagement tool tests
 │   ├── test_tools_raw_api.py      # Raw API tool tests
+│   ├── test_research.py           # Research prompt + URL classifier tests
 │   ├── test_agents_base.py        # Base agent builder tests
 │   ├── test_agents_objects.py     # ObjectsAgent tests
 │   ├── test_orchestrator_routing.py    # Routing tests
@@ -1373,6 +1375,444 @@ git commit -m "feat: add raw_api escape-hatch tool for direct HubSpot API calls"
 
 ---
 
+### Task 17b: Research workflow & source classification
+
+**Files:**
+- Create: `src/hubspot_agent/research.py`
+- Test: `tests/test_research.py`
+
+**Purpose:** Sub-agents research HubSpot semantics by using Claude Code's native `WebSearch` tool with site-restricted queries against `developers.hubspot.com`, `knowledge.hubspot.com`, and `community.hubspot.com`. There is no Python search-tool wrapper — sub-agents call `WebSearch` directly because they already inherit it from Claude Code when dispatched via the `Agent` tool.
+
+What lives in Python is small but real:
+
+1. **`RESEARCH_PROMPT_BLOCK`** — a single-source-of-truth string the base agent builder (Task 18) injects into every sub-agent's system prompt. Defines the search workflow, the result shape sub-agents must return, and trust-tier rules.
+2. **`classify_url(url)`** — best-effort URL → `(source, trust_tier)` classifier. Used by the orchestrator to validate or default what a sub-agent reports in `informing_sources`, so an agent can't accidentally label a random Stack Overflow link as `"official"`.
+
+**Design decisions:**
+- No external search provider, no API key, no `SearchBackend` abstraction — `WebSearch` is the backend.
+- Snippets and full pages are handled by `WebSearch`/`WebFetch` natively; we do not re-implement either.
+- Trust-tier assignment happens in two passes: the sub-agent assigns it based on rich context (accepted-answer flag, employee badges, post age), and the orchestrator validates/falls back via `classify_url`.
+
+- [ ] **Step 1: Write failing test**
+
+```python
+def test_classify_developers_url_is_official():
+    from hubspot_agent.research import classify_url
+    src, tier = classify_url("https://developers.hubspot.com/docs/api/crm/contacts")
+    assert src == "official"
+    assert tier == "official"
+
+
+def test_classify_knowledge_url_is_official():
+    from hubspot_agent.research import classify_url
+    src, tier = classify_url("https://knowledge.hubspot.com/contacts/import-contacts")
+    assert src == "official"
+    assert tier == "official"
+
+
+def test_classify_community_url_defaults_to_unverified():
+    from hubspot_agent.research import classify_url
+    src, tier = classify_url("https://community.hubspot.com/t5/Lists/foo/td-p/12345")
+    assert src == "community"
+    assert tier == "community-unverified"
+
+
+def test_classify_unknown_domain_falls_back_to_community_unverified():
+    from hubspot_agent.research import classify_url
+    src, tier = classify_url("https://random.example.com/post")
+    assert src == "community"
+    assert tier == "community-unverified"
+
+
+def test_research_prompt_block_mentions_websearch_and_informing_sources():
+    from hubspot_agent.research import RESEARCH_PROMPT_BLOCK
+    assert "WebSearch" in RESEARCH_PROMPT_BLOCK
+    assert "site:developers.hubspot.com" in RESEARCH_PROMPT_BLOCK
+    assert "site:community.hubspot.com" in RESEARCH_PROMPT_BLOCK
+    assert "informing_sources" in RESEARCH_PROMPT_BLOCK
+```
+
+- [ ] **Step 2: Run test — expect FAIL**
+
+Run: `pytest tests/test_research.py -v`
+Expected: `ModuleNotFoundError: No module named 'hubspot_agent.research'`
+
+- [ ] **Step 3: Implement research.py**
+
+```python
+"""Research workflow helpers for sub-agents.
+
+Sub-agents perform research using Claude Code's native WebSearch tool with
+site-restricted queries against HubSpot's official docs and community forum.
+This module provides the prompt template injected into every sub-agent (via
+the base agent builder in Task 18) and a URL classifier the orchestrator
+uses to validate or normalize what agents report in `informing_sources`.
+"""
+from __future__ import annotations
+
+from typing import Literal
+
+Source = Literal["official", "community"]
+TrustTier = Literal["official", "community-accepted", "community-unverified"]
+
+OFFICIAL_DOMAINS: tuple[str, ...] = (
+    "developers.hubspot.com",
+    "knowledge.hubspot.com",
+)
+COMMUNITY_DOMAIN = "community.hubspot.com"
+
+
+RESEARCH_PROMPT_BLOCK = """\
+## Research guidance
+
+Before proposing any write, if you are uncertain about HubSpot semantics,
+property type validity, list/workflow behavior, or tier-dependent feature
+availability, research first using the WebSearch tool with site-restricted
+queries:
+
+  - Official docs:   site:developers.hubspot.com <your query>
+  - Knowledge base:  site:knowledge.hubspot.com <your query>
+  - Community:       site:community.hubspot.com <your query>
+
+After an unexpected API error, search the error category or message text the
+same way to interpret it.
+
+Treat community results as hypotheses to verify against the API, not as
+authoritative facts. If a community post is more than ~2 years old, marked
+unanswered, or contradicts the official docs, weight it accordingly.
+
+When research informs a write, populate `informing_sources` on the
+PreviewResult you return. Each entry must be:
+
+  {
+    "source": "official" | "community",
+    "trust_tier": "official" | "community-accepted" | "community-unverified",
+    "title": "<page title>",
+    "url": "<url>",
+    "last_updated": "<ISO date or null>"
+  }
+
+Trust-tier rules:
+  - "official"               — URL on developers.hubspot.com or knowledge.hubspot.com
+  - "community-accepted"     — community.hubspot.com post marked as the accepted
+                               answer OR authored by a HubSpot employee badge
+  - "community-unverified"   — any other community.hubspot.com post
+
+If you fetch full page contents with WebFetch, only retain the parts directly
+relevant to the proposed write. Do not pad `informing_sources` with results
+you did not actually use.
+"""
+
+
+def classify_url(url: str) -> tuple[Source, TrustTier]:
+    """Best-effort source/trust classification from a URL alone.
+
+    The orchestrator uses this to validate or default what a sub-agent reports
+    in `informing_sources`. Sub-agents are expected to assign trust_tier
+    directly using richer context (accepted-answer flag, employee badge, post
+    age); this function exists so the orchestrator can catch obvious mistakes
+    (e.g., a random non-HubSpot URL labeled as "official").
+    """
+    lower = url.lower()
+    if any(domain in lower for domain in OFFICIAL_DOMAINS):
+        return ("official", "official")
+    if COMMUNITY_DOMAIN in lower:
+        return ("community", "community-unverified")
+    # Anything else: treat as community-unverified rather than fabricating an
+    # "official" tier we cannot justify from the URL.
+    return ("community", "community-unverified")
+```
+
+- [ ] **Step 4: Run test — expect PASS**
+
+Run: `pytest tests/test_research.py -v`
+Expected: 5 passed (developers URL, knowledge URL, community URL, unknown URL fallback, prompt block contents).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/hubspot_agent/research.py tests/test_research.py
+git commit -m "feat: add research prompt block and URL → trust_tier classifier"
+```
+
+- [ ] **Step 1: Write failing test**
+
+```python
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_returns_empty_when_no_backend():
+    from hubspot_agent.tools.docs import hubspot_docs_search
+
+    result = await hubspot_docs_search(query="workflow enrollment", search_backend=None)
+    assert result["results"] == []
+    assert "no search backend configured" in result["search_warnings"]
+
+
+@pytest.mark.asyncio
+async def test_searches_both_sources_and_sorts_by_score():
+    from hubspot_agent.tools.docs import DocsResult, hubspot_docs_search
+
+    async def fake_backend(query, domain, limit):
+        if "developers.hubspot.com" in domain:
+            return [DocsResult(
+                source="official", trust_tier="official",
+                title="Workflows v4", url="https://developers.hubspot.com/workflows",
+                snippet="Workflows can be triggered by enrollment criteria.",
+                last_updated="2026-04-01", score=0.9,
+            )]
+        return [DocsResult(
+            source="community", trust_tier="community-unverified",
+            title="Re: Static lists not updating",
+            url="https://community.hubspot.com/t5/abc",
+            snippet="I had this issue too...",
+            last_updated="2024-08-15", score=0.5,
+        )]
+
+    result = await hubspot_docs_search(
+        query="workflow enrollment", search_backend=fake_backend,
+    )
+    sources = {r["source"] for r in result["results"]}
+    assert sources == {"official", "community"}
+    assert result["results"][0]["source"] == "official"  # higher score first
+
+
+@pytest.mark.asyncio
+async def test_snippet_truncation():
+    from hubspot_agent.tools.docs import DocsResult, hubspot_docs_search
+
+    async def fake_backend(query, domain, limit):
+        return [DocsResult(
+            source="official", trust_tier="official",
+            title="t", url="u", snippet="x" * 1000, score=0.5,
+        )]
+
+    result = await hubspot_docs_search(
+        query="q", sources=["official"], search_backend=fake_backend,
+    )
+    assert len(result["results"][0]["snippet"]) <= 300
+
+
+@pytest.mark.asyncio
+async def test_backend_error_surfaces_as_warning():
+    from hubspot_agent.tools.docs import hubspot_docs_search
+
+    async def failing_backend(query, domain, limit):
+        raise RuntimeError("provider down")
+
+    result = await hubspot_docs_search(
+        query="q", sources=["official"], search_backend=failing_backend,
+    )
+    assert result["results"] == []
+    assert any("official search failed" in w for w in result["search_warnings"])
+
+
+@pytest.mark.asyncio
+async def test_single_source_filter():
+    from hubspot_agent.tools.docs import DocsResult, hubspot_docs_search
+
+    async def fake_backend(query, domain, limit):
+        if "developers" in domain:
+            return [DocsResult(
+                source="official", trust_tier="official",
+                title="t", url="u", snippet="s", score=0.9,
+            )]
+        return [DocsResult(
+            source="community", trust_tier="community-unverified",
+            title="t", url="u", snippet="s", score=0.4,
+        )]
+
+    result = await hubspot_docs_search(
+        query="q", sources=["official"], search_backend=fake_backend,
+    )
+    sources = {r["source"] for r in result["results"]}
+    assert sources == {"official"}
+```
+
+- [ ] **Step 2: Run test — expect FAIL**
+
+Run: `pytest tests/test_tools_docs.py -v`
+Expected: `ModuleNotFoundError: No module named 'hubspot_agent.tools.docs'`
+
+- [ ] **Step 3: Implement docs.py**
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Literal
+
+from hubspot_agent.tools import tool
+
+Source = Literal["official", "community"]
+TrustTier = Literal["official", "community-accepted", "community-unverified"]
+
+OFFICIAL_DOMAIN = "developers.hubspot.com"
+COMMUNITY_DOMAIN = "community.hubspot.com"
+_MAX_SNIPPET_CHARS = 300
+
+
+@dataclass
+class DocsResult:
+    source: Source
+    trust_tier: TrustTier
+    title: str
+    url: str
+    snippet: str
+    last_updated: str | None = None
+    score: float = 0.0
+    warnings: list[str] = field(default_factory=list)
+
+
+SearchBackend = Callable[[str, str, int], Awaitable[list[DocsResult]]]
+# Signature: (query, domain, limit) -> list[DocsResult]
+
+_default_backend: SearchBackend | None = None
+
+
+def set_search_backend(backend: SearchBackend | None) -> None:
+    """Register the production search backend (call at startup)."""
+    global _default_backend
+    _default_backend = backend
+
+
+def _truncate_snippet(text: str) -> str:
+    if len(text) <= _MAX_SNIPPET_CHARS:
+        return text
+    return text[: _MAX_SNIPPET_CHARS - 1].rstrip() + "…"
+
+
+def _build_query(query: str, domain_hint: str | None, api_version: str | None) -> str:
+    parts = [query]
+    if domain_hint:
+        parts.append(domain_hint)
+    if api_version:
+        parts.append(api_version)
+    return " ".join(parts)
+
+
+@tool(
+    name="hubspot_docs_search",
+    description=(
+        "Search HubSpot's official documentation and/or the HubSpot community "
+        "for guidance on API semantics, error meanings, list/workflow behavior, "
+        "or tier-dependent feature availability. Call BEFORE proposing a write "
+        "when uncertain, or AFTER an unexpected error to interpret it. Results "
+        "are labeled by source and trust tier; community results are hypotheses "
+        "to verify, not authoritative facts."
+    ),
+)
+async def hubspot_docs_search(
+    query: str,
+    sources: list[Source] | None = None,
+    max_results_per_source: int = 5,
+    domain_hint: str | None = None,
+    api_version: str | None = None,
+    search_backend: SearchBackend | None = None,
+) -> dict[str, Any]:
+    selected_sources: list[Source] = sources or ["official", "community"]
+    backend = search_backend or _default_backend
+    warnings: list[str] = []
+
+    if backend is None:
+        return {
+            "query": query,
+            "results": [],
+            "search_warnings": ["no search backend configured"],
+        }
+
+    full_query = _build_query(query, domain_hint, api_version)
+    results: list[DocsResult] = []
+
+    for source in selected_sources:
+        domain = OFFICIAL_DOMAIN if source == "official" else COMMUNITY_DOMAIN
+        try:
+            source_results = await backend(full_query, domain, max_results_per_source)
+        except Exception as exc:
+            warnings.append(f"{source} search failed: {exc}")
+            continue
+        for r in source_results:
+            r.snippet = _truncate_snippet(r.snippet)
+        results.extend(source_results)
+
+    if not results and not warnings:
+        warnings.append("no results from any source")
+
+    results.sort(key=lambda r: r.score, reverse=True)
+    return {
+        "query": query,
+        "results": [
+            {
+                "source": r.source,
+                "trust_tier": r.trust_tier,
+                "title": r.title,
+                "url": r.url,
+                "snippet": r.snippet,
+                "last_updated": r.last_updated,
+                "score": r.score,
+                "warnings": r.warnings,
+            }
+            for r in results
+        ],
+        "search_warnings": warnings,
+    }
+```
+
+- [ ] **Step 4: Run test — expect PASS**
+
+Run: `pytest tests/test_tools_docs.py -v`
+Expected: 5 passed (no backend, two-source merge, truncation, backend error, single-source filter).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/hubspot_agent/tools/docs.py tests/test_tools_docs.py
+git commit -m "feat: add hubspot_docs_search tool (official + community, cross-agent)"
+```
+
+---
+
+### Task 17b — Amendments to subsequent tasks
+
+These are small, in-place edits to tasks defined later. Apply each when reaching that task; they are not standalone work units.
+
+**Amendment to Task 3 (`models.py`):** Extend `PreviewResult` with an `informing_sources` field so research that shaped a write is carried through preview → approval → audit:
+
+```python
+informing_sources: list[dict[str, Any]] = Field(default_factory=list)
+# Each entry: {"source": "official"|"community", "trust_tier": str,
+#              "title": str, "url": str, "last_updated": str | None}
+```
+
+Also update `tests/test_models.py` to assert the field defaults to an empty list.
+
+**Amendment to Task 18 (`_base.py` — base agent builder):** The base prompt builder must import `RESEARCH_PROMPT_BLOCK` from `hubspot_agent.research` and append it to every sub-agent's system prompt. No tool-list change is needed — sub-agents dispatched via Claude Code's `Agent` tool inherit `WebSearch` and `WebFetch` natively, so research happens through those, not through a registered Python tool.
+
+Add a test in `tests/test_agents_base.py` asserting that any built prompt contains the research prompt block (e.g., assert `"site:developers.hubspot.com" in built_prompt`).
+
+**Amendment to Tasks 19–29 (per-agent definitions):** No per-task code change — the research prompt block is inherited from the base builder, and `WebSearch`/`WebFetch` are inherited from Claude Code. The per-agent tool lists in the spec (which only enumerate the Python `@tool` registrations) stay as-is.
+
+**Amendment to Task 32 (`orchestrator.py`):** Two changes.
+
+1. In `present_preview`, when `result.informing_sources` is non-empty, append a section so the user sees what shaped the proposed write before approving:
+
+   ```
+   **Informed by:**
+   - [Official: <title>](<url>)
+   - [Community (unverified): <title>](<url>)  ← if trust_tier != "official"
+   ```
+
+   Render the trust tier inline for any non-official source so destructive-gate decisions can weight it.
+
+2. Add a normalization step that runs `informing_sources` through `classify_url` (from `hubspot_agent.research`) and overrides any entry whose self-reported `(source, trust_tier)` disagrees with the URL-derived classification — except it never *upgrades* a self-reported `community-accepted` to `official` based on URL alone. This catches an agent labeling a non-HubSpot URL as `"official"` without throwing away the agent's richer accepted-answer context.
+
+Add tests in `tests/test_orchestrator_hitl.py` covering: rendering of mixed official/community sources, and downgrading of a misclassified entry.
+
+**Amendment to Task 36 (`audit.py::log_write`):** Include `informing_sources` in the JSONL audit record (post-normalization, so the log reflects what was actually shown at approval time). Field shape matches the `PreviewResult` field. This makes post-hoc reviews able to attribute "this delete was shaped by a 4-year-old community post." Update the audit test accordingly.
+
+---
+
 ## Phase 4: Sub-Agent Definitions
 
 ### Task 18: Base agent builder
@@ -1731,13 +2171,13 @@ git commit -m "feat: complete hubspot-agent skill with 11 sub-agents, HITL, and 
 
 ## Summary
 
-**38 tasks** organized in 7 phases:
+**39 tasks** organized in 7 phases:
 1. **Scaffolding** (1 task) — project setup
-2. **Shared Infrastructure** (5 tasks) — exceptions, models, config, client, tool registry
-3. **Tool Library** (11 tasks) — ~50 tools across 11 domains
-4. **Sub-Agent Definitions** (12 tasks) — base builder + 11 agents
-5. **Parent Orchestrator** (4 tasks) — routing, scopes, HITL, dispatch
+2. **Shared Infrastructure** (5 tasks) — exceptions, models (with `informing_sources` on PreviewResult), config, client, tool registry
+3. **Tool Library** (11 tasks + 17b research module) — ~50 tools across 11 domains, plus `research.py` (prompt block + URL classifier; sub-agents do search via Claude Code's native `WebSearch`)
+4. **Sub-Agent Definitions** (12 tasks) — base builder injects the research prompt block; per-agent definitions unchanged
+5. **Parent Orchestrator** (4 tasks) — routing, scopes, HITL (with `informing_sources` rendering + normalization), dispatch
 6. **Skill Entry Point** (1 task) — CLI + portal commands
-7. **Integration & Polish** (4 tasks) — cache, audit, integration tests, cleanup
+7. **Integration & Polish** (4 tasks) — cache, audit (with `informing_sources` capture), integration tests, cleanup
 
-**Estimated total:** 38 commits, each representing 2-5 minutes of focused work.
+**Estimated total:** 39 commits, each representing 2-5 minutes of focused work.

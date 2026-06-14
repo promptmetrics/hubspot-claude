@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from hubspot_agent.redaction import redact_dict_for_disk
+
 
 def _audit_file_path(portal_id: str) -> Path:
     base = Path.home() / ".claude" / "hubspot" / portal_id
@@ -17,16 +19,19 @@ def log_write(
     action: str,
     agent: str,
     result_summary: dict[str, Any],
+    informing_sources: list[dict[str, Any]] | None = None,
 ) -> None:
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "action": action,
         "agent": agent,
         "result_summary": result_summary,
+        "informing_sources": informing_sources or [],
     }
+    safe_entry = redact_dict_for_disk(entry)
     file_path = _audit_file_path(portal_id)
     with file_path.open("a") as f:
-        f.write(json.dumps(entry) + "\n")
+        f.write(json.dumps(safe_entry) + "\n")
 
 
 def get_recent_audits(portal_id: str, limit: int = 50) -> list[dict[str, Any]]:

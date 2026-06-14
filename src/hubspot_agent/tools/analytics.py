@@ -7,8 +7,8 @@ from hubspot_agent.errors import HubSpotError, RateLimitError, ScopeError
 from hubspot_agent.tools import tool
 
 
-@tool(name="hubspot_get_report", description="Fetch raw report data from HubSpot analytics.")
-async def hubspot_get_report(
+@tool(name="hubspot_get_analytics_report", description="Fetch raw report data from HubSpot analytics.")
+async def hubspot_get_analytics_report(
     report_id: str,
     client: HubSpotClient,
     portal_id: str,
@@ -21,13 +21,13 @@ async def hubspot_get_report(
         )
         return resp.body
     except (HubSpotError, RateLimitError, ScopeError) as exc:
-        return {"error": str(exc), "tool": "hubspot_get_report"}
+        return {"error": str(exc), "tool": "hubspot_get_analytics_report"}
 
 
 @tool(name="hubspot_calculate_metrics", description="Calculate conversion rate, average deal size, and win rate from deal data.")
 async def hubspot_calculate_metrics(
     data: list[dict[str, Any]],
-    client: HubSpotClient = None,
+    client: HubSpotClient | None = None,
     portal_id: str = "",
 ) -> dict[str, Any]:
     total = len(data)
@@ -48,7 +48,7 @@ async def hubspot_calculate_metrics(
 @tool(name="hubspot_pipeline_velocity", description="Calculate average days between stage transitions from deal history.")
 async def hubspot_pipeline_velocity(
     deals: list[dict[str, Any]],
-    client: HubSpotClient = None,
+    client: HubSpotClient | None = None,
     portal_id: str = "",
 ) -> dict[str, Any]:
     from datetime import datetime
