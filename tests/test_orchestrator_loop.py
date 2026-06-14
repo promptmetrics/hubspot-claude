@@ -1,3 +1,4 @@
+import pytest
 from unittest.mock import patch
 
 from hubspot_agent.config import PortalConfig
@@ -9,15 +10,17 @@ def _portal_config(tier: str = "Professional") -> PortalConfig:
     return PortalConfig(portal_id="123", token="test-token", tier=tier)
 
 
-def test_run_loop_returns_clarifying_question_for_non_json():
+@pytest.mark.asyncio
+async def test_run_loop_returns_clarifying_question_for_non_json():
     config = _portal_config()
     with patch("hubspot_agent.orchestrator.spawn_agent", return_value="What object type do you want?"):
-        result = run_loop("do something", config, ".", "trace-1")
+        result = await run_loop("do something", config, ".", "trace-1")
     assert "need a bit more clarity" in result
     assert "What object type" in result
 
 
-def test_run_loop_validates_plan_and_executes():
+@pytest.mark.asyncio
+async def test_run_loop_validates_plan_and_executes():
     config = _portal_config()
     plan_json = """
     {
@@ -31,7 +34,7 @@ def test_run_loop_validates_plan_and_executes():
     }
     """
 
-    def fake_dispatch(agent_name, user_request, portal_config=None, mode="preview", payload=None):
+    async def fake_dispatch(agent_name, user_request, portal_config=None, mode="preview", **kwargs):
         return AgentResult(
             agent_name=agent_name,
             status="preview" if mode == "preview" else "success",
@@ -40,14 +43,15 @@ def test_run_loop_validates_plan_and_executes():
 
     with patch("hubspot_agent.orchestrator.spawn_agent", return_value=plan_json):
         with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
-            result = run_loop("create property renewal_date", config, ".", "trace-2")
+            result = await run_loop("create property renewal_date", config, ".", "trace-2")
 
     assert "Goal:" in result
     assert "prop-123" in result
     assert "properties" in result
 
 
-def test_run_loop_detects_missing_workflow_capability():
+@pytest.mark.asyncio
+async def test_run_loop_detects_missing_workflow_capability():
     config = _portal_config(tier="Free")
     plan_json = """
     {
@@ -60,13 +64,14 @@ def test_run_loop_detects_missing_workflow_capability():
     """
 
     with patch("hubspot_agent.orchestrator.spawn_agent", return_value=plan_json):
-        result = run_loop("create workflow", config, ".", "trace-3")
+        result = await run_loop("create workflow", config, ".", "trace-3")
 
     assert "cannot be executed" in result
     assert "workflow" in result.lower()
 
 
-def test_run_loop_handles_execution_error():
+@pytest.mark.asyncio
+async def test_run_loop_handles_execution_error():
     config = _portal_config()
     plan_json = """
     {
@@ -78,25 +83,27 @@ def test_run_loop_handles_execution_error():
     }
     """
 
-    def fake_dispatch(agent_name, user_request, portal_config=None, mode="preview", payload=None):
+    async def fake_dispatch(agent_name, user_request, portal_config=None, mode="preview", **kwargs):
         return AgentResult(agent_name=agent_name, status="error", error_message="api down")
 
     with patch("hubspot_agent.orchestrator.spawn_agent", return_value=plan_json):
         with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
-            result = run_loop("create property", config, ".", "trace-4")
+            result = await run_loop("create property", config, ".", "trace-4")
 
     assert "Execution stopped" in result
     assert "api down" in result
 
 
-def test_run_simple_backwards_compatible():
+@pytest.mark.asyncio
+async def test_run_simple_backwards_compatible():
     config = _portal_config()
-    results = run_simple("find contacts", config)
+    results = await run_simple("find contacts", config)
     assert any(r.agent_name == "objects" for r in results)
     assert all(r.status == "preview" for r in results)
 
 
-def test_run_loop_acceptance_property_and_workflow():
+@pytest.mark.asyncio
+async def test_run_loop_acceptance_property_and_workflow():
     """Group 1 acceptance: property creation feeds workflow creation with verification."""
     config = _portal_config(tier="Professional")
     plan_json = """
@@ -129,7 +136,7 @@ def test_run_loop_acceptance_property_and_workflow():
 
     calls: list[tuple[str, str]] = []
 
-    def fake_dispatch(agent_name, user_request, portal_config=None, mode="preview", payload=None):
+    async def fake_dispatch(agent_name, user_request, portal_config=None, mode="preview", **kwargs):
         calls.append((agent_name, mode))
         if agent_name == "properties":
             return AgentResult(
@@ -148,7 +155,7 @@ def test_run_loop_acceptance_property_and_workflow():
 
     with patch("hubspot_agent.orchestrator.spawn_agent", return_value=plan_json):
         with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
-            result = run_loop(
+            result = await run_loop(
                 "create a custom contact property called renewal_date and build a workflow "
                 "that enrolls contacts 30 days before renewal",
                 config,
@@ -158,7 +165,6 @@ def test_run_loop_acceptance_property_and_workflow():
 
     assert "prop-renewal-123" in result
     assert "wf-renewal-456" in result
-    # Each write step gets preview + execute; verification is a spawn_agent call
     assert any(c == ("properties", "preview") for c in calls)
     assert any(c == ("properties", "execute") for c in calls)
     assert any(c == ("workflows", "preview") for c in calls)

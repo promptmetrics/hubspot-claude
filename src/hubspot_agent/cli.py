@@ -28,6 +28,8 @@ from hubspot_agent.orchestrator import (
     initialize_session,
     parse_batch_mode,
     route_request,
+    run_loop,
+    run_simple,
 )
 from hubspot_agent.persistence import (
     clear as _clear_pending_preview,
@@ -53,10 +55,20 @@ def _header(portal_id: str, tier: str = "unknown") -> str:
     return f"📍 Portal: {portal_id} ({tier})"
 
 
+def _parse_flags(request: str) -> tuple[bool, str]:
+    """Return (loop_flag_enabled, stripped_request)."""
+    stripped = request.strip()
+    if stripped.startswith("--loop "):
+        return True, stripped[7:].strip()
+    if stripped == "--loop":
+        return True, ""
+    return False, stripped
+
+
 def hubspot_command(request: str, working_dir: str = ".") -> str:
-    request = request.strip()
+    loop_flag, request = _parse_flags(request)
     if not request:
-        return "Usage: /hubspot <request>"
+        return "Usage: /hubspot [--loop] <request>"
 
     if request.lower().startswith("portal "):
         return _handle_portal_command(request[7:].strip(), working_dir)
@@ -108,6 +120,12 @@ def hubspot_command(request: str, working_dir: str = ".") -> str:
             "I'm not sure which HubSpot domain this request belongs to. "
             "Could you rephrase or specify what you'd like to do (e.g., 'find contacts', 'create workflow')?"
         )
+
+    # Use loop mode when explicitly requested or when multiple agents are involved.
+    use_loop = loop_flag or len(agent_names) > 1
+    if use_loop:
+        emit_trace(portal_id, "route_decision", trace_id, {"agents": agent_names, "mode": "loop"})
+        return _run_async(run_loop, cleaned_request, portal_config, working_dir, trace_id)
 
     emit_trace(portal_id, "route_decision", trace_id, {"agents": agent_names})
 

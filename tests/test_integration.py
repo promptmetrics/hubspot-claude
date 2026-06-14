@@ -1,4 +1,5 @@
 import pytest
+from unittest.mock import patch
 
 from hubspot_agent.cli import hubspot_command
 
@@ -12,26 +13,13 @@ def mock_portal(tmp_path, monkeypatch):
 
 
 def test_integration_read_query(mock_portal):
-    from unittest.mock import patch
-
-    # Multi-domain requests now default to the loop orchestrator.
-    with patch(
-        "hubspot_agent.cli.run_loop",
-        return_value="📍 Portal: 123 (unknown)\n\nGoal: count contacts\n\n### Steps\n1. **objects** — search contacts\n2. **analytics** — calculate count",
-    ):
-        result = hubspot_command("how many contacts", working_dir=mock_portal)
+    result = hubspot_command("how many contacts", working_dir=mock_portal)
     assert "Portal: 123" in result
     assert "objects" in result
 
 
 def test_integration_write_routing(mock_portal):
-    from unittest.mock import patch
-
-    with patch(
-        "hubspot_agent.cli.run_loop",
-        return_value="📍 Portal: 123 (unknown)\n\nGoal: create contact\n\n### Steps\n1. **objects** — create contact",
-    ):
-        result = hubspot_command("create a contact with email test@example.com", working_dir=mock_portal)
+    result = hubspot_command("create a contact with email test@example.com", working_dir=mock_portal)
     assert "Portal: 123" in result
     assert "objects" in result
 
@@ -179,7 +167,7 @@ class TestIntegrationHitlHappyPath:
                 "batch-test",
                 {
                     "agent_name": "objects",
-                    "request_text": "create three contacts",
+                    "request_text": "create a contact",
                     "intent": {"intent_type": "create", "target_object": "contacts"},
                     "preview": preview_result.data,
                     "batch_mode": "batch",
@@ -196,7 +184,7 @@ class TestIntegrationHitlHappyPath:
         portal_file.write_text("123\n")
         save_portal_config(PortalConfig(portal_id="123", token="test-token"))
 
-        result = hubspot_command("create three contacts --batch", working_dir=str(tmp_path))
+        result = hubspot_command("create a contact --batch", working_dir=str(tmp_path))
         assert "Preview" in result
         assert "batch-test" in result
         preview = orchestrator._load_pending_preview("123", "batch-test")

@@ -43,7 +43,9 @@ from hubspot_agent.agents.services import get_services_agent_prompt
 from hubspot_agent.agents.subscriptions import get_subscriptions_agent_prompt
 from hubspot_agent.agents.taxes import get_taxes_agent_prompt
 from hubspot_agent.agents.timeline_events import get_timeline_events_agent_prompt
+from hubspot_agent.agents.triage import get_triage_agent_prompt
 from hubspot_agent.agents.users import get_users_agent_prompt
+from hubspot_agent.agents.verify import get_verify_agent_prompt
 from hubspot_agent.agents.workflows import get_workflows_agent_prompt
 
 _AGENT_REGISTRY: dict[str, Callable[..., AgentPrompt]] = {
@@ -89,6 +91,8 @@ _AGENT_REGISTRY: dict[str, Callable[..., AgentPrompt]] = {
     "email_events": get_email_events_agent_prompt,
     "forecasts": get_forecasts_agent_prompt,
     "timeline_events": get_timeline_events_agent_prompt,
+    "triage": get_triage_agent_prompt,
+    "verify": get_verify_agent_prompt,
 }
 
 # Category taxonomy for visual grouping and CLI organization
@@ -144,6 +148,8 @@ _AGENT_CATEGORIES: dict[str, tuple[str, str]] = {
     "security_history": ("System & Audit", "🔒"),
     "email_events": ("System & Audit", "🔒"),
     "timeline_events": ("System & Audit", "🔒"),
+    "triage": ("Loop", "🔁"),
+    "verify": ("Loop", "✅"),
 }
 
 

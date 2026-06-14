@@ -81,7 +81,7 @@ def _capture_artifacts(result: AgentResult, step: PlanStep) -> StepArtifact:
     )
 
 
-def verify_step(
+async def verify_step(
     step: PlanStep,
     artifact: StepArtifact,
     portal_config: Any,
@@ -127,7 +127,7 @@ def verify_step(
     return "escalate", result
 
 
-def execute_plan(
+async def execute_plan(
     plan: LoopPlan,
     request_text: str,
     portal_config: Any,
@@ -149,18 +149,18 @@ def execute_plan(
     Raises:
         RuntimeError: on unrecoverable error or rejected approval.
     """
-    approve_callback = approve_callback or (lambda _: True)
-    artifacts: dict[int, StepArtifact] = {}
-
     # Lazy import to avoid a circular dependency with orchestrator.py.
     from hubspot_agent.orchestrator import dispatch_agent
+
+    approve_callback = approve_callback or (lambda _: True)
+    artifacts: dict[int, StepArtifact] = {}
 
     for step in plan.steps:
         resolved = _resolve_artifacts(step, artifacts)
         step_request = _build_step_request(step, request_text, resolved)
 
         # Preview
-        preview_result = dispatch_agent(
+        preview_result = await dispatch_agent(
             step.agent,
             step_request,
             portal_config=portal_config,
@@ -178,12 +178,12 @@ def execute_plan(
 
         # Execute
         payload = preview_result.data.get("proposed_payload")
-        execute_result = dispatch_agent(
+        execute_result = await dispatch_agent(
             step.agent,
             step_request,
             portal_config=portal_config,
             mode="execute",
-            payload=payload if isinstance(payload, dict) else None,
+            proposed_payload=payload if isinstance(payload, dict) else None,
         )
         if execute_result.status == "error":
             raise RuntimeError(
@@ -194,7 +194,7 @@ def execute_plan(
         artifacts[step.step_number] = artifact
 
         if is_write:
-            decision, verification = verify_step(step, artifact, portal_config)
+            decision, verification = await verify_step(step, artifact, portal_config)
             if decision == "escalate":
                 raise RuntimeError(
                     f"Step {step.step_number} verification failed: {verification.message}"

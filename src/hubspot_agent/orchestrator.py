@@ -12,7 +12,7 @@ from hubspot_agent.capabilities import CapabilityMatrix, probe_portal, validate_
 from hubspot_agent.client import HubSpotClient
 from hubspot_agent.config import CONFIG_DIR, load_portal_config
 from hubspot_agent.dispatch import get_execute_dispatch, get_preview_builder, get_reconcile_dispatch
-from hubspot_agent.models import AgentResult, BatchApprovalMode, PreviewResult, RiskLevel, TaskIntent
+from hubspot_agent.models import AgentResult, BatchApprovalMode, LoopPlan, PreviewResult, RiskLevel, StepArtifact, TaskIntent
 from hubspot_agent.persistence import clear as _clear_pending_preview
 from hubspot_agent.persistence import list_pending as _list_pending_previews
 from hubspot_agent.persistence import load as _load_pending_preview
@@ -20,6 +20,11 @@ from hubspot_agent.persistence import store as _store_pending_preview
 from hubspot_agent.preview import format_preview
 from hubspot_agent.research import classify_url
 from hubspot_agent.tools import invoke_tool
+
+# Loop engineering imports (Group 1)
+from hubspot_agent.agent_dispatch import build_triage_prompt, spawn_agent
+from hubspot_agent.planning import parse_plan, plan_to_markdown, validate_plan
+from hubspot_agent.sequential_dispatch import execute_plan
 
 
 def _normalize_informing_sources(sources: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -515,3 +520,110 @@ async def reconcile_after_timeout(
         }
     finally:
         await client.close()
+
+
+# ---------------------------------------------------------------------------
+# Loop orchestration (Group 1)
+# ---------------------------------------------------------------------------
+
+
+def _build_loop_capability_matrix(portal_config) -> dict[str, bool]:
+    return {
+        "objects": True,
+        "properties": True,
+        "workflows": portal_config.tier in {"Professional", "Enterprise"},
+        "lists": True,
+        "pipelines": True,
+        "users": True,
+        "hygiene": True,
+        "analytics": True,
+        "associations": True,
+        "engagements": True,
+        "raw_api": True,
+    }
+
+
+def _is_clarifying_response(raw: str) -> bool:
+    """Heuristic: if the triage response is not valid JSON, treat it as clarifying questions."""
+    if not raw or raw.strip().startswith("["):
+        return True
+    parsed = parse_plan(raw)
+    return parsed is None
+
+
+async def run_loop(
+    request_text: str,
+    portal_config,
+    working_dir: str,
+    trace_id: str,
+    approve_callback: Any = None,
+) -> str:
+    """Run the closed-loop planner/executor/verifier for a multi-step HubSpot request."""
+    triage_prompt = build_triage_prompt(request_text, portal_config)
+    triage_raw = spawn_agent("triage", triage_prompt, context={"working_dir": working_dir})
+
+    if _is_clarifying_response(triage_raw):
+        return (
+            f"📍 Portal: {portal_config.portal_id} ({portal_config.tier})\n\n"
+            f"I need a bit more clarity before I can plan this:\n\n{triage_raw.strip()}"
+        )
+
+    plan = parse_plan(triage_raw)
+    if plan is None:
+        return (
+            f"📍 Portal: {portal_config.portal_id} ({portal_config.tier})\n\n"
+            f"I could not build a plan from that request. Could you rephrase?"
+        )
+
+    capability_matrix = _build_loop_capability_matrix(portal_config)
+    validation_errors = validate_plan(plan, capability_matrix)
+    if validation_errors:
+        return (
+            f"📍 Portal: {portal_config.portal_id} ({portal_config.tier})\n\n"
+            f"The generated plan cannot be executed:\n"
+            + "\n".join(f"- {e}" for e in validation_errors)
+            + "\n\nPlease adjust your request or upgrade the portal capabilities."
+        )
+
+    try:
+        artifacts = await execute_plan(
+            plan,
+            request_text,
+            portal_config,
+            trace_id,
+            approve_callback=approve_callback,
+        )
+    except RuntimeError as exc:
+        return (
+            f"📍 Portal: {portal_config.portal_id} ({portal_config.tier})\n\n"
+            f"Execution stopped: {exc}"
+        )
+
+    summary_lines = [
+        f"📍 Portal: {portal_config.portal_id} ({portal_config.tier})",
+        f"**Goal:** {plan.goal}",
+        "",
+        "### Plan executed",
+        plan_to_markdown(plan),
+        "",
+        "### Artifacts",
+    ]
+    for artifact in artifacts:
+        summary_lines.append(f"- Step {artifact.step_number} ({artifact.agent}): {artifact.outputs}")
+        if artifact.warnings:
+            summary_lines.append(f"  - warnings: {artifact.warnings}")
+
+    return "\n".join(summary_lines)
+
+
+async def run_simple(
+    request_text: str,
+    portal_config,
+) -> list[AgentResult]:
+    """Backwards-compatible flat dispatch for single-domain requests."""
+    agent_names = route_request(request_text)
+    results: list[AgentResult] = []
+    for agent_name in agent_names:
+        result = await dispatch_agent(agent_name, request_text, portal_config=portal_config, mode="preview")
+        results.append(result)
+    return results
