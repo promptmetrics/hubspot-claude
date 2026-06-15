@@ -20,7 +20,7 @@ from hubspot_agent.snapshot import save_undo_snapshot, update_undo_snapshot
 ApprovalCallback = Callable[[dict[str, Any]], bool]
 
 
-def _is_write_step(step: PlanStep) -> bool:
+def is_write_step(step: PlanStep) -> bool:
     """Heuristic: steps whose action contains create/update/delete/upsert/enroll/toggle are writes."""
     action = step.action.lower()
     write_verbs = {"create", "update", "delete", "upsert", "merge", "enroll", "toggle", "bulk"}
@@ -162,6 +162,131 @@ def _save_step_undo_snapshot(
     )
 
 
+async def execute_single_step(
+    step: PlanStep,
+    request_text: str,
+    portal_config: Any,
+    resolved_artifacts: dict[int, StepArtifact],
+    approve_callback: ApprovalCallback | None = None,
+) -> StepArtifact:
+    """Execute a single plan step and return its artifact.
+
+    This is the unit of work used by the durable loop controller.  It performs
+    preview, approval, execution, self-correction, undo snapshots, and
+    verification for one step.
+
+    Args:
+        step: The PlanStep to execute.
+        request_text: The original user request.
+        portal_config: Portal configuration.
+        resolved_artifacts: Outputs from prerequisite steps keyed by step number.
+        approve_callback: Optional callable that receives a preview dict and returns True to approve.
+
+    Returns:
+        The StepArtifact produced by the step.
+
+    Raises:
+        RuntimeError: on preview/execution failure, rejected approval, or verification escalation.
+    """
+    # Lazy import to avoid a circular dependency with orchestrator.py.
+    from hubspot_agent.orchestrator import dispatch_agent
+
+    approve_callback = approve_callback or (lambda _: True)
+
+    resolved = _resolve_artifacts(step, resolved_artifacts)
+    step_request = _build_step_request(step, request_text, resolved)
+
+    # Preview
+    preview_result = await dispatch_agent(
+        step.agent,
+        step_request,
+        portal_config=portal_config,
+        mode="preview",
+    )
+    if preview_result.status == "error":
+        raise RuntimeError(
+            f"Step {step.step_number} ({step.agent}) preview failed: {preview_result.error_message}"
+        )
+
+    # Approval for writes
+    is_write = is_write_step(step)
+    if is_write and not approve_callback(preview_result.data):
+        raise RuntimeError(f"Step {step.step_number} ({step.agent}) was not approved.")
+
+    # Persist an undo snapshot before executing writes.
+    if is_write:
+        _save_step_undo_snapshot(
+            portal_config,
+            preview_result.data.get("action_id", "unknown"),
+            preview_result.data,
+        )
+
+    # Execute
+    payload = preview_result.data.get("proposed_payload")
+    execute_result = await dispatch_agent(
+        step.agent,
+        step_request,
+        portal_config=portal_config,
+        mode="execute",
+        proposed_payload=payload if isinstance(payload, dict) else None,
+    )
+
+    # Self-correction: if the executor returns a corrected payload, require
+    # re-approval and execute the corrected version.
+    if execute_result.status == "corrected":
+        corrected_payload = execute_result.corrected_payload or {}
+        corrected_preview = {
+            "action_id": preview_result.data.get("action_id"),
+            "risk_level": preview_result.data.get("risk_level", "medium"),
+            "impact_count": preview_result.data.get("impact_count", 1),
+            "proposed_payload": corrected_payload,
+            "original_values": preview_result.data.get("original_values", {}),
+            "intent_type": preview_result.data.get("intent_type", "unknown"),
+            "target_object": preview_result.data.get("target_object"),
+        }
+        if is_write and not approve_callback(corrected_preview):
+            raise RuntimeError(
+                f"Step {step.step_number} ({step.agent}) corrected payload was not approved."
+            )
+        execute_result = await dispatch_agent(
+            step.agent,
+            step_request,
+            portal_config=portal_config,
+            mode="execute",
+            proposed_payload=corrected_payload,
+        )
+
+    if execute_result.status == "error":
+        raise RuntimeError(
+            f"Step {step.step_number} ({step.agent}) execution failed: {execute_result.error_message}"
+        )
+
+    # For creates, record the IDs that were created so the snapshot can undo them.
+    if is_write and preview_result.data.get("intent_type") == "create":
+        created_ids: list[str] = []
+        result_payload = execute_result.data.get("result", {})
+        if isinstance(result_payload, dict):
+            created_id = result_payload.get("id")
+            if created_id:
+                created_ids.append(str(created_id))
+        update_undo_snapshot(
+            _snapshot_dir(portal_config) or ".",
+            preview_result.data.get("action_id", "unknown"),
+            metadata={"created_ids": created_ids},
+        )
+
+    artifact = _capture_artifacts(execute_result, step)
+
+    if is_write:
+        decision, verification = await verify_step(step, artifact, portal_config)
+        if decision == "escalate":
+            raise RuntimeError(
+                f"Step {step.step_number} verification failed: {verification.message}"
+            )
+
+    return artifact
+
+
 async def execute_plan(
     plan: LoopPlan,
     request_text: str,
@@ -184,103 +309,16 @@ async def execute_plan(
     Raises:
         RuntimeError: on unrecoverable error or rejected approval.
     """
-    # Lazy import to avoid a circular dependency with orchestrator.py.
-    from hubspot_agent.orchestrator import dispatch_agent
-
-    approve_callback = approve_callback or (lambda _: True)
     artifacts: dict[int, StepArtifact] = {}
 
     for step in plan.steps:
-        resolved = _resolve_artifacts(step, artifacts)
-        step_request = _build_step_request(step, request_text, resolved)
-
-        # Preview
-        preview_result = await dispatch_agent(
-            step.agent,
-            step_request,
-            portal_config=portal_config,
-            mode="preview",
+        artifact = await execute_single_step(
+            step,
+            request_text,
+            portal_config,
+            artifacts,
+            approve_callback=approve_callback,
         )
-        if preview_result.status == "error":
-            raise RuntimeError(
-                f"Step {step.step_number} ({step.agent}) preview failed: {preview_result.error_message}"
-            )
-
-        # Approval for writes
-        is_write = _is_write_step(step)
-        if is_write and not approve_callback(preview_result.data):
-            raise RuntimeError(f"Step {step.step_number} ({step.agent}) was not approved.")
-
-        # Persist an undo snapshot before executing writes.
-        if is_write:
-            _save_step_undo_snapshot(
-                portal_config,
-                preview_result.data.get("action_id", "unknown"),
-                preview_result.data,
-            )
-
-        # Execute
-        payload = preview_result.data.get("proposed_payload")
-        execute_result = await dispatch_agent(
-            step.agent,
-            step_request,
-            portal_config=portal_config,
-            mode="execute",
-            proposed_payload=payload if isinstance(payload, dict) else None,
-        )
-
-        # Self-correction: if the executor returns a corrected payload, require
-        # re-approval and execute the corrected version.
-        if execute_result.status == "corrected":
-            corrected_payload = execute_result.corrected_payload or {}
-            corrected_preview = {
-                "action_id": preview_result.data.get("action_id"),
-                "risk_level": preview_result.data.get("risk_level", "medium"),
-                "impact_count": preview_result.data.get("impact_count", 1),
-                "proposed_payload": corrected_payload,
-                "original_values": preview_result.data.get("original_values", {}),
-                "intent_type": preview_result.data.get("intent_type", "unknown"),
-                "target_object": preview_result.data.get("target_object"),
-            }
-            if is_write and not approve_callback(corrected_preview):
-                raise RuntimeError(
-                    f"Step {step.step_number} ({step.agent}) corrected payload was not approved."
-                )
-            execute_result = await dispatch_agent(
-                step.agent,
-                step_request,
-                portal_config=portal_config,
-                mode="execute",
-                proposed_payload=corrected_payload,
-            )
-
-        if execute_result.status == "error":
-            raise RuntimeError(
-                f"Step {step.step_number} ({step.agent}) execution failed: {execute_result.error_message}"
-            )
-
-        # For creates, record the IDs that were created so the snapshot can undo them.
-        if is_write and preview_result.data.get("intent_type") == "create":
-            created_ids: list[str] = []
-            result_payload = execute_result.data.get("result", {})
-            if isinstance(result_payload, dict):
-                created_id = result_payload.get("id")
-                if created_id:
-                    created_ids.append(str(created_id))
-            update_undo_snapshot(
-                _snapshot_dir(portal_config) or ".",
-                preview_result.data.get("action_id", "unknown"),
-                metadata={"created_ids": created_ids},
-            )
-
-        artifact = _capture_artifacts(execute_result, step)
         artifacts[step.step_number] = artifact
-
-        if is_write:
-            decision, verification = await verify_step(step, artifact, portal_config)
-            if decision == "escalate":
-                raise RuntimeError(
-                    f"Step {step.step_number} verification failed: {verification.message}"
-                )
 
     return list(artifacts.values())

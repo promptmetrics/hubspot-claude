@@ -12,7 +12,7 @@ from hubspot_agent.capabilities import CapabilityMatrix, probe_portal, validate_
 from hubspot_agent.client import HubSpotClient
 from hubspot_agent.config import CONFIG_DIR, load_portal_config
 from hubspot_agent.dispatch import get_execute_dispatch, get_preview_builder, get_reconcile_dispatch
-from hubspot_agent.models import AgentResult, BatchApprovalMode, LoopPlan, PreviewResult, RiskLevel, StepArtifact, TaskIntent
+from hubspot_agent.models import AgentResult, BatchApprovalMode, LoopPlan, PreviewResult, RiskLevel, StepArtifact, TaskIntent, VerificationResult
 from hubspot_agent.persistence import clear as _clear_pending_preview
 from hubspot_agent.persistence import list_pending as _list_pending_previews
 from hubspot_agent.persistence import load as _load_pending_preview
@@ -26,6 +26,8 @@ from hubspot_agent.agent_dispatch import build_triage_prompt, spawn_agent
 from hubspot_agent.planning import parse_plan, plan_to_markdown, validate_plan
 from hubspot_agent.sequential_dispatch import execute_plan
 from hubspot_agent.validation import format_scope_error, validate_scopes
+from hubspot_agent.loop_controller import LoopController
+from hubspot_agent import loop_log, loop_state
 
 
 def _normalize_informing_sources(sources: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -582,6 +584,31 @@ def _is_clarifying_response(raw: str) -> bool:
     return parsed is None
 
 
+def _format_loop_result(
+    portal_config,
+    state: loop_state.LoopState,
+    final_message: str,
+) -> str:
+    """Render the final loop result for the user."""
+    summary_lines = [
+        f"📍 Portal: {portal_config.portal_id} ({portal_config.tier})",
+        f"**Goal:** {state.plan.goal}",
+        "",
+        f"**Status:** {state.status}",
+        "",
+        "### Plan executed",
+        plan_to_markdown(state.plan),
+        "",
+        "### Artifacts",
+    ]
+    for artifact in state.artifacts:
+        summary_lines.append(f"- Step {artifact.step_number} ({artifact.agent}): {artifact.outputs}")
+        if artifact.warnings:
+            summary_lines.append(f"  - warnings: {artifact.warnings}")
+    summary_lines.extend(["", final_message])
+    return "\n".join(summary_lines)
+
+
 async def run_loop(
     request_text: str,
     portal_config,
@@ -589,62 +616,153 @@ async def run_loop(
     trace_id: str,
     approve_callback: Any = None,
 ) -> str:
-    """Run the closed-loop planner/executor/verifier for a multi-step HubSpot request."""
-    triage_prompt = build_triage_prompt(request_text, portal_config)
-    triage_raw = spawn_agent("triage", triage_prompt, context={"working_dir": working_dir})
+    """Run the durable closed-loop planner/executor/verifier.
 
-    if _is_clarifying_response(triage_raw):
-        return (
-            f"📍 Portal: {portal_config.portal_id} ({portal_config.tier})\n\n"
-            f"I need a bit more clarity before I can plan this:\n\n{triage_raw.strip()}"
+    If a non-stale LoopState exists for the portal, execution resumes from
+    the saved step.  State is checkpointed after each step and cleared on
+    completion or terminal failure.
+    """
+    portal_id = portal_config.portal_id
+    existing_state = loop_state.load(portal_id)
+
+    if existing_state is not None:
+        if (
+            loop_state.is_stale(existing_state)
+            or existing_state.request_text != request_text
+            or existing_state.status in {"completed", "failed", "escalated", "stop"}
+        ):
+            loop_state.clear(portal_id)
+            existing_state = None
+
+    if existing_state is not None:
+        state = existing_state
+        plan = state.plan
+        loop_log.log_event(portal_id, trace_id, "loop_resumed", {
+            "current_step": state.current_step,
+            "iterations": state.iterations,
+        })
+    else:
+        triage_prompt = build_triage_prompt(request_text, portal_config)
+        triage_raw = spawn_agent("triage", triage_prompt, context={"working_dir": working_dir})
+
+        if _is_clarifying_response(triage_raw):
+            return (
+                f"📍 Portal: {portal_config.portal_id} ({portal_config.tier})\n\n"
+                f"I need a bit more clarity before I can plan this:\n\n{triage_raw.strip()}"
+            )
+
+        parsed_plan = parse_plan(triage_raw)
+        if parsed_plan is None:
+            return (
+                f"📍 Portal: {portal_config.portal_id} ({portal_config.tier})\n\n"
+                f"I could not build a plan from that request. Could you rephrase?"
+            )
+        plan = parsed_plan
+
+        capability_matrix = _build_loop_capability_matrix(portal_config)
+        validation_errors = validate_plan(plan, capability_matrix)
+        if validation_errors:
+            return (
+                f"📍 Portal: {portal_config.portal_id} ({portal_config.tier})\n\n"
+                f"The generated plan cannot be executed:\n"
+                + "\n".join(f"- {e}" for e in validation_errors)
+                + "\n\nPlease adjust your request or upgrade the portal capabilities."
+            )
+
+        state = loop_state.LoopState(
+            portal_id=portal_id,
+            request_text=request_text,
+            trace_id=trace_id,
+            plan=plan,
         )
+        loop_log.log_event(portal_id, trace_id, "loop_started", {
+            "goal": plan.goal,
+            "step_count": len(plan.steps),
+        })
 
-    plan = parse_plan(triage_raw)
-    if plan is None:
-        return (
-            f"📍 Portal: {portal_config.portal_id} ({portal_config.tier})\n\n"
-            f"I could not build a plan from that request. Could you rephrase?"
-        )
+    controller = LoopController(max_iterations=plan.max_iterations)
 
-    capability_matrix = _build_loop_capability_matrix(portal_config)
-    validation_errors = validate_plan(plan, capability_matrix)
-    if validation_errors:
-        return (
-            f"📍 Portal: {portal_config.portal_id} ({portal_config.tier})\n\n"
-            f"The generated plan cannot be executed:\n"
-            + "\n".join(f"- {e}" for e in validation_errors)
-            + "\n\nPlease adjust your request or upgrade the portal capabilities."
-        )
+    while state.current_step < len(plan.steps):
+        step = plan.steps[state.current_step]
+        loop_log.log_event(portal_id, trace_id, "step_started", {
+            "step_number": step.step_number,
+            "agent": step.agent,
+            "action": step.action,
+        })
 
-    try:
-        artifacts = await execute_plan(
-            plan,
-            request_text,
-            portal_config,
-            trace_id,
-            approve_callback=approve_callback,
-        )
-    except RuntimeError as exc:
-        return (
-            f"📍 Portal: {portal_config.portal_id} ({portal_config.tier})\n\n"
-            f"Execution stopped: {exc}"
-        )
+        try:
+            from hubspot_agent.sequential_dispatch import execute_single_step, is_write_step
 
-    summary_lines = [
-        f"📍 Portal: {portal_config.portal_id} ({portal_config.tier})",
-        f"**Goal:** {plan.goal}",
-        "",
-        "### Plan executed",
-        plan_to_markdown(plan),
-        "",
-        "### Artifacts",
-    ]
-    for artifact in artifacts:
-        summary_lines.append(f"- Step {artifact.step_number} ({artifact.agent}): {artifact.outputs}")
-        if artifact.warnings:
-            summary_lines.append(f"  - warnings: {artifact.warnings}")
+            artifact = await execute_single_step(
+                step,
+                state.request_text,
+                portal_config,
+                {a.step_number: a for a in state.artifacts},
+                approve_callback=approve_callback,
+            )
+        except RuntimeError as exc:
+            state.status = "failed"
+            state.last_error = str(exc)
+            loop_state.save(state)
+            loop_log.log_event(portal_id, trace_id, "step_failed", {
+                "step_number": step.step_number,
+                "error": str(exc),
+            })
+            return _format_loop_result(
+                portal_config,
+                state,
+                f"Execution stopped at step {step.step_number}: {exc}",
+            )
 
-    return "\n".join(summary_lines)
+        state.artifacts.append(artifact)
+        loop_log.log_event(portal_id, trace_id, "step_completed", {
+            "step_number": step.step_number,
+            "outputs": artifact.outputs,
+        })
+
+        if is_write_step(step):
+            from hubspot_agent.sequential_dispatch import verify_step
+
+            decision, verification = await verify_step(step, artifact, portal_config)
+            loop_log.log_event(portal_id, trace_id, "verification", {
+                "step_number": step.step_number,
+                "decision": decision,
+                "status": verification.status.value,
+                "message": verification.message,
+            })
+
+            controller_action = controller.next_action(state, verification=verification)
+            if controller_action.action == "retry":
+                controller.record_iteration(state)
+                loop_state.save(state)
+                loop_log.log_event(portal_id, trace_id, "retry", {
+                    "step_number": step.step_number,
+                    "reason": controller_action.reason,
+                    "iteration": state.iterations,
+                })
+                # Re-run the same step on the next loop iteration.
+                continue
+            if controller_action.action in ("escalate", "stop"):
+                state.status = controller_action.action
+                loop_state.save(state)
+                return _format_loop_result(
+                    portal_config,
+                    state,
+                    f"Loop halted: {controller_action.reason}",
+                )
+
+        state.current_step += 1
+        loop_state.save(state)
+
+    state.status = "completed"
+    loop_state.save(state)
+    loop_log.log_event(portal_id, trace_id, "loop_completed", {
+        "iterations": state.iterations,
+        "steps_completed": state.current_step,
+    })
+    result = _format_loop_result(portal_config, state, "Loop completed successfully.")
+    loop_state.clear(portal_id)
+    return result
 
 
 async def run_simple(

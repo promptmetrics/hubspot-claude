@@ -31,6 +31,7 @@ from hubspot_agent.orchestrator import (
     run_loop,
     run_simple,
 )
+from hubspot_agent import loop_log, loop_state
 from hubspot_agent.persistence import (
     clear as _clear_pending_preview,
     confirm as _confirm_pending_preview,
@@ -112,6 +113,20 @@ def hubspot_command(request: str, working_dir: str = ".") -> str:
         if subcommand:
             return _handle_undo(subcommand, working_dir)
         return "Usage: /hubspot undo <action_id> or /hubspot undo list"
+
+    if request.lower() == "continue":
+        return _handle_continue(working_dir)
+
+    if request.lower() == "abandon":
+        return _handle_abandon(working_dir)
+
+    if request.lower().startswith("loop "):
+        subcommand = request[5:].strip()
+        if subcommand.lower() == "status":
+            return _handle_loop_status(working_dir)
+        if subcommand.lower() == "log":
+            return _handle_loop_log(working_dir)
+        return "Usage: /hubspot loop {status | log}"
 
     portal_id = detect_default_portal(working_dir)
     if not portal_id:
@@ -770,5 +785,83 @@ def _handle_reject_last(working_dir: str) -> str:
         return f"❌ Rejected preview {action_id} for {preview_data['agent_name']}."
 
     return "No pending previews to reject."
+
+
+def _handle_continue(working_dir: str) -> str:
+    portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return "No default portal found."
+
+    portal_config = load_portal_config(portal_id)
+    if not portal_config:
+        return f"Portal {portal_id} has no token configured."
+
+    state = loop_state.load(portal_id)
+    if state is None:
+        return "No active loop to continue."
+    if loop_state.is_stale(state):
+        loop_state.clear(portal_id)
+        return "The previous loop has expired. Start a new request."
+
+    trace_id = state.trace_id
+    return _run_async(run_loop, state.request_text, portal_config, working_dir, trace_id)
+
+
+def _handle_abandon(working_dir: str) -> str:
+    portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return "No default portal found."
+
+    state = loop_state.load(portal_id)
+    if state is None:
+        return "No active loop to abandon."
+
+    loop_log.log_event(portal_id, state.trace_id, "loop_abandoned", {
+        "current_step": state.current_step,
+        "status": state.status,
+    })
+    loop_state.clear(portal_id)
+    return f"✅ Abandoned active loop for portal {portal_id}."
+
+
+def _handle_loop_status(working_dir: str) -> str:
+    portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return "No default portal found."
+
+    state = loop_state.load(portal_id)
+    if state is None:
+        return "No active loop for this portal."
+
+    lines = [
+        f"**Loop status for portal {portal_id}**",
+        f"- Goal: {state.plan.goal}",
+        f"- Status: {state.status}",
+        f"- Step: {state.current_step + 1} of {len(state.plan.steps)}",
+        f"- Iterations: {state.iterations}",
+    ]
+    if state.last_error:
+        lines.append(f"- Last error: {state.last_error}")
+    return "\n".join(lines)
+
+
+def _handle_loop_log(working_dir: str, limit: int = 20) -> str:
+    portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return "No default portal found."
+
+    state = loop_state.load(portal_id)
+    trace_id = state.trace_id if state else None
+    events = loop_log.get_recent(portal_id, trace_id=trace_id, limit=limit)
+    if not events:
+        return "No loop log entries for this portal."
+
+    lines = [f"**Recent loop log for portal {portal_id}**", ""]
+    for event in reversed(events):
+        lines.append(
+            f"- `{event.get('timestamp')}` {event.get('event_type')}: "
+            f"{event.get('payload', {})}"
+        )
+    return "\n".join(lines)
 
 
