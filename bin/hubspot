@@ -1,0 +1,43 @@
+#!/bin/sh
+# hubspot — plugin entrypoint.
+#
+# Resolves the plugin venv python (FR-15 venv contract) then runs the daemon
+# router, which routes ``tool`` calls through the warm-client daemon and falls
+# back to the in-process CLI for everything else.
+#
+# Venv resolver priority:
+#   1. $CLAUDE_PLUGIN_DATA/venv.path   (written by the SessionStart hook)
+#   2. $CLAUDE_PLUGIN_DATA/venv/bin/python
+#   3. glob ~/.claude/plugins/data/hubspot-*/venv/bin/python
+#   4. system python3 (package may not be installed → router import errors)
+#      On total failure, print a pointer to install.log and exit 127.
+set -u
+
+CLAUDE_PLUGIN_DATA="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/hubspot}"
+
+PY=""
+if [ -f "$CLAUDE_PLUGIN_DATA/venv.path" ]; then
+  vp=$(cat "$CLAUDE_PLUGIN_DATA/venv.path" 2>/dev/null)
+  if [ -n "$vp" ] && [ -x "$vp/bin/python" ]; then
+    PY="$vp/bin/python"
+  fi
+fi
+if [ -z "$PY" ] && [ -x "$CLAUDE_PLUGIN_DATA/venv/bin/python" ]; then
+  PY="$CLAUDE_PLUGIN_DATA/venv/bin/python"
+fi
+if [ -z "$PY" ]; then
+  for cand in "$HOME"/.claude/plugins/data/hubspot-*/venv/bin/python; do
+    if [ -x "$cand" ]; then PY="$cand"; break; fi
+  done
+fi
+if [ -z "$PY" ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    PY=python3
+  else
+    echo "hubspot: no plugin venv found and python3 not on PATH." >&2
+    echo "hubspot: see $CLAUDE_PLUGIN_DATA/install.log or re-run the SessionStart hook." >&2
+    exit 127
+  fi
+fi
+
+exec "$PY" -m hubspot_agent.router "$@"

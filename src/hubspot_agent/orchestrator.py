@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -18,7 +17,7 @@ from hubspot_agent.persistence import list_pending as _list_pending_previews
 from hubspot_agent.persistence import load as _load_pending_preview
 from hubspot_agent.persistence import store as _store_pending_preview
 from hubspot_agent.preview import format_preview
-from hubspot_agent.research import classify_url
+from hubspot_agent.safety import ScopeBlocked, apply_write, normalize_informing_sources as _normalize_informing_sources
 from hubspot_agent.tools import invoke_tool
 
 # Loop engineering imports (Group 1)
@@ -28,43 +27,6 @@ from hubspot_agent.sequential_dispatch import execute_plan
 from hubspot_agent.validation import format_scope_error, validate_scopes
 from hubspot_agent.loop_controller import LoopController
 from hubspot_agent import loop_log, loop_state
-
-
-def _normalize_informing_sources(sources: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    """Validate and correct trust-tier assignments from sub-agents.
-
-    Sub-agents are expected to assign trust_tier using richer context
-    (accepted-answer flag, employee badge, post age). This function
-    catches obvious URL-vs-tier mismatches so the orchestrator can
-    override misreported tiers before they reach the user or audit log.
-    """
-    if not sources:
-        return []
-    normalized: list[dict[str, Any]] = []
-    for src in sources:
-        url = src.get("url", "")
-        inferred_source, inferred_tier = classify_url(url)
-        reported_tier = src.get("trust_tier", inferred_tier)
-        # If the reported tier contradicts what the URL alone supports,
-        # downgrade to the safest tier the URL can justify.
-        if inferred_source == "official" and reported_tier != "official":
-            # URL is official but agent said otherwise — fix it
-            corrected_tier = "official"
-        elif inferred_source == "community" and reported_tier == "official":
-            # Agent claimed official but URL is community — downgrade
-            corrected_tier = "community-unverified"
-        else:
-            corrected_tier = reported_tier
-        normalized.append(
-            {
-                "source": inferred_source,
-                "trust_tier": corrected_tier,
-                "title": src.get("title", ""),
-                "url": url,
-                "last_updated": src.get("last_updated"),
-            }
-        )
-    return normalized
 
 
 async def initialize_session(portal_id: str) -> None:
@@ -85,6 +47,8 @@ async def initialize_session(portal_id: str) -> None:
 def parse_batch_mode(request: str) -> tuple[BatchApprovalMode, str]:
     """Parse batch approval mode keywords from request text."""
     text = request.lower()
+    if "--pattern" in text:
+        return BatchApprovalMode.PATTERN, request.replace("--pattern", "").strip()
     if "--batch" in text or "approve all" in text:
         return BatchApprovalMode.BATCH, request.replace("--batch", "").replace("approve all", "").strip()
     return BatchApprovalMode.SINGLE, request
@@ -174,6 +138,10 @@ def route_request(request_text: str, portal_id: str | None = None) -> list[str]:
     return [best[0]]
 
 
+# DEAD CODE — NFR-13: Phase-0 routing stubs.  Not called from any production
+# path — routing now goes through ``route_request`` and the ``hubspot route``
+# CLI.  Retained importable because tests/test_routing_regression.py and
+# tests/test_custom_objects.py import these symbols; do not delete.
 def _fast_path_route(request_text: str, portal_id: str | None = None) -> list[str] | None:
     """Stub: fast-path keyword routing for Phase 0."""
     text = request_text.lower()
@@ -228,6 +196,7 @@ def build_routing_prompt(request_text: str, portal_id: str | None = None) -> str
 def parse_llm_routing_response(response: str) -> list[str]:
     """Stub: parse LLM routing response for Phase 0."""
     return [line.strip() for line in response.split(",") if line.strip()]
+# END DEAD CODE — NFR-13 (Phase-0 routing stubs)
 
 
 async def check_dispatch_readiness(agent_names: list[str], portal_config) -> dict[str, Any]:
@@ -392,25 +361,31 @@ async def dispatch_agent(
 
     try:
         if mode == "preview":
-            preview = await _build_preview_for_intent(
-                agent_name, intent, client, portal_config.portal_id
-            )
-
-            action_id = str(uuid.uuid4())[:8]
-            normalized_sources = _normalize_informing_sources(preview.informing_sources)
-            preview_data = {
-                "agent_name": agent_name,
-                "request_text": request_text,
-                "intent": intent.model_dump(mode="json"),
-                "preview": preview.model_dump(mode="json"),
-                "trace_id": trace_id,
-                "batch_mode": batch_mode.value,
-                "proposed_payload": proposed_payload or {},
-                "informing_sources": normalized_sources,
-                "required_confirmation": preview.impact_count,
-                "confirmed_count": None,
-            }
-            _store_pending_preview(portal_config.portal_id, action_id, preview_data)
+            try:
+                aw = await apply_write(
+                    client=client,
+                    portal_config=portal_config,
+                    preview_builder=lambda c: _build_preview_for_intent(
+                        agent_name, intent, c, portal_config.portal_id
+                    ),
+                    agent_name=agent_name,
+                    intent=intent,
+                    request_text=request_text,
+                    trace_id=trace_id,
+                    batch_mode=batch_mode,
+                    proposed_payload=proposed_payload,
+                )
+            except ScopeBlocked as exc:
+                return AgentResult(
+                    agent_name=agent_name,
+                    status="error",
+                    error_message=format_scope_error(exc.blocked),
+                    category=get_agent_category(agent_name),
+                    emoji=get_agent_emoji(agent_name),
+                )
+            preview = aw.preview
+            action_id = aw.action_id
+            normalized_sources = aw.normalized_sources
 
             # Build preview text from the agent's preview dict
             if "message" in preview.preview:
@@ -765,6 +740,10 @@ async def run_loop(
     return result
 
 
+# DEAD CODE — NFR-13: flat single-domain dispatch, superseded by the durable
+# ``run_loop`` path (cli.py calls run_loop, not run_simple).  Retained
+# importable: cli.py imports it and tests/test_orchestrator_loop.py exercises
+# it; do not delete.
 async def run_simple(
     request_text: str,
     portal_config,
@@ -776,3 +755,4 @@ async def run_simple(
         result = await dispatch_agent(agent_name, request_text, portal_config=portal_config, mode="preview")
         results.append(result)
     return results
+# END DEAD CODE — NFR-13 (run_simple)

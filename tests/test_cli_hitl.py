@@ -293,7 +293,10 @@ class TestCliHitlFlow:
                 data={"message": "Contact created."},
             )
 
-        monkeypatch.setattr(cli, "dispatch_agent", mock_dispatch_agent)
+        # execute_pending_write (handlers.py) looks up dispatch_agent on
+        # hubspot_agent.orchestrator, so patch it there (the preview-path
+        # dispatch_agents_parallel patch on cli stays as-is).
+        monkeypatch.setattr("hubspot_agent.orchestrator.dispatch_agent", mock_dispatch_agent)
 
         portal_file = tmp_path / ".hubspot-portal"
         portal_file.write_text("123\n")

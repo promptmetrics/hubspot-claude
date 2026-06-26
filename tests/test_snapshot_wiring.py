@@ -59,7 +59,7 @@ def test_approve_update_saves_original_values_snapshot(portal_dir):
     async def fake_dispatch(*args, **kwargs):
         return AgentResult(agent_name="objects", status="success", data={"message": "updated"})
 
-    with patch("hubspot_agent.cli.dispatch_agent", side_effect=fake_dispatch):
+    with patch("hubspot_agent.orchestrator.dispatch_agent", side_effect=fake_dispatch):
         hubspot_command(f"approve {action_id}", working_dir=str(portal_dir))
 
     snapshot_file = portal_dir / "123" / "undo_snapshots" / f"{action_id}.json"
@@ -83,7 +83,7 @@ def test_approve_create_saves_empty_snapshot_with_metadata(portal_dir):
             data={"result": {"id": "contact-999"}},
         )
 
-    with patch("hubspot_agent.cli.dispatch_agent", side_effect=fake_dispatch):
+    with patch("hubspot_agent.orchestrator.dispatch_agent", side_effect=fake_dispatch):
         hubspot_command(f"approve {action_id}", working_dir=str(portal_dir))
 
     snapshot_file = portal_dir / "123" / "undo_snapshots" / f"{action_id}.json"

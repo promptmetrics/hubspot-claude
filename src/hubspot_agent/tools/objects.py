@@ -8,24 +8,8 @@ from hubspot_agent.client import HubSpotClient
 from hubspot_agent.errors import HubSpotError, RateLimitError, ScopeError
 from hubspot_agent.progress import ProgressTracker
 from hubspot_agent.tools import tool
-from hubspot_agent.cache import SchemaCache
+from hubspot_agent.cache import STANDARD_OBJECT_TYPES as _VALID_OBJECT_TYPES, SchemaCache
 from hubspot_agent.validation import validate_properties
-
-_VALID_OBJECT_TYPES = frozenset({
-    "contacts",
-    "companies",
-    "deals",
-    "tickets",
-    "carts",
-    "order",
-    "quotes",
-    "subscriptions",
-    "invoices",
-    "discount",
-    "fees",
-    "taxes",
-    "goal_targets",
-})
 
 
 def _validate_object_type(object_type: str, portal_id: str) -> None:

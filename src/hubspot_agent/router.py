@@ -1,0 +1,318 @@
+"""hubspot CLI router — venv-resolved entrypoint that routes ``tool`` calls
+through the warm-client daemon (FR-15) and falls back to the in-process CLI.
+
+Invoked by ``bin/hubspot`` after it resolves the plugin venv python.  Only the
+``tool`` subcommand benefits from the warm daemon (HubSpot I/O via one reused
+``HubSpotClient`` + ``SchemaCache``); ``serve stop`` is daemon-native.
+Everything else — ``approve``/``reject`` (low-frequency, no warm-client
+benefit), ``loop *`` (local disk), ``route``, ``agents`` — runs in-process via
+:func:`hubspot_agent.cli.hubspot_command` so behaviour is identical to the
+console-script path.  ``approve`` is routed in-process deliberately: it is
+low-frequency and the in-process path shares the same
+:func:`hubspot_agent.handlers.execute_pending_write` core (FR-19 gate,
+FR-17/18 undo, FR-17 audit) as the daemon handler, so both paths behave
+identically.
+
+Crash recovery (FR-15): a stale PID → unlink socket + restart; an RPC failure
+or timeout → kill the daemon + restart once + retry.  Any daemon failure falls
+back to the in-process CLI so the caller always gets a correct result.
+"""
+from __future__ import annotations
+
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+DAEMON_IDLE_TIMEOUT = 600.0
+RPC_TIMEOUT = 5.0
+LAZY_START_TIMEOUT = 5.0
+
+
+def plugin_data_dir() -> Path:
+    env = os.environ.get("CLAUDE_PLUGIN_DATA")
+    if env:
+        return Path(env)
+    return Path.home() / ".claude" / "plugins" / "data" / "hubspot"
+
+
+def socket_path() -> Path:
+    return plugin_data_dir() / "hubspot.sock"
+
+
+def pid_path() -> Path:
+    return plugin_data_dir() / "hubspot.pid"
+
+
+def install_log_path() -> Path:
+    return plugin_data_dir() / "install.log"
+
+
+def resolve_venv_python() -> str | None:
+    """Resolve the plugin venv python (FR-15 venv contract).
+
+    Priority: ``$CLAUDE_PLUGIN_DATA/venv.path`` → ``$CLAUDE_PLUGIN_DATA/venv/bin/python``
+    → glob ``~/.claude/plugins/data/hubspot-*/venv/bin/python`` → None.
+    """
+    data = plugin_data_dir()
+    venv_path_file = data / "venv.path"
+    if venv_path_file.is_file():
+        try:
+            vp = venv_path_file.read_text().strip()
+        except OSError:
+            vp = ""
+        if vp:
+            cand = Path(vp) / "bin" / "python"
+            if cand.exists() and os.access(cand, os.X_OK):
+                return str(cand)
+    cand = data / "venv" / "bin" / "python"
+    if cand.exists() and os.access(cand, os.X_OK):
+        return str(cand)
+    for p in sorted(Path.home().glob(".claude/plugins/data/hubspot-*/venv/bin/python")):
+        if p.exists() and os.access(p, os.X_OK):
+            return str(p)
+    return None
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_pid() -> int:
+    try:
+        return int(pid_path().read_text().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def is_daemon_alive() -> bool:
+    """True if a live daemon owns the socket.  Cleans up a stale socket/PID."""
+    sock = socket_path()
+    if not sock.exists():
+        return False
+    pid = _read_pid()
+    if pid and _pid_alive(pid):
+        return True
+    try:
+        sock.unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        pid_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+    return False
+
+
+def rpc_call(method: str, params: dict[str, Any], *, timeout: float = RPC_TIMEOUT) -> dict[str, Any]:
+    """Send one JSON-RPC line to the daemon and return the parsed response."""
+    payload = (json.dumps({"method": method, "params": params, "id": 1}) + "\n").encode("utf-8")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(str(socket_path()))
+        s.sendall(payload)
+        buf = bytearray()
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        s.close()
+    if not buf:
+        raise TimeoutError("daemon returned no response")
+    return json.loads(buf.decode("utf-8"))
+
+
+def start_daemon(portal_id: str, *, idle_timeout: float = DAEMON_IDLE_TIMEOUT) -> subprocess.Popen:
+    """Lazily start the warm-client daemon detached (FR-15)."""
+    plugin_data_dir().mkdir(parents=True, exist_ok=True)
+    log = open(install_log_path(), "a")
+    return subprocess.Popen(
+        [sys.executable, "-m", "hubspot_agent.daemon", portal_id, "--idle-timeout", str(idle_timeout)],
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=log,
+        start_new_session=True,
+    )
+
+
+def _kill_daemon() -> None:
+    pid = _read_pid()
+    if pid and _pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        for _ in range(20):
+            if not _pid_alive(pid):
+                break
+            time.sleep(0.05)
+    try:
+        socket_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        pid_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _wait_for_socket(timeout: float = LAZY_START_TIMEOUT) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if socket_path().exists():
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(0.5)
+                s.connect(str(socket_path()))
+                s.close()
+                return True
+            except OSError:
+                pass
+        time.sleep(0.05)
+    return False
+
+
+def _parse_tool_argv(tokens: list[str]) -> tuple[str, dict[str, Any]]:
+    if not tokens:
+        raise ValueError("tool name required")
+    tool_name = tokens[0]
+    tool_input: dict[str, Any] = {}
+    if "--input" in tokens:
+        i = tokens.index("--input")
+        raw = tokens[i + 1] if i + 1 < len(tokens) else ""
+        if raw == "-":
+            raw = sys.stdin.read()
+        if raw.strip():
+            tool_input = json.loads(raw)  # raises on bad JSON
+            if not isinstance(tool_input, dict):
+                raise ValueError("--input must be a JSON object")
+    return tool_name, tool_input
+
+
+def _format_tool_response(resp: dict[str, Any]) -> str:
+    if "error" in resp:
+        err = resp["error"]
+        return f"error: {err.get('message', err.get('kind', 'unknown'))}"
+    data = resp.get("result", {}).get("data", {})
+    if "result" in data:  # read → match cli._tool_read output
+        return json.dumps(data["result"], indent=2, default=str)
+    return json.dumps(data, indent=2, default=str)  # write preview → match cli._tool_write
+
+
+def _daemon_tool_path(tokens: list[str], portal_id: str) -> str | None:
+    """Try the warm-client daemon for a tool call.  Return formatted output or
+    None when the daemon path fails (caller falls back to the in-process CLI)."""
+    try:
+        tool_name, tool_input = _parse_tool_argv(tokens)
+    except ValueError as exc:
+        return f"Usage: hubspot tool <name> [--input <json>|-]\n  error: {exc}"
+    params = {"tool_name": tool_name, "input": tool_input, "batch_mode": "single"}
+
+    # Attempt 1: reuse a live daemon, else lazy-start one.
+    if not is_daemon_alive():
+        try:
+            start_daemon(portal_id)
+        except OSError:
+            return None
+        if not _wait_for_socket():
+            return None
+    try:
+        return _format_tool_response(rpc_call("tool", params))
+    except (OSError, TimeoutError, json.JSONDecodeError):
+        pass
+
+    # Attempt 2: crash recovery — kill + restart + retry once (FR-15).
+    _kill_daemon()
+    try:
+        start_daemon(portal_id)
+    except OSError:
+        return None
+    if not _wait_for_socket():
+        return None
+    try:
+        return _format_tool_response(rpc_call("tool", params))
+    except (OSError, TimeoutError, json.JSONDecodeError):
+        return None
+
+
+def _cli_fallback(remaining: list[str], working_dir: str, portal_id: str | None) -> str:
+    from hubspot_agent.cli import hubspot_command
+
+    return hubspot_command(" ".join(remaining), working_dir, portal_id=portal_id)
+
+
+def route(argv: list[str]) -> int:
+    from hubspot_agent.cli import _strip_global_flags
+    from hubspot_agent.config import detect_default_portal
+
+    remaining, working_dir, portal_id = _strip_global_flags(list(argv))
+    if not remaining:
+        print(_cli_fallback(remaining, working_dir, portal_id))
+        return 0
+
+    head = remaining[0].lower()
+
+    if head == "tool":
+        pid = portal_id or detect_default_portal(working_dir)
+        if pid:
+            out = _daemon_tool_path(remaining[1:], pid)
+            if out is not None:
+                print(out)
+                return 0
+        # No portal, or daemon path failed → in-process CLI fallback.
+        print(_cli_fallback(remaining, working_dir, portal_id))
+        return 0
+
+    if head == "serve":
+        sub = remaining[1].lower() if len(remaining) >= 2 else ""
+        if sub == "stop":
+            if is_daemon_alive():
+                try:
+                    rpc_call("serve_stop", {})
+                except OSError:
+                    pass
+                print("daemon stop requested")
+            else:
+                print("daemon not running")
+            return 0
+        # ``hubspot serve`` — start the warm-client daemon in the foreground
+        # (blocks until idle-timeout or ``hubspot serve stop``).  The lazy-start
+        # path in ``_daemon_tool_path`` covers the common case; this is for
+        # explicit/E2E use (runbook §16.5).
+        pid = portal_id or detect_default_portal(working_dir)
+        if not pid:
+            print("No default portal found.")
+            return 1
+        from hubspot_agent.daemon import main as daemon_main
+
+        return daemon_main([pid])
+
+    # approve/reject (undo+audit), loop_* (local disk), route/agents/tools/agent-prompt/status/…
+    print(_cli_fallback(remaining, working_dir, portal_id))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    return route(sys.argv[1:] if argv is None else list(argv))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

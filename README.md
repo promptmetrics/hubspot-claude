@@ -1,24 +1,47 @@
 # HubSpot Agent
 
-A Claude Code skill (`/hubspot`) for natural-language administration of HubSpot CRM. Dispatch 45+ specialist sub-agents to perform CRUD operations across contacts, companies, deals, workflows, lists, pipelines, properties, analytics, engagements, associations, and more — with mandatory human-in-the-loop approval for all writes.
+A Claude Code plugin (`/hubspot`) for natural-language administration of HubSpot CRM. Claude orchestrates specialist sub-agents that each call the `hubspot` CLI over Bash to perform CRUD across contacts, companies, deals, workflows, lists, pipelines, properties, analytics, engagements, associations, and more — with mandatory human-in-the-loop approval for every write.
 
-## Quick Start
+The agent and tool catalogs live in code. As of this release the registry holds **44 specialist sub-agents** and **75 tools**; discover the current set with `hubspot agents list` and `hubspot tools list` rather than trusting this number.
 
-**Prerequisites:** Python 3.12+, Claude Code, a HubSpot portal ID.
+## Install
+
+### From the marketplace
+
+```
+/plugin marketplace add iiizzzyyy/hubspot-claude
+/plugin install hubspot@hubspot-claude
+```
+
+On the first session after install, a `SessionStart` hook provisions an isolated venv under `${CLAUDE_PLUGIN_DATA}/venv` (preferring `uv`, else `python3 -m venv` + `pip install`) and writes `venv.path` so the `bin/hubspot` resolver can find it. The hook rebuilds the venv only when `pyproject.toml` changes, fails gracefully (never blocks the session), and does **not** start the daemon.
+
+### Local development
 
 ```bash
 git clone https://github.com/iiizzzyyy/hubspot-claude.git
 cd hubspot-claude
-pip install -e ".[dev]"
+pip install -e ".[dev]"          # editable install with test deps
+claude plugin validate ./        # schema-check plugin.json + marketplace.json + hooks
+claude --plugin-dir ./           # load the plugin for this session
 ```
 
-**Authenticate with a Private App Token:**
+Then invoke `/hubspot` in that session. (If the plugin is also installed from the marketplace, uninstall it first so both copies don't collide.) Confirm the exact invocation name Claude Code registers — it is `/hubspot` for a root `SKILL.md` with `name: hubspot`; update these docs if your local run shows otherwise.
+
+## Authenticate
+
+**Private App token (simplest for personal use):**
 
 ```
 /hubspot setup <portal_id> token <pat-na1-...>
 ```
 
-Or use OAuth 2.0 for team setups (see [`docs/QUICKSTART.md`](docs/QUICKSTART.md)).
+**OAuth 2.0 (for team setups):**
+
+```
+/hubspot setup <portal_id> oauth
+```
+
+Auth is OAuth 2.0 or Private App tokens only — never API keys. Portal auto-detection reads a `.hubspot-portal` file in the working directory; multi-portal setups keep isolated state per portal.
 
 **Verify:**
 
@@ -26,98 +49,79 @@ Or use OAuth 2.0 for team setups (see [`docs/QUICKSTART.md`](docs/QUICKSTART.md)
 /hubspot status
 ```
 
-## Architecture
+## How it works
 
 ```
 User (Claude Code session)
-    |
-    v
-/hubspot "find duplicate contacts and merge them"
-    |
-    v
-Parent Orchestrator (routing + scope validation)
-    |
-    +---> HygieneAgent (find duplicates)
-    |        +---> Returns: list of duplicate pairs
-    |
-    +---> [HITL Approval]
-    |
-    +---> HygieneAgent (merge contacts)
-             +---> Returns: merged records
+    │  /hubspot "find duplicate contacts and merge them"
+    ▼
+Claude orchestrates  ── route ──▶ {"agents": ["hygiene"], ...}
+    │
+    ├── spawn sub-agent(hygiene)  ──▶  hubspot tool hubspot_find_duplicates --input '{...}'
+    │                                   ▼  read → JSON result
+    ├── present preview + action_id      (write returns a preview, NOT a mutation)
+    ├── hubspot approve <action_id> <count>   ← user confirms (count mandatory for destructive)
+    └── hubspot tool hubspot_get_contact --input '{...}'   ← verify the change landed
 ```
 
-- **Parent Orchestrator** — routes requests, validates scope, handles HITL approval, dispatches sub-agents, reconciles results
-- **45+ Sub-Agents** — each domain agent runs in isolation with focused tools and prompts
-- **No custom orchestration framework** — uses Claude Code's native `Agent` tool
-- **State lives in conversation context + disk cache** — no LangGraph required
+- **Claude is the orchestrator** — it routes, spawns sub-agents with `hubspot agent-prompt <name>`, and approves writes. No custom orchestration framework; Claude Code's native `Agent` tool does the spawning.
+- **The CLI is the single source of truth** — every sub-agent calls `${CLAUDE_PLUGIN_ROOT}/bin/hubspot tool <name> --input '<json>' --portal <id> --working-dir <dir>`.
+- **Warm-client daemon** — read and write-preview tool calls route through one reused `HubSpotClient` + schema cache for speed; `approve`/`reject`/`loop *`/`route`/`agents` run in-process. The daemon is lazy-started on the first tool call, self-exits after idle, and `bin/hubspot` falls back to the in-process CLI if it's ever unreachable (same correct result, only slower). Manage it with `hubspot serve` / `hubspot serve stop`.
+- **Durable loops** — `/hubspot --loop '<goal>'` runs triage → sequential step execution → verify → checkpoint, with `loop status`/`log`/`continue`/`abandon`.
 
-## Agent Domains
+## Sub-commands
 
-| Domain | Agents | Key Operations |
-|--------|--------|----------------|
-| Objects | contacts, companies, deals, tickets, products, line_items, custom objects | CRUD, search, batch ops |
-| Properties | standard & custom properties, groups | create, update, migrate |
-| Workflows | flows, legacy workflows, blueprints | build, enroll, analyze |
-| Lists | static & dynamic lists, memberships | create, update, segment |
-| Pipelines | deals, tickets, custom pipelines & stages | CRUD, reorder |
-| Users | owners, teams, permissions | assign, audit |
-| Hygiene | duplicates, stale records, unassigned | merge, clean, alert |
-| Analytics | reports, dashboards, funnels | build, schedule |
-| Associations | contact↔company, deal↔contact, custom | create, delete, label |
-| Engagements | calls, emails, meetings, notes, tasks | log, sync |
-| Commerce | orders, carts, invoices, subscriptions, fees, taxes, discounts | manage, reconcile |
-| Raw API | any HubSpot v3 endpoint | GET/POST/PATCH/DELETE |
+| Command | Purpose |
+|---------|---------|
+| `hubspot status` | Portal, agent readiness, pending approvals |
+| `hubspot route '<request>'` | JSON `{agents, rationale}` |
+| `hubspot tool <name> --input '<json>'` | Read → JSON; write → preview + `action_id` |
+| `hubspot agents list` / `tools list` | Enumerate the registry |
+| `hubspot agent-prompt <name>` | Full prompt for one agent |
+| `hubspot approve <id> [<count>]` | Execute a previewed write (count required for destructive) |
+| `hubspot reject <id>` | Discard a pending write |
+| `hubspot --loop '<goal>'` / `loop status\|log\|continue\|abandon` | Durable closed loop |
+| `hubspot --pattern '<sample>'` | Sample-verify-scale batch approval |
+| `hubspot serve` / `serve stop` | Warm-client daemon lifecycle |
+| `hubspot portal auth\|token\|list\|switch` / `setup` / `refresh` | Portal + auth management |
 
-## Project Structure
+## Project structure
 
 ```
 src/hubspot_agent/
-├── orchestrator.py       # Parent router, HITL, dispatch
-├── cli.py                # /hubspot skill entry point
-├── client.py             # Async HTTP client with rate limiting
-├── models.py             # Shared Pydantic models
-├── dispatch.py           # Agent dispatch utilities
-├── persistence.py        # Preview / checkpoint storage
-├── agents/               # 45+ domain sub-agents
-├── tools/                # 20+ tool modules (CRUD wrappers)
-├── blueprints/workflows/ # Pre-built workflow templates
-└── prompts/              # System prompt fragments
-
-tests/                    # 70+ test modules
-docs/                     # Design specs, ADRs, user manual
-plans/                    # HTML design specs & task tracker
+├── cli.py                # /hubspot entry point, sub-commands, HITL approve/reject
+├── orchestrator.py       # routing, dispatch, durable loop
+├── router.py             # bin/hubspot daemon router + in-process fallback
+├── daemon.py             # warm-client Unix-socket JSON-RPC server
+├── handlers.py           # shared tool/approve/loop handlers (daemon + CLI)
+├── safety.py             # apply_write: scope validation + preview + HITL persist
+├── client.py             # async httpx client with rate limiting
+├── persistence.py        # preview / action-id storage (flock + atomic)
+├── loop_state.py / loop_log.py  # durable loop state + NDJSON event log
+├── agents/               # specialist sub-agents (registry: 44)
+├── tools/                # tool modules (registry: 75)
+└── blueprints/workflows/ # pre-built workflow templates
+bin/hubspot               # plugin entrypoint (venv resolver → router)
+hooks/                    # SessionStart venv provisioning
+.claude-plugin/           # plugin.json + marketplace.json
+tests/                    # pytest suite
 ```
 
 ## Testing
 
 ```bash
-pytest -x                    # run all tests
-pytest tests/test_integration.py -v   # integration tests
+pytest -x                 # full suite
+pytest tests/test_install_hook.py -v   # SessionStart venv contract
 ```
 
-## Authentication
+## Key design decisions
 
-- **OAuth 2.0** or **Private App tokens** only (no API keys)
-- **Portal auto-detection:** reads `.hubspot-portal` file in working directory
-- **Multi-portal support:** isolated state per portal
-
-## Key Design Decisions
-
-1. **Sub-agent isolation** — each agent runs with minimal tools to reduce error rates
-2. **Read-based previews** — HubSpot has no dry-run; we preview reads before writes
-3. **Count-based confirmation** — destructive ops require explicit user confirmation
-4. **Reusable client** — async `httpx` client with built-in rate limiting and retries
-
-See [`docs/adr/`](docs/adr/) for Architecture Decision Records.
-
-## Documentation
-
-- [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — 10-minute setup guide
-- [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) — Tool and agent reference
-- [`docs/DEMO_SCRIPT.md`](docs/DEMO_SCRIPT.md) — Demo script for stakeholders
-- [`docs/superpowers/USER_MANUAL.md`](docs/superpowers/USER_MANUAL.md) — Full user manual
-- [`docs/superpowers/specs/`](docs/superpowers/specs/) — Design specifications
+1. **Claude orchestrates; the CLI is the source of truth** — sub-agents are stateless and call `hubspot tool` over Bash; proposed payloads are embedded in their prompts.
+2. **Read-based previews** — HubSpot has no dry-run, so writes preview the affected records and return an `action_id`; nothing mutates until `approve`.
+3. **Count-based confirmation** — destructive operations require the expected count, re-checked at execute time.
+4. **One warm client** — the daemon reuses a single `HubSpotClient` + schema cache; every other path runs in-process with identical results.
+5. **Three call paths, one handler set** — daemon (warm), in-process fallback (fresh client), and CLI sync all share `handlers.py`.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

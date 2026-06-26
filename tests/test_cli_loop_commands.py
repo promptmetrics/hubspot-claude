@@ -111,3 +111,60 @@ def test_loop_log_shows_entries(tmp_path, monkeypatch):
     assert "Recent loop log for portal 123" in result
     assert "step_started" in result
     assert "step_completed" in result
+
+
+def test_loop_checkpoint_no_active_loop(tmp_path, monkeypatch):
+    _setup_portal(tmp_path, monkeypatch)
+    result = hubspot_command("loop checkpoint", working_dir=str(tmp_path))
+    assert "No active loop to checkpoint" in result
+
+
+def test_loop_checkpoint_persists_and_logs(tmp_path, monkeypatch):
+    _setup_portal(tmp_path, monkeypatch)
+    from hubspot_agent import loop_log, loop_state
+    state = _make_state()
+    loop_state.save(state)
+    original_updated_at = state.updated_at
+
+    result = hubspot_command("loop checkpoint", working_dir=str(tmp_path))
+    assert "Checkpointed loop for portal 123" in result
+    assert "step 2 of 2" in result
+
+    events = loop_log.get_recent("123", trace_id="trace-continue", limit=50)
+    assert any(e.get("event_type") == "loop_checkpoint" for e in events)
+
+    reloaded = loop_state.load("123")
+    assert reloaded is not None
+    assert reloaded.updated_at >= original_updated_at
+
+
+@pytest.mark.asyncio
+async def test_loop_continue_alias_routes_to_handler(tmp_path, monkeypatch):
+    _setup_portal(tmp_path, monkeypatch)
+    from hubspot_agent import loop_state
+    loop_state.save(_make_state())
+
+    with patch("hubspot_agent.cli.run_loop") as mock_run_loop:
+        result = hubspot_command("loop continue", working_dir=str(tmp_path))
+
+    mock_run_loop.assert_called_once()
+    assert result == mock_run_loop.return_value
+
+
+def test_loop_abandon_alias_clears_state(tmp_path, monkeypatch):
+    _setup_portal(tmp_path, monkeypatch)
+    from hubspot_agent import loop_state
+    loop_state.save(_make_state())
+
+    result = hubspot_command("loop abandon", working_dir=str(tmp_path))
+    assert "Abandoned active loop" in result
+    assert loop_state.load("123") is None
+
+
+def test_loop_unknown_subcommand_returns_usage(tmp_path, monkeypatch):
+    _setup_portal(tmp_path, monkeypatch)
+    result = hubspot_command("loop bogus", working_dir=str(tmp_path))
+    assert "Usage: /hubspot loop" in result
+    assert "checkpoint" in result
+    assert "continue" in result
+    assert "abandon" in result

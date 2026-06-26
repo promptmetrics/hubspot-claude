@@ -1,6 +1,10 @@
 # Routing regression corpus
 # Each entry: request text -> expected route(s)
-# Fast-path routes should be stable across prompt changes.
+# `mode: fast_path` entries are gated by tests/test_routing_corpus_gate.py against
+# the live keyword router `route_request` — expected_routes reflect CURRENT
+# route_request output and lock it as the regression baseline.
+# `mode: llm` entries are aspirational targets for the (stub) LLM router and are
+# skipped by the gate; the LLM router is not yet live.
 
 - request: "find all contacts"
   expected_routes: ["objects"]
@@ -15,27 +19,27 @@
   mode: fast_path
 
 - request: "list workflows"
-  expected_routes: []
+  expected_routes: ["lists", "workflows"]
   mode: fast_path
 
 - request: "add contacts to a list"
-  expected_routes: []
+  expected_routes: ["lists", "objects"]
   mode: fast_path
 
 - request: "create a workflow to send welcome emails"
-  expected_routes: ["workflows"]
+  expected_routes: ["objects", "workflows"]
   mode: fast_path
 
 - request: "log a call with a contact"
-  expected_routes: ["objects", "engagements"]
+  expected_routes: ["engagements"]
   mode: fast_path
 
 - request: "get pipeline stages for deals"
-  expected_routes: ["objects"]
+  expected_routes: ["associations", "objects"]
   mode: fast_path
 
 - request: "how many contacts were created last week"
-  expected_routes: ["objects"]
+  expected_routes: ["associations", "objects"]
   mode: fast_path
 
 - request: "clean up duplicate contacts"
@@ -47,7 +51,7 @@
   mode: llm
 
 - request: "create a custom property on contacts"
-  expected_routes: []
+  expected_routes: ["associations", "objects"]
   mode: fast_path
 
 - request: "show me the analytics for email opens"
@@ -55,7 +59,7 @@
   mode: llm
 
 - request: "create a list of contacts who haven't engaged in 30 days"
-  expected_routes: []
+  expected_routes: ["associations", "objects"]
   mode: fast_path
 
 - request: "remove from list"

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,7 +11,10 @@ from hubspot_agent.cli import (
 )
 from hubspot_agent.config import PortalConfig, save_portal_config
 from hubspot_agent.models import AgentResult
-from hubspot_agent.persistence import store as _store_pending_preview
+from hubspot_agent.persistence import (
+    load as _load_pending_preview,
+    store as _store_pending_preview,
+)
 
 
 def _destructive_preview_data(impact_count: int = 5) -> dict:
@@ -85,8 +89,38 @@ def test_approve_with_wrong_count_rejected(portal_dir):
     _store_pending_preview("123", action_id, _destructive_preview_data(5))
 
     result = hubspot_command(f"approve {action_id} 3", working_dir=str(portal_dir))
-    assert "destructive" in result.lower()
-    assert "approve abc123 5" in result
+    payload = json.loads(result)
+    # FR-19 / NFR-15: wrong count → stable error shape + guidance.
+    assert payload["error"]["kind"] == "validation"
+    assert payload["error"]["retryable"] is False
+    assert "approve abc123 5" in payload["error"]["guidance"]
+
+
+def test_approve_destructive_without_count_rejected(portal_dir):
+    action_id = "abc123"
+    _store_pending_preview("123", action_id, _destructive_preview_data(5))
+
+    result = hubspot_command(f"approve {action_id}", working_dir=str(portal_dir))
+    payload = json.loads(result)
+    assert payload["error"]["kind"] == "validation"
+    assert payload["error"]["retryable"] is False
+    assert "approve abc123 5" in payload["error"]["guidance"]
+    # The pending preview must still be present (no execution, no clear).
+    assert _load_pending_preview("123", action_id) is not None
+
+
+def test_reject_by_id_clears_pending(portal_dir):
+    action_id = "abc123"
+    _store_pending_preview("123", action_id, _destructive_preview_data(5))
+
+    result = hubspot_command(f"reject {action_id}", working_dir=str(portal_dir))
+    assert "Rejected preview abc123" in result
+    assert _load_pending_preview("123", action_id) is None
+
+
+def test_reject_unknown_id(portal_dir):
+    result = hubspot_command("reject nope0000", working_dir=str(portal_dir))
+    assert "No pending preview found with ID nope0000" in result
 
 
 def test_approve_with_exact_count_executes(portal_dir):
@@ -100,7 +134,7 @@ def test_approve_with_exact_count_executes(portal_dir):
             data={"message": "deleted 5 contacts"},
         )
 
-    with patch("hubspot_agent.cli.dispatch_agent", side_effect=fake_dispatch):
+    with patch("hubspot_agent.orchestrator.dispatch_agent", side_effect=fake_dispatch):
         result = hubspot_command(f"approve {action_id} 5", working_dir=str(portal_dir))
 
     assert "Approved and executed" in result
@@ -119,10 +153,13 @@ def test_confirm_command_with_exact_count_executes(portal_dir):
             data={"message": "deleted 5 contacts"},
         )
 
-    with patch("hubspot_agent.cli.dispatch_agent", side_effect=fake_dispatch):
+    with patch("hubspot_agent.orchestrator.dispatch_agent", side_effect=fake_dispatch) as mock_dispatch:
         result = hubspot_command("5", working_dir=str(portal_dir))
 
     assert "Approved and executed" in result
+    mock_dispatch.assert_called_once()
+    snapshot_file = portal_dir / "123" / "undo_snapshots" / f"{action_id}.json"
+    assert snapshot_file.exists()
 
 
 def test_non_destructive_y_still_approves(portal_dir):
@@ -140,7 +177,10 @@ def test_non_destructive_y_still_approves(portal_dir):
             data={"message": "updated contact"},
         )
 
-    with patch("hubspot_agent.cli.dispatch_agent", side_effect=fake_dispatch):
+    with patch("hubspot_agent.orchestrator.dispatch_agent", side_effect=fake_dispatch) as mock_dispatch:
         result = hubspot_command("y", working_dir=str(portal_dir))
 
     assert "Approved and executed" in result
+    mock_dispatch.assert_called_once()
+    snapshot_file = portal_dir / "123" / "undo_snapshots" / f"{action_id}.json"
+    assert snapshot_file.exists()

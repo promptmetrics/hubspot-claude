@@ -4,6 +4,53 @@ import json
 from pathlib import Path
 from typing import Any
 
+from hubspot_agent import config
+
+
+def snapshot_dir_for_portal(portal_id: str) -> str:
+    """Directory holding a portal's undo snapshots.
+
+    ``config.CONFIG_DIR`` is read lazily so test fixtures that monkeypatch
+    ``hubspot_agent.config.CONFIG_DIR`` redirect snapshot writes; an
+    import-bound local would freeze the original path and leak to real disk.
+    """
+    return str(config.CONFIG_DIR / portal_id / "undo_snapshots")
+
+
+def save_undo_snapshot_for_action(
+    portal_id: str,
+    action_id: str,
+    preview_data: dict[str, Any],
+    created_ids: list[str] | None = None,
+) -> Path:
+    """Persist an undo snapshot for a pending write from its preview record.
+
+    Called by :func:`hubspot_agent.handlers.execute_pending_write`, the shared
+    core used by both the CLI approve path and the daemon ``handle_approve``,
+    so both capture the same undo artifact (FR-17/FR-18).
+    """
+    intent = preview_data.get("intent") or {}
+    intent_type = intent.get("intent_type", "unknown")
+    target_object = intent.get("target_object")
+    preview = preview_data.get("preview") or {}
+    original_values = preview.get("original_values", {})
+
+    undoable = intent_type in ("create", "update")
+    metadata: dict[str, Any] = {
+        "intent_type": intent_type,
+        "target_object": target_object,
+        "undoable": undoable,
+    }
+    if created_ids:
+        metadata["created_ids"] = created_ids
+
+    return save_undo_snapshot(
+        snapshot_dir_for_portal(portal_id),
+        action_id,
+        original_values,
+        metadata=metadata,
+    )
+
 
 def save_undo_snapshot(
     snapshot_dir: str,

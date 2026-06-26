@@ -11,6 +11,46 @@ from hubspot_agent.config import PortalConfig
 
 WARM_DOMAINS = ["contacts", "companies", "deals", "tickets"]
 
+# Canonical set of built-in HubSpot object types that never need custom-schema
+# discovery.  ``tools/objects.py`` aliases this as ``_VALID_OBJECT_TYPES`` so the
+# tool path and the cache layer share one source of truth (avoids an import
+# cycle: ``tools.objects`` imports ``cache``, not the reverse).
+STANDARD_OBJECT_TYPES = frozenset({
+    "contacts",
+    "companies",
+    "deals",
+    "tickets",
+    "carts",
+    "order",
+    "quotes",
+    "subscriptions",
+    "invoices",
+    "discount",
+    "fees",
+    "taxes",
+    "goal_targets",
+})
+
+
+async def ensure_custom_schema_cached(
+    portal_config: PortalConfig, object_type: str | None
+) -> None:
+    """Discover custom object schemas if ``object_type`` is non-standard and absent.
+
+    The tool path validates custom object types against the on-disk
+    :class:`SchemaCache`; custom schemas only land there via
+    :func:`discover_custom_schemas`, which the agent path runs in
+    ``initialize_session`` but the tool path historically did not.  Calling this
+    before validation lets ``hubspot tool ... '{"object_type":"<custom>"}'``
+    succeed on a cold cache.  Idempotent: it skips the HubSpot ``/schemas`` fetch
+    when the type is built-in or already cached (within TTL).
+    """
+    if not object_type or object_type in STANDARD_OBJECT_TYPES:
+        return
+    if SchemaCache(portal_config.portal_id).get(object_type) is not None:
+        return
+    await discover_custom_schemas(portal_config)
+
 
 async def discover_custom_schemas(portal_config: PortalConfig) -> list[str]:
     """Fetch custom object schemas from HubSpot and cache them.

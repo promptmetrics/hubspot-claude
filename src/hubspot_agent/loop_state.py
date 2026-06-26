@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
@@ -115,17 +116,23 @@ def save(state: LoopState) -> Path:
     path = _state_path(state.portal_id)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="loop-state-", suffix=".tmp")
+    dir_fd = os.open(path.parent, os.O_RDONLY)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(state.to_dict(), fh, indent=2, default=str)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except Exception:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        raise
+        fcntl.flock(dir_fd, fcntl.LOCK_EX)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="loop-state-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(state.to_dict(), fh, indent=2, default=str)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+    finally:
+        fcntl.flock(dir_fd, fcntl.LOCK_UN)
+        os.close(dir_fd)
     path.chmod(0o600)
     return path
 

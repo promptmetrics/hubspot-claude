@@ -7,6 +7,21 @@ dist/
 .claude/
 .codex/
 .pytest_cache/
+.hypothesis/
+.mypy_cache/
 .DS_Store
 .coverage
 .hubspot-portal
+
+# Dev-only paths — kept on disk but excluded from the shipping artifact
+# (allowlist: src/ tests/ bin/hubspot hooks/ .claude-plugin/ SKILL.md README.md LICENSE pyproject.toml).
+AGENTS.md
+CLAUDE.md
+TASKS.md
+docs/
+plans/
+scripts/
+specs/
+brz/
+ranya-demo/
+healthcare-recruiter-hubspot-setup.md

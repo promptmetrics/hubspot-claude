@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import webbrowser
 from pathlib import Path
 from typing import Any
@@ -15,8 +16,16 @@ from hubspot_agent.config import (
     save_portal_config,
 )
 from hubspot_agent.maintenance import _validate_portal_id
-from hubspot_agent.agents import get_agent_category, get_agent_emoji, group_agents_by_category
-from hubspot_agent.models import AgentResult, RiskLevel
+from hubspot_agent.agents import (
+    get_agent_category,
+    get_agent_emoji,
+    get_agent_prompt,
+    group_agents_by_category,
+    list_agent_names,
+)
+from hubspot_agent.models import PreviewResult, RiskLevel, TaskIntent
+from hubspot_agent.safety import apply_write as _apply_write
+from hubspot_agent.scope_registry import get_required_scopes
 from hubspot_agent.setup import REQUIRED_SCOPES
 import asyncio
 
@@ -41,12 +50,21 @@ from hubspot_agent.persistence import (
 from hubspot_agent.snapshot import (
     delete_undo_snapshot,
     load_undo_snapshot,
-    save_undo_snapshot,
-    update_undo_snapshot,
+    snapshot_dir_for_portal,
 )
-from hubspot_agent.tools import invoke_tool
+from hubspot_agent.tools import invoke_tool, get_tool, list_tools
 from hubspot_agent.trace import compute_status_aggregates, emit_trace, new_trace_id
 from hubspot_agent import audit
+from hubspot_agent.handlers import (
+    ExecuteError,
+    execute_pending_write,
+    _WRITE_SCOPE_SUFFIXES,
+    _is_write_tool,
+    _tool_impact_count,
+    _tool_intent_type,
+    _tool_kwargs,
+    _tool_risk_level,
+)
 
 
 def _run_async(async_fn, *args, **kwargs):
@@ -74,7 +92,7 @@ def _parse_flags(request: str) -> tuple[bool, str]:
     return False, stripped
 
 
-def hubspot_command(request: str, working_dir: str = ".") -> str:
+def hubspot_command(request: str, working_dir: str = ".", *, portal_id: str | None = None) -> str:
     loop_flag, request = _parse_flags(request)
     if not request:
         return "Usage: /hubspot [--loop] <request>"
@@ -96,6 +114,9 @@ def hubspot_command(request: str, working_dir: str = ".") -> str:
 
     if request.lower() in ("y", "yes"):
         return _handle_approve_last(working_dir)
+
+    if request.lower().startswith("reject "):
+        return _handle_reject(request[7:].strip(), working_dir)
 
     if request.lower() in ("n", "no", "reject"):
         return _handle_reject_last(working_dir)
@@ -126,9 +147,31 @@ def hubspot_command(request: str, working_dir: str = ".") -> str:
             return _handle_loop_status(working_dir)
         if subcommand.lower() == "log":
             return _handle_loop_log(working_dir)
-        return "Usage: /hubspot loop {status | log}"
+        if subcommand.lower() == "checkpoint":
+            return _handle_loop_checkpoint(working_dir)
+        if subcommand.lower() == "continue":
+            return _handle_continue(working_dir)
+        if subcommand.lower() == "abandon":
+            return _handle_abandon(working_dir)
+        return "Usage: /hubspot loop {status | log | checkpoint | continue | abandon}"
 
-    portal_id = detect_default_portal(working_dir)
+    if request.lower() == "route" or request.lower().startswith("route "):
+        return _handle_route(request[6:].strip(), working_dir, portal_id)
+
+    if request.lower() == "tool" or request.lower().startswith("tool "):
+        return _handle_tool(request[5:].strip(), working_dir, portal_id)
+
+    if request.lower() == "agents" or request.lower().startswith("agents "):
+        return _handle_agents_list()
+
+    if request.lower() == "tools" or request.lower().startswith("tools "):
+        return _handle_tools_list()
+
+    if request.lower() == "agent-prompt" or request.lower().startswith("agent-prompt "):
+        return _handle_agent_prompt(request[13:].strip(), working_dir, portal_id)
+
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
     if not portal_id:
         return (
             "No default portal found. Create a `.hubspot-portal` file in your working directory "
@@ -493,7 +536,7 @@ def _handle_refresh(working_dir: str) -> str:
 
 
 def _snapshot_dir_for_portal(portal_id: str) -> str:
-    return str(CONFIG_DIR / portal_id / "undo_snapshots")
+    return snapshot_dir_for_portal(portal_id)
 
 
 def _is_destructive_preview(preview_data: dict[str, Any]) -> bool:
@@ -513,33 +556,16 @@ def _present_destructive_preview(action_id: str, impact_count: int) -> str:
     )
 
 
-def _save_undo_snapshot_for_action(
-    portal_id: str,
-    action_id: str,
-    preview_data: dict[str, Any],
-    created_ids: list[str] | None = None,
-) -> None:
-    intent = preview_data.get("intent") or {}
-    intent_type = intent.get("intent_type", "unknown")
-    target_object = intent.get("target_object")
-    preview = preview_data.get("preview") or {}
-    original_values = preview.get("original_values", {})
-
-    undoable = intent_type in ("create", "update")
-    metadata: dict[str, Any] = {
-        "intent_type": intent_type,
-        "target_object": target_object,
-        "undoable": undoable,
-    }
-    if created_ids:
-        metadata["created_ids"] = created_ids
-
-    save_undo_snapshot(
-        _snapshot_dir_for_portal(portal_id),
-        action_id,
-        original_values,
-        metadata=metadata,
-    )
+def _error_json(
+    kind: str, message: str, *, retryable: bool = False, retry_after=None, guidance: str | None = None
+) -> str:
+    """NFR-15 stable error contract: ``{"error":{kind,message,retryable,retry_after?,guidance?}}``."""
+    error: dict[str, Any] = {"kind": kind, "message": message, "retryable": retryable}
+    if retry_after is not None:
+        error["retry_after"] = retry_after
+    if guidance is not None:
+        error["guidance"] = guidance
+    return json.dumps({"error": error}, indent=2)
 
 
 def _handle_approve(action_id: str, working_dir: str) -> str:
@@ -558,66 +584,30 @@ def _handle_approve(action_id: str, working_dir: str) -> str:
         confirm_count = int(parts[-1])
         action_id = parts[0]
 
-    preview_data = _load_pending_preview(portal_id, action_id)
-    if not preview_data:
-        return f"No pending preview found with ID {action_id}."
-
-    is_destructive = _is_destructive_preview(preview_data)
-    required = preview_data.get("required_confirmation")
-
-    if is_destructive:
-        if confirm_count is not None:
-            if not _confirm_pending_preview(portal_id, action_id, confirm_count):
-                return _present_destructive_preview(action_id, required or 0)
-        elif preview_data.get("confirmed_count") != required:
-            return _present_destructive_preview(action_id, required or 0)
-
-    # Persist an undo snapshot before executing any write.
-    intent = preview_data.get("intent") or {}
-    if intent.get("intent_type") in ("create", "update", "delete"):
-        _save_undo_snapshot_for_action(portal_id, action_id, preview_data)
-
-    result = _run_async(
-        dispatch_agent,
-        preview_data["agent_name"],
-        preview_data["request_text"],
-        portal_config=portal_config,
-        mode="execute",
-        trace_id=preview_data.get("trace_id"),
-        batch_mode=BatchApprovalMode(preview_data.get("batch_mode", "single")),
-        proposed_payload=preview_data.get("proposed_payload"),
-    )
-
-    _clear_pending_preview(portal_id, action_id)
-
-    if result.status == "error":
-        # Remove the snapshot so a failed action cannot be "undone".
-        delete_undo_snapshot(_snapshot_dir_for_portal(portal_id), action_id)
-        return f"❌ Execution failed: {result.error_message}"
-
-    # For creates, capture the IDs we just created so undo can delete them.
-    if intent.get("intent_type") == "create":
-        created_ids: list[str] = []
-        result_payload = result.data.get("result", {})
-        if isinstance(result_payload, dict):
-            created_id = result_payload.get("id")
-            if created_id:
-                created_ids.append(str(created_id))
-        update_undo_snapshot(
-            _snapshot_dir_for_portal(portal_id),
-            action_id,
-            metadata={"created_ids": created_ids},
+    # The full approve→execute contract (FR-19 gate, FR-17/18 undo, FR-17 audit,
+    # retryable-on-failure) lives in execute_pending_write, shared with the
+    # daemon handler.  client=None → the core builds a fresh HubSpotClient for
+    # the tool branch; the agent branch builds its own inside dispatch_agent.
+    try:
+        result = _run_async(
+            execute_pending_write, portal_config, action_id, confirm_count=confirm_count
         )
+    except ExecuteError as exc:
+        return _error_json(exc.kind, exc.message, retryable=exc.retryable, guidance=exc.guidance)
+    except Exception as exc:
+        # Any unexpected failure (async loop teardown, import error, etc.)
+        # surfaces as structured error JSON, never a traceback.
+        return _error_json("server", str(exc), retryable=True)
 
-    audit.log_write(
-        portal_id=portal_id,
-        action=f"approve:{action_id}",
-        agent=preview_data["agent_name"],
-        result_summary={"request": preview_data["request_text"], "status": "success"},
-        informing_sources=preview_data.get("informing_sources"),
-    )
-
-    return f"✅ Approved and executed action {action_id}.\n\n{result.data.get('message', '')}"
+    # Surface a human-readable message: the agent branch carries its own
+    # "message"; the tool branch stringifies the raw outcome as JSON.
+    payload = result.data.get("data", {})
+    message = payload.get("message") if isinstance(payload, dict) else None
+    if not message:
+        message = json.dumps(payload, default=str) if payload else ""
+    if result.audit_failed:
+        message += "\n⚠️ Audit log write failed — see stderr; the HubSpot write succeeded."
+    return f"✅ Approved and executed action {action_id}.\n\n{message}"
 
 
 def _handle_approve_last(working_dir: str) -> str:
@@ -768,6 +758,22 @@ def _handle_undo_list(working_dir: str) -> str:
     return "\n".join(lines)
 
 
+def _handle_reject(action_id: str, working_dir: str) -> str:
+    """``hubspot reject <id>`` — clear one pending preview by ID (FR-19/§7 step 4)."""
+    portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return "No default portal found."
+    action_id = action_id.split()[0] if action_id else ""
+    if not action_id:
+        return _handle_reject_last(working_dir)
+    preview_data = _load_pending_preview(portal_id, action_id)
+    if not preview_data:
+        return f"No pending preview found with ID {action_id}."
+    _clear_pending_preview(portal_id, action_id)
+    agent = preview_data.get("agent_name") or preview_data.get("tool_name") or "action"
+    return f"❌ Rejected preview {action_id} for {agent}."
+
+
 def _handle_reject_last(working_dir: str) -> str:
     portal_id = detect_default_portal(working_dir)
     if not portal_id:
@@ -863,5 +869,339 @@ def _handle_loop_log(working_dir: str, limit: int = 20) -> str:
             f"{event.get('payload', {})}"
         )
     return "\n".join(lines)
+
+
+def _handle_loop_checkpoint(working_dir: str) -> str:
+    portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return "No default portal found."
+
+    state = loop_state.load(portal_id)
+    if state is None:
+        return "No active loop to checkpoint."
+
+    loop_log.log_event(portal_id, state.trace_id, "loop_checkpoint", {
+        "current_step": state.current_step,
+        "status": state.status,
+        "iterations": state.iterations,
+    })
+    loop_state.save(state)
+    return f"✅ Checkpointed loop for portal {portal_id} at step {state.current_step + 1} of {len(state.plan.steps)}."
+
+
+def _handle_route(request_text: str, working_dir: str, portal_id: str | None) -> str:
+    """Route a request to agent(s) and emit a frozen-shape JSON ``{agents, rationale}``.
+
+    Wraps ``route_request`` (keyword routing).  Portal resolution is best-effort:
+    routing works without a portal, but a known portal enables custom-object
+    fast-path detection inside ``route_request``.
+    """
+    if not request_text:
+        return json.dumps(
+            {"agents": [], "rationale": "empty request; no agents routed"}, indent=2
+        )
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
+    agents = route_request(request_text, portal_id=portal_id)
+    if not agents:
+        rationale = "no keyword match; no agents routed"
+    elif len(agents) == 1:
+        rationale = f"keyword routing selected agent: {agents[0]}"
+    else:
+        rationale = (
+            f"keyword routing selected {len(agents)} agents in dependency order: "
+            f"{', '.join(agents)}"
+        )
+    return json.dumps({"agents": agents, "rationale": rationale}, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# hubspot tool <name> [--input <json>|-]  (T6)
+# ---------------------------------------------------------------------------
+
+
+def _split_input_flag(args: str) -> tuple[str, str]:
+    """Split ``<name> [--input <json>|-]`` into (name, raw_input)."""
+    marker = " --input "
+    idx = args.find(marker)
+    if idx != -1:
+        return args[:idx], args[idx + len(marker):]
+    marker = " --input="
+    idx = args.find(marker)
+    if idx != -1:
+        return args[:idx], args[idx + len(marker):]
+    return args, ""
+
+
+def _parse_tool_args(args: str) -> tuple[str, dict[str, Any]]:
+    if not args:
+        raise ValueError("tool name required")
+    name, raw = _split_input_flag(args)
+    name = name.strip()
+    if not name:
+        raise ValueError("tool name required")
+    if not raw:
+        return name, {}
+    if raw.strip() == "-":
+        raw = sys.stdin.read()
+    raw = raw.strip()
+    if not raw:
+        return name, {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid --input JSON ({exc.msg})") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("--input must be a JSON object")
+    return name, payload
+
+
+def _tool_scope_error(tool_name: str, missing: list[str]) -> str:
+    lines = [f"Missing HubSpot OAuth scopes for tool {tool_name}:"]
+    for scope in missing:
+        lines.append(f"- {scope}")
+    return "\n".join(lines)
+
+
+async def _capture_original_values(
+    tool_name: str, tool_input: dict[str, Any], client, portal_id: str
+) -> dict[str, Any]:
+    """Best-effort fetch of current state for update/delete so undo can restore it."""
+    if tool_name not in ("hubspot_update_object", "hubspot_delete_object"):
+        return {}
+    object_id = tool_input.get("object_id")
+    object_type = tool_input.get("object_type")
+    if not object_id or not object_type:
+        return {}
+    try:
+        result = await invoke_tool(
+            "hubspot_get_object",
+            portal_id,
+            object_id=str(object_id),
+            object_type=str(object_type),
+            client=client,
+        )
+    except Exception:
+        return {}
+    if not isinstance(result, dict) or result.get("error") or "id" not in result:
+        return {}
+    return {str(result["id"]): result.get("properties", {})}
+
+
+async def _build_tool_preview(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    required_scopes: set[str],
+    client,
+    portal_id: str,
+) -> PreviewResult:
+    risk = _tool_risk_level(required_scopes)
+    original_values = await _capture_original_values(tool_name, tool_input, client, portal_id)
+    return PreviewResult(
+        preview={"tool": tool_name, "input": tool_input, "message": f"Preview of {tool_name}"},
+        impact_count=_tool_impact_count(tool_name, tool_input),
+        risk_level=risk,
+        original_values=original_values,
+        informing_sources=[],
+    )
+
+
+async def _tool_read(tool_name, portal_id, portal_config, tool_input):
+    from hubspot_agent.client import HubSpotClient
+    from hubspot_agent.cache import ensure_custom_schema_cached
+
+    await ensure_custom_schema_cached(portal_config, tool_input.get("object_type") if isinstance(tool_input, dict) else None)
+    client = HubSpotClient(portal_config)
+    try:
+        result = await invoke_tool(tool_name, portal_id, client=client, **_tool_kwargs(tool_input))
+        return json.dumps(result, indent=2, default=str)
+    finally:
+        await client.close()
+
+
+async def _tool_write(tool_name, portal_id, portal_config, tool_input, required_scopes):
+    from hubspot_agent.client import HubSpotClient
+    from hubspot_agent.cache import ensure_custom_schema_cached
+
+    await ensure_custom_schema_cached(portal_config, tool_input.get("object_type") if isinstance(tool_input, dict) else None)
+    risk = _tool_risk_level(required_scopes)
+    intent = TaskIntent(
+        intent_type=_tool_intent_type(tool_name),
+        target_object=tool_input.get("object_type") if isinstance(tool_input, dict) else None,
+        description=f"tool {tool_name}",
+        risk_level=risk,
+    )
+    client = HubSpotClient(portal_config)
+    try:
+        aw = await _apply_write(
+            client=client,
+            portal_config=portal_config,
+            preview_builder=lambda c: _build_tool_preview(
+                tool_name, tool_input, required_scopes, c, portal_id
+            ),
+            agent_name=None,
+            tool_name=tool_name,
+            intent=intent,
+            request_text=f"tool {tool_name}",
+            proposed_payload=tool_input,
+        )
+        return json.dumps(
+            {
+                "status": "preview",
+                "tool": tool_name,
+                "action_id": aw.action_id,
+                "preview": aw.preview.preview,
+                "risk_level": aw.preview.risk_level.value,
+                "impact_count": aw.preview.impact_count,
+                "original_values": aw.preview.original_values,
+                "required_confirmation": aw.preview.impact_count,
+            },
+            indent=2,
+            default=str,
+        )
+    finally:
+        await client.close()
+
+
+def _handle_tool(args: str, working_dir: str, portal_id: str | None) -> str:
+    """``hubspot tool <name> [--input <json>|-]`` — direct tool dispatch.
+
+    Reads run through ``invoke_tool`` and return JSON.  Writes route through
+    ``safety.apply_write`` with a tool-level preview builder (no agent/runtime
+    fabrication, FR-5b); scope is resolved via ``scope_registry.get_required_scopes``.
+    """
+    try:
+        tool_name, tool_input = _parse_tool_args(args)
+    except ValueError as exc:
+        return f"Usage: /hubspot tool <name> [--input <json>|-]\n  error: {exc}"
+
+    if get_tool(tool_name) is None:
+        known = ", ".join(sorted(t.name for t in list_tools()))
+        return f"Unknown tool: {tool_name}. Known tools: {known}"
+
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return (
+            "No default portal found. Create a `.hubspot-portal` file in your working directory "
+            "with your portal ID, or use `--portal <portal_id>`."
+        )
+    portal_config = load_portal_config(portal_id)
+    if not portal_config:
+        return (
+            f"Portal {portal_id} found but no token configured. "
+            f"Use `/hubspot portal auth {portal_id}` or `/hubspot portal token {portal_id}`."
+        )
+
+    target_object = tool_input.get("object_type") if isinstance(tool_input, dict) else None
+    required = get_required_scopes([tool_name], target_object=target_object)
+
+    if portal_config.scopes_granted:
+        missing = sorted(required - set(portal_config.scopes_granted))
+        if missing:
+            return _tool_scope_error(tool_name, missing)
+
+    if _is_write_tool(required):
+        return _run_async(_tool_write, tool_name, portal_id, portal_config, tool_input, required)
+    return _run_async(_tool_read, tool_name, portal_id, portal_config, tool_input)
+
+
+# ---------------------------------------------------------------------------
+# hubspot agents list / tools list / agent-prompt <name>  (T7)
+# ---------------------------------------------------------------------------
+
+
+def _handle_agents_list() -> str:
+    """Enumerate the agent registry as JSON ``{count, agents:[{name,category,emoji}]}``."""
+    entries = [
+        {"name": name, "category": get_agent_category(name), "emoji": get_agent_emoji(name)}
+        for name in sorted(list_agent_names())
+    ]
+    return json.dumps({"count": len(entries), "agents": entries}, indent=2)
+
+
+def _handle_tools_list() -> str:
+    """Enumerate the tool registry as JSON ``{count, tools:[{name,description,async}]}``."""
+    entries = [
+        {"name": t.name, "description": t.description, "async": t.is_async}
+        for t in sorted(list_tools(), key=lambda x: x.name)
+    ]
+    return json.dumps({"count": len(entries), "tools": entries}, indent=2)
+
+
+def _handle_agent_prompt(name: str, working_dir: str, portal_id: str | None) -> str:
+    """Emit the system prompt + tool set for one agent (catalog introspection)."""
+    if not name:
+        return "Usage: /hubspot agent-prompt <name>"
+    portal_config = None
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
+    if portal_id:
+        portal_config = load_portal_config(portal_id)
+    prompt = get_agent_prompt(name, portal_config)
+    if prompt is None:
+        known = ", ".join(sorted(list_agent_names()))
+        return f"Unknown agent: {name}. Known agents: {known}"
+    return json.dumps(
+        {
+            "name": name,
+            "agent_name": prompt.agent_name,
+            "domain_description": prompt.domain_description,
+            "tool_names": prompt.tool_names,
+            "system_prompt": prompt.system_prompt,
+        },
+        indent=2,
+    )
+
+
+def _strip_global_flags(argv: list[str]) -> tuple[list[str], str | None, str | None]:
+    """Remove top-level --working-dir / --portal flags from argv.
+
+    Only standalone argv tokens (or ``--flag=value`` forms) are matched, so a
+    flag-like substring inside a quoted ``--input`` JSON value is never touched.
+    Returns ``(remaining_tokens, working_dir, portal_id)``.
+    """
+    remaining: list[str] = []
+    working_dir: str | None = None
+    portal_id: str | None = None
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--working-dir" and i + 1 < len(argv):
+            working_dir = argv[i + 1]
+            i += 2
+            continue
+        if tok.startswith("--working-dir="):
+            working_dir = tok[len("--working-dir=") :]
+            i += 1
+            continue
+        if tok == "--portal" and i + 1 < len(argv):
+            portal_id = argv[i + 1]
+            i += 2
+            continue
+        if tok.startswith("--portal="):
+            portal_id = tok[len("--portal=") :]
+            i += 1
+            continue
+        remaining.append(tok)
+        i += 1
+    return remaining, working_dir, portal_id
+
+
+def main() -> None:
+    """Console-script entrypoint: ``hubspot <request> [--working-dir <dir>] [--portal <id>]``."""
+    import sys
+
+    remaining, working_dir, portal_id = _strip_global_flags(list(sys.argv[1:]))
+    if working_dir is None:
+        working_dir = "."
+    if portal_id is not None:
+        try:
+            _validate_portal_id(portal_id)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(2)
+    request = " ".join(remaining)
+    print(hubspot_command(request, working_dir, portal_id=portal_id))
 
 
