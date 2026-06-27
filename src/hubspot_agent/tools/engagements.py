@@ -21,7 +21,7 @@ async def hubspot_get_engagement(
             expected_scopes=[
                 "crm.objects.notes.read",
                 "crm.objects.calls.read",
-                "crm.objects.meetings.read",
+                "crm.objects.appointments.read",
                 "crm.objects.tasks.read",
                 "crm.objects.emails.read",
                 "sales-email-read",
@@ -46,7 +46,7 @@ async def hubspot_search_engagements(
             expected_scopes=[
                 "crm.objects.notes.read",
                 "crm.objects.calls.read",
-                "crm.objects.meetings.read",
+                "crm.objects.appointments.read",
                 "crm.objects.tasks.read",
                 "crm.objects.emails.read",
                 "sales-email-read",
@@ -159,7 +159,7 @@ async def hubspot_create_meeting(
             "/crm/v3/objects/engagements",
             portal_id=portal_id,
             body=payload,
-            expected_scopes=["crm.objects.meetings.write"],
+            expected_scopes=["crm.objects.appointments.write"],
         )
         return resp.body
     except (HubSpotError, RateLimitError, ScopeError) as exc:

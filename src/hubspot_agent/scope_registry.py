@@ -121,10 +121,17 @@ _TOOL_SCOPES: dict[str, set[str] | Any] = {
 
     # Engagements — HubSpot has no single engagements scope; each engagement
     # type carries its own granular object scope. Read tools need the union.
+    # NOTE: crm.objects.notes/calls/tasks/emails.* are HubSpot "hidden scopes"
+    # (referenced in API 403s but not selectable in any app picker), so they are
+    # deliberately NOT requested at authorize time (see setup.REQUIRED_SCOPES).
+    # They remain listed here as the honest API requirement; on OAuth portals
+    # the scope pre-check is skipped (scopes_granted is empty) and these tools
+    # 403 at call time. crm.objects.appointments.* IS selectable and is the
+    # correct scope for meetings.
     "hubspot_search_engagements": {
         "crm.objects.notes.read",
         "crm.objects.calls.read",
-        "crm.objects.meetings.read",
+        "crm.objects.appointments.read",
         "crm.objects.tasks.read",
         "crm.objects.emails.read",
         "sales-email-read",
@@ -132,14 +139,14 @@ _TOOL_SCOPES: dict[str, set[str] | Any] = {
     "hubspot_get_engagement": {
         "crm.objects.notes.read",
         "crm.objects.calls.read",
-        "crm.objects.meetings.read",
+        "crm.objects.appointments.read",
         "crm.objects.tasks.read",
         "crm.objects.emails.read",
         "sales-email-read",
     },
     "hubspot_create_call": {"crm.objects.calls.write"},
     "hubspot_create_email": {"crm.objects.emails.write", "sales-email-read"},
-    "hubspot_create_meeting": {"crm.objects.meetings.write"},
+    "hubspot_create_meeting": {"crm.objects.appointments.write"},
     "hubspot_create_note": {"crm.objects.notes.write"},
     "hubspot_create_task": {"crm.objects.tasks.write"},
 

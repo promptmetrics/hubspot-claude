@@ -11,11 +11,9 @@ from typing import Any
 
 import httpx
 
-from hubspot_agent.app_credentials import get_client_id, get_client_secret
+from hubspot_agent.app_credentials import get_client_id, get_client_secret, get_oauth_endpoints
 from hubspot_agent.config import CONFIG_DIR, PortalConfig, load_portal_config, save_portal_config
 
-_AUTHORIZE_URL = "https://app.hubspot.com/oauth/authorize"
-_TOKEN_URL = "https://api.hubapi.com/oauth/v1/token"
 _REFRESH_BUFFER_SECONDS = 300  # refresh if within 5 minutes of expiry
 _STATE_EXPIRY_SECONDS = 600  # 10 minutes
 
@@ -86,6 +84,8 @@ def get_authorization_url(
     if not client_id:
         raise ValueError("HubSpot app credentials not found. Run save_app_credentials() first.")
 
+    authorize_url, _ = get_oauth_endpoints()
+
     state = secrets.token_urlsafe(32)
     code_verifier = _build_code_verifier()
     code_challenge = _build_code_challenge(code_verifier)
@@ -101,7 +101,7 @@ def get_authorization_url(
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
     }
-    return f"{_AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
+    return f"{authorize_url}?{urllib.parse.urlencode(params)}"
 
 
 async def exchange_code_for_token(
@@ -124,9 +124,10 @@ async def exchange_code_for_token(
     code_verifier = state_data["code_verifier"]
     _clear_oauth_state(state)
 
+    _, token_url = get_oauth_endpoints()
     async with httpx.AsyncClient() as client:
         resp = await client.post(
-            _TOKEN_URL,
+            token_url,
             data={
                 "grant_type": "authorization_code",
                 "client_id": client_id,
@@ -154,9 +155,10 @@ async def refresh_access_token(portal_id: str, refresh_token: str) -> dict[str, 
     if not client_id or not client_secret:
         raise ValueError("HubSpot app credentials not found.")
 
+    _, token_url = get_oauth_endpoints()
     async with httpx.AsyncClient() as client:
         resp = await client.post(
-            _TOKEN_URL,
+            token_url,
             data={
                 "grant_type": "refresh_token",
                 "client_id": client_id,

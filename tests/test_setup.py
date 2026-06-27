@@ -160,16 +160,8 @@ async def test_setup_all_scopes_granted(respx_mock, tmp_path, monkeypatch):
                 "crm.pipelines.orders.write",
                 "settings.users.read",
                 "settings.users.write",
-                "crm.objects.notes.read",
-                "crm.objects.notes.write",
-                "crm.objects.calls.read",
-                "crm.objects.calls.write",
-                "crm.objects.meetings.read",
-                "crm.objects.meetings.write",
-                "crm.objects.tasks.read",
-                "crm.objects.tasks.write",
-                "crm.objects.emails.read",
-                "crm.objects.emails.write",
+                "crm.objects.appointments.read",
+                "crm.objects.appointments.write",
                 "sales-email-read",
             ],
         )
@@ -426,21 +418,27 @@ async def test_setup_schema_counts_malformed_cache(respx_mock, tmp_path, monkeyp
     assert result["schema_counts"].get("companies") == 1
 
 
-# Registry of HubSpot OAuth scopes that are officially selectable / documented.
-# Sourced from https://developers.hubspot.com/docs/apps/developer-platform/build-apps/authentication/scopes
-# Keep this in sync with that reference; the regression test below guards against
-# re-introducing invented scope strings (e.g. automation.workflows.*, crm.pipelines.*,
-# crm.objects.engagements.*, crm.objects.tickets.*) that HubSpot rejects at authorize time.
+# Registry of HubSpot OAuth scopes that are officially SELECTABLE in the
+# developer app's Auth-tab scope picker (the set we may request at authorize
+# time). Sourced from https://developers.hubspot.com/docs/apps/developer-platform/build-apps/authentication/scopes
+#
+# DELIBERATELY EXCLUDED: crm.objects.notes/calls/meetings/tasks/emails.{read,write}
+# are HubSpot "hidden scopes" — the API references them in 403 MISSING_SCOPES
+# responses, but they are NOT selectable in any app picker (OAuth or private
+# app). Requesting them at authorize time makes HubSpot reject the whole
+# authorize call. They are intentionally absent here so the regression test
+# below catches any re-introduction into REQUIRED_SCOPES. The internal
+# scope_registry still names them as the honest API requirement for the
+# engagement create tools (those 403 at call time on OAuth portals).
+#
+# The regression test below guards against re-introducing invented OR hidden
+# scope strings (e.g. automation.workflows.*, crm.pipelines.*,
+# crm.objects.engagements.*, crm.objects.tickets.*, crm.objects.notes.*).
 _VALID_HUBSPOT_SCOPES = {
-    # CRM objects (granular)
+    # CRM objects (granular, selectable)
     "crm.objects.contacts.read", "crm.objects.contacts.write",
     "crm.objects.companies.read", "crm.objects.companies.write",
     "crm.objects.deals.read", "crm.objects.deals.write",
-    "crm.objects.notes.read", "crm.objects.notes.write",
-    "crm.objects.calls.read", "crm.objects.calls.write",
-    "crm.objects.meetings.read", "crm.objects.meetings.write",
-    "crm.objects.tasks.read", "crm.objects.tasks.write",
-    "crm.objects.emails.read", "crm.objects.emails.write",
     "crm.objects.appointments.read", "crm.objects.appointments.write",
     # CRM schemas
     "crm.schemas.contacts.read", "crm.schemas.contacts.write",
@@ -464,6 +462,7 @@ _VALID_HUBSPOT_SCOPES = {
 
 
 def test_required_scopes_are_valid_hubspot_scopes():
-    """Every scope we request at OAuth authorize time must be a real HubSpot scope."""
+    """Every scope we request at OAuth authorize time must be selectable by the
+    app (never an invented or hidden HubSpot scope)."""
     invalid = [s for s in REQUIRED_SCOPES if s not in _VALID_HUBSPOT_SCOPES]
-    assert invalid == [], f"REQUIRED_SCOPES contains non-HubSpot scopes: {invalid}"
+    assert invalid == [], f"REQUIRED_SCOPES contains non-selectable HubSpot scopes: {invalid}"

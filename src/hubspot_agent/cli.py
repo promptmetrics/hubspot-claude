@@ -278,7 +278,7 @@ def _authenticate_portal_oauth(portal_id: str) -> dict[str, Any]:
                 "Save them with:\n"
                 "```python\n"
                 "from hubspot_agent.app_credentials import save_app_credentials\n"
-                "save_app_credentials(client_id='your-client-id', client_secret='your-client-secret', app_id='your-app-id')\n"
+                "save_app_credentials(client_id='your-client-id', client_secret='your-client-secret', app_id='your-app-id', region='us')  # use region='eu' for EU (app-eu1.hubspot.com) apps\n"
                 "```\n\n"
                 f"Then run: `/hubspot portal auth {portal_id}`"
             ),

@@ -55,7 +55,9 @@ async def test_client_hubspot_error(respx_mock):
 async def test_client_401_triggers_refresh(respx_mock, monkeypatch, tmp_path):
     import time
     from pathlib import Path
+    from hubspot_agent.app_credentials import save_app_credentials
     monkeypatch.setattr("hubspot_agent.config.CONFIG_DIR", tmp_path)
+    save_app_credentials(client_id="client-123", client_secret="secret-456")
 
     client = HubSpotClient(PortalConfig(
         portal_id="123",
@@ -94,8 +96,10 @@ async def test_client_401_triggers_refresh(respx_mock, monkeypatch, tmp_path):
 async def test_client_401_after_refresh_raises(respx_mock, monkeypatch, tmp_path):
     import time
     from hubspot_agent.errors import HubSpotError
+    from hubspot_agent.app_credentials import save_app_credentials
 
     monkeypatch.setattr("hubspot_agent.config.CONFIG_DIR", tmp_path)
+    save_app_credentials(client_id="client-123", client_secret="secret-456")
 
     client = HubSpotClient(PortalConfig(
         portal_id="123",
@@ -156,8 +160,10 @@ async def test_client_400_validation_without_errors_key(respx_mock):
 async def test_client_401_auth_category(respx_mock, monkeypatch, tmp_path):
     import time
     from hubspot_agent.errors import HubSpotError, ErrorCategory
+    from hubspot_agent.app_credentials import save_app_credentials
 
     monkeypatch.setattr("hubspot_agent.config.CONFIG_DIR", tmp_path)
+    save_app_credentials(client_id="client-123", client_secret="secret-456")
 
     client = HubSpotClient(PortalConfig(
         portal_id="123",

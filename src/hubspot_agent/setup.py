@@ -36,17 +36,16 @@ REQUIRED_SCOPES = [
     # Users
     "settings.users.read",
     "settings.users.write",
-    # Engagements — granular per-type scopes (notes/calls/meetings/tasks/emails)
-    "crm.objects.notes.read",
-    "crm.objects.notes.write",
-    "crm.objects.calls.read",
-    "crm.objects.calls.write",
-    "crm.objects.meetings.read",
-    "crm.objects.meetings.write",
-    "crm.objects.tasks.read",
-    "crm.objects.tasks.write",
-    "crm.objects.emails.read",
-    "crm.objects.emails.write",
+    # Engagements — only selectable scopes. crm.objects.appointments.* covers
+    # meetings; sales-email-read covers one-to-one sales emails. The granular
+    # crm.objects.notes/calls/tasks/emails.* scopes are HubSpot "hidden scopes"
+    # (referenced in API 403 responses but NOT selectable in the app picker or
+    # private-app config), so requesting them at authorize time makes HubSpot
+    # reject the whole authorize call. We omit them here; the corresponding
+    # create_note/call/task/email tools 403 at call time on OAuth portals and
+    # require a private-app token.
+    "crm.objects.appointments.read",
+    "crm.objects.appointments.write",
     "sales-email-read",
 ]
 

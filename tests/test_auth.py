@@ -129,3 +129,56 @@ async def test_get_valid_token_none(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr("hubspot_agent.config.CONFIG_DIR", tmp_path)
     assert await get_valid_token("123") is None
+
+
+def test_get_authorization_url_us_region_default(tmp_path, monkeypatch):
+    from pathlib import Path
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    from hubspot_agent.app_credentials import save_app_credentials
+    save_app_credentials("client-us", "secret-us")  # default region='us'
+
+    url = get_authorization_url("123", ["crm.objects.contacts.read"])
+    assert url.startswith("https://app.hubspot.com/oauth/authorize")
+    assert "client_id=client-us" in url
+
+
+def test_get_authorization_url_eu_region(tmp_path, monkeypatch):
+    from pathlib import Path
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    from hubspot_agent.app_credentials import save_app_credentials
+    save_app_credentials("client-eu", "secret-eu", region="eu")
+
+    url = get_authorization_url("123", ["crm.objects.contacts.read"])
+    assert url.startswith("https://app-eu1.hubspot.com/oauth/authorize")
+    assert "client_id=client-eu" in url
+
+
+@pytest.mark.asyncio
+async def test_exchange_code_for_token_eu_region(respx_mock, monkeypatch, tmp_path):
+    from pathlib import Path
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("hubspot_agent.config.CONFIG_DIR", tmp_path)
+
+    from hubspot_agent.app_credentials import save_app_credentials
+    save_app_credentials("client-eu", "secret-eu", region="eu")
+
+    respx_mock.post("https://api-eu1.hubapi.com/oauth/v1/token").mock(
+        return_value=Response(200, json={
+            "access_token": "eu-access-token",
+            "refresh_token": "eu-refresh-token",
+            "expires_in": 21600,
+        })
+    )
+
+    url = get_authorization_url("123", ["crm.objects.contacts.read"])
+    state = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["state"][0]
+
+    result = await exchange_code_for_token("123", "auth-code-abc", state)
+    assert result["access_token"] == "eu-access-token"
+
+    portal = load_portal_config("123")
+    assert portal is not None
+    assert portal.token == "eu-access-token"
+    assert portal.auth_type == "oauth"

@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from hubspot_agent.app_credentials import get_api_base_url
 from hubspot_agent.config import PortalConfig
 from hubspot_agent.errors import (
     ErrorCategory,
@@ -33,7 +34,7 @@ class HubSpotClient:
     def __init__(self, portal: PortalConfig):
         self.portal = portal
         self._client = httpx.AsyncClient(
-            base_url=self.BASE_URL,
+            base_url=get_api_base_url(),
             headers={"Authorization": f"Bearer {portal.token}"},
             timeout=httpx.Timeout(30.0, connect=5.0),
         )
