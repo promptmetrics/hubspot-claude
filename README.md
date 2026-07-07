@@ -31,14 +31,14 @@ The agent and tool catalogs live in code. As of this release the registry holds 
 In Claude Code:
 
 ```
-/plugin marketplace add iiizzzyyy/hubspot-claude
+/plugin marketplace add promptmetrics/hubspot-claude
 /plugin install hubspot@hubspot-claude
 ```
 
 Or via the CLI:
 
 ```bash
-claude plugin marketplace add iiizzzyyy/hubspot-claude
+claude plugin marketplace add promptmetrics/hubspot-claude
 claude plugin install hubspot@hubspot-claude
 ```
 
@@ -47,7 +47,7 @@ On the first session after install, the `SessionStart` hook (`hooks/install.sh`)
 ### Local development
 
 ```bash
-git clone https://github.com/iiizzzyyy/hubspot-claude.git
+git clone https://github.com/promptmetrics/hubspot-claude.git
 cd hubspot-claude
 pip install -e ".[dev]"          # editable install with test deps
 claude plugin validate ./        # schema-check plugin.json + marketplace.json + hooks
@@ -216,7 +216,7 @@ claude plugin validate ./                    # schema-check manifests + hooks
 
 ## Questions or Issues?
 
-Open an issue at [github.com/iiizzzyyy/hubspot-claude/issues](https://github.com/iiizzzyyy/hubspot-claude/issues).
+Open an issue at [github.com/promptmetrics/hubspot-claude/issues](https://github.com/promptmetrics/hubspot-claude/issues).
 
 ## License
 

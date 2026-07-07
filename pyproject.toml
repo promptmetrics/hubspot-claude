@@ -12,8 +12,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/iiizzzyyy/hubspot-claude"
-Repository = "https://github.com/iiizzzyyy/hubspot-claude"
+Homepage = "https://github.com/promptmetrics/hubspot-claude"
+Repository = "https://github.com/promptmetrics/hubspot-claude"
 
 [project.scripts]
 hubspot = "hubspot_agent.cli:main"

@@ -3,8 +3,8 @@
   "version": "0.1.4",
   "description": "HubSpot CRM administration via natural language — specialist sub-agents, human-in-the-loop write approval, and a warm-client daemon.",
   "author": { "name": "Izzy Aly" },
-  "homepage": "https://github.com/iiizzzyyy/hubspot-claude",
-  "repository": "https://github.com/iiizzzyyy/hubspot-claude",
+  "homepage": "https://github.com/promptmetrics/hubspot-claude",
+  "repository": "https://github.com/promptmetrics/hubspot-claude",
   "license": "MIT",
   "keywords": ["hubspot", "crm", "sales", "automation", "claude-code"]
 }
