@@ -6,7 +6,7 @@ This is a **local-execution** plugin: a `SessionStart` hook provisions an isolat
 
 > **Important**: Every write is gated behind a preview + explicit `approve`. Destructive operations require the expected record count, re-checked at execute time. The plugin authenticates with OAuth 2.0 or Private App tokens only — never API keys. HubSpot credentials are stored locally under `~/.claude/hubspot/`; review your org's secret-handling policy before use.
 
-The agent and tool catalogs live in code. As of this release the registry holds **44 specialist sub-agents** and **75 tools**; discover the current set with `hubspot agents list` and `hubspot tools list` rather than trusting this number.
+The agent and tool catalogs live in code. As of this release the registry holds **44 specialist sub-agents** and **79 tools**; discover the current set with `hubspot agents list` and `hubspot tools list` rather than trusting this number.
 
 ## Features
 
@@ -16,6 +16,7 @@ The agent and tool catalogs live in code. As of this release the registry holds 
 - **Durable loops** — `/hubspot --loop '<goal>'` runs triage → sequential step execution → verify → checkpoint, resumable across sessions.
 - **Undo + audit** — every approved create/update/delete records an undo snapshot and an audit entry (FR-17/FR-18).
 - **Multi-portal** — isolated state per portal; auto-detection via a `.hubspot-portal` file in the working directory.
+- **Workflow blueprints + learning loop** — 19 JSON blueprint templates ship with the plugin; extract an existing portal workflow into a reviewable blueprint, parameterize it, promote it, and create new workflows from it. All workflow writes now gate behind preview + approval. See [docs/BLUEPRINTS.md](docs/BLUEPRINTS.md).
 
 ## Prerequisites
 
@@ -113,6 +114,20 @@ Categories include Core CRM (contacts, companies, deals, associations), Analytic
 2. Inspect progress: `/hubspot loop status` and `/hubspot loop log`.
 3. Resume after an interruption: `/hubspot loop continue`. Stop early: `/hubspot loop abandon`.
 
+## Workflow blueprints
+
+The plugin ships 19 JSON workflow blueprint templates and a **learning loop** that turns an existing portal workflow into a reusable blueprint: extract → parameterize → promote → create.
+
+```bash
+hubspot tool hubspot_extract_workflow_blueprint       --input '{"workflow_id":"777","name":"My Workflow"}'
+# review the returned flags, then parameterize portal-specific values:
+hubspot tool hubspot_parameterize_blueprint_draft     --input '{"name":"My Workflow","edits":[{"path":"spec.actions[0].fields.content_id","param_name":"email_content_id"}]}'
+hubspot tool hubspot_promote_blueprint_draft          --input '{"name":"My Workflow"}'
+hubspot tool hubspot_create_workflow_from_blueprint    --input '{"blueprint_name":"My Workflow","params":{"email_content_id":"123"}}'
+```
+
+All five workflow write tools (create/update/enroll/toggle/create_from_blueprint) gate behind a preview + `approve`. Extraction is read-only (no gate); parameterize and promote touch local disk only. See [docs/BLUEPRINTS.md](docs/BLUEPRINTS.md) for the format spec, the draft review checklist, and on-disk layout.
+
 ## How it works
 
 ```
@@ -165,6 +180,9 @@ Auth is OAuth 2.0 or Private App tokens only — never API keys. Portal auto-det
 | `${CLAUDE_PLUGIN_DATA}/venv` | Provisioned plugin venv (written by the SessionStart hook) |
 | `${CLAUDE_PLUGIN_DATA}/install.log` | Venv provisioning log (check this if the CLI won't load) |
 | `~/.claude/hubspot/<portal>/` | Portal config, schema cache, undo snapshots, audit log, pending previews, loop state |
+| `~/.claude/hubspot/blueprints/` | Promoted user workflow blueprints (override shipped on name collision) |
+| `~/.claude/hubspot/blueprints/drafts/` | Extracted blueprint drafts awaiting review |
+| `~/.claude/hubspot/<portal>/blueprint_learning.jsonl` | Per-portal unknown-action log (delete to clear) |
 
 ## Project structure
 
@@ -181,7 +199,7 @@ src/hubspot_agent/
 ├── loop_state.py / loop_log.py  # durable loop state + NDJSON event log
 ├── agents/               # specialist sub-agents (registry: 44)
 ├── tools/                # tool modules (registry: 75)
-└── blueprints/workflows/ # pre-built workflow templates
+└── blueprints/workflows/ # JSON workflow blueprints + extract/parameterize/promote learning loop
 bin/hubspot               # plugin entrypoint (venv resolver → router)
 hooks/                    # SessionStart venv provisioning
 .claude-plugin/           # plugin.json + marketplace.json
@@ -192,7 +210,7 @@ tests/                    # pytest suite
 
 ```bash
 pip install -e ".[dev]"                      # test deps (pytest, pytest-asyncio, respx, hypothesis, pyyaml)
-pytest -x                                    # full suite (840 passed, 3 skipped)
+pytest -x                                    # full suite (962 passed, 3 skipped)
 pytest tests/test_install_hook.py -v         # SessionStart venv contract
 bash scripts/check-artifact-allowlist.sh     # shipping-artifact allowlist gate
 claude plugin validate ./                    # schema-check manifests + hooks

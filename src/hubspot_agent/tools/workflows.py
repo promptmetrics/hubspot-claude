@@ -165,7 +165,7 @@ async def hubspot_toggle_workflow(
 
 @tool(
     name="hubspot_create_workflow_from_blueprint",
-    description="Create a new HubSpot workflow from a blueprint template.",
+    description="Create a new HubSpot workflow from a blueprint (shipped template or one extracted from another portal).",
 )
 async def hubspot_create_workflow_from_blueprint(
     blueprint_name: str,
@@ -219,6 +219,8 @@ async def hubspot_create_workflow_from_blueprint(
                 "property-relative task due dates (e.g. '{{deadline - 5d}}'), "
                 "unknown custom-object event triggers, placeholder team IDs, missing marketing email content_id, "
                 "or missing custom properties/deal stages in the target portal. "
-                "Build those workflows manually in the HubSpot UI."
+                "For a workflow that already exists in a portal, extract it with "
+                "hubspot_extract_workflow_blueprint, parameterize the draft, then promote and "
+                "create from it; build the rest manually in the HubSpot UI."
             ),
         }
