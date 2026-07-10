@@ -8,6 +8,7 @@ from hubspot_agent.blueprints.workflows import (
     list_blueprints,
     register_blueprint,
 )
+from hubspot_agent.blueprints.workflows.converter import blueprint_to_v4_payload
 from hubspot_agent.blueprints.workflows.deal_stage_task import _build as build_deal_stage_task
 from hubspot_agent.blueprints.workflows.lead_scoring import _build as build_lead_scoring
 from hubspot_agent.blueprints.workflows.re_engagement import _build as build_re_engagement
@@ -167,3 +168,37 @@ class TestWorkflowsAgentPrompt:
     def test_prompt_still_has_tools(self):
         prompt = get_workflows_agent_prompt()
         assert "hubspot_create_workflow" in prompt.system_prompt
+
+
+class TestConverterV4Shape:
+    def test_event_based_contact_payload_shape(self):
+        payload = blueprint_to_v4_payload(
+            {
+                "name": "X",
+                "object_type": "Contact-based",
+                "enrollment": {"type": "EVENT_BASED", "trigger": "Contact is created"},
+                "actions": [],
+            }
+        )
+        assert payload["flowType"] == "WORKFLOW"
+        assert payload["objectTypeId"] == "0-1"
+        assert payload["type"] == "CONTACT_FLOW"
+        assert payload["isEnabled"] is False
+        ec = payload["enrollmentCriteria"]
+        assert ec["type"] == "EVENT_BASED"
+        assert ec["eventFilterBranches"][0]["eventTypeId"] == "4-1463224"
+        assert ec["eventFilterBranches"][0]["operator"] == "HAS_COMPLETED"
+
+    def test_list_based_payload_has_list_filter_branch(self):
+        payload = blueprint_to_v4_payload(
+            {
+                "name": "Y",
+                "object_type": "Deal-based",
+                "enrollment": {"type": "LIST_BASED", "filter_branch": {"filters": []}},
+                "actions": [],
+            }
+        )
+        assert payload["objectTypeId"] == "0-3"
+        assert payload["type"] == "PLATFORM_FLOW"
+        assert payload["enrollmentCriteria"]["type"] == "LIST_BASED"
+        assert "listFilterBranch" in payload["enrollmentCriteria"]
