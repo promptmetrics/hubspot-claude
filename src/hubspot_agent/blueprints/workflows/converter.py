@@ -13,6 +13,7 @@ from hubspot_agent.blueprints.workflows.action_type_map import (
     ACTION_TYPE_REGISTRY,
     BRANCH_TYPES,
     EVENT_TYPE_MAP,
+    OPERATOR_MAP,
     resolve_flow_type,
     resolve_object_type_id,
 )
@@ -41,15 +42,19 @@ def _parse_due(raw: str) -> tuple[int, str]:
     m = re.search(r"\+\s*(\d+)\s*(h|hour|hours)", raw)
     if m:
         return int(m.group(1)), "HOURS"
-    m = re.search(r"\+\s*(\d+)\s*(m|min|minute|minutes)", raw)
-    if m:
-        return int(m.group(1)), "MINUTES"
     m = re.search(r"\+\s*(\d+)\s*(d|day|days)", raw)
     if m:
         return int(m.group(1)), "DAYS"
+    # month must be checked before minutes: the minutes alternation ``m``
+    # would otherwise match the leading ``m`` of ``month`` (e.g. ``+1month``
+    # parsed as 1 MINUTE). The extractor's due-date inverter relies on this
+    # so MONTHS tasks (re_closing_day) round-trip.
     m = re.search(r"\+\s*(\d+)\s*(month|months)", raw)
     if m:
         return int(m.group(1)), "MONTHS"
+    m = re.search(r"\+\s*(\d+)\s*(m|min|minute|minutes)", raw)
+    if m:
+        return int(m.group(1)), "MINUTES"
     m = re.search(r"\+\s*(\d+)\s*(year|years)", raw)
     if m:
         return int(m.group(1)) * 12, "MONTHS"
@@ -214,13 +219,7 @@ def _build_branch_node(
         operator = fields.get("Operator", "")
         value = fields.get("Value", "")
 
-        op_map = {
-            "is equal to any of": "IS_ANY_OF",
-            "is not equal to any of": "IS_NONE_OF",
-            "is known": "IS_KNOWN",
-            "is unknown": "IS_UNKNOWN",
-        }
-        api_op = op_map.get(operator, operator.upper().replace(" ", "_"))
+        api_op = OPERATOR_MAP.get(operator, operator.upper().replace(" ", "_"))
 
         if api_op in ("IS_KNOWN", "IS_UNKNOWN"):
             op_type = "ALL_PROPERTY"
