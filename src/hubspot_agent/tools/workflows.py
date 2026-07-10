@@ -69,36 +69,77 @@ async def hubspot_list_workflows(
 @tool(name="hubspot_create_workflow", description="Create a new HubSpot workflow.")
 async def hubspot_create_workflow(
     name: str,
-    workflow_type: str,
-    actions: list[dict[str, Any]],
+    object_type: str,
     enrollment: dict[str, Any],
+    actions: list[dict[str, Any]],
     client: HubSpotClient,
     portal_id: str,
 ) -> dict[str, Any]:
+    """Create a workflow via the V4 Flows API.
+
+    ``object_type`` (e.g. "Contact-based", "Deal-based") resolves both the V4
+    ``objectTypeId`` and ``type``. ``enrollment`` and ``actions`` use the
+    blueprint-spec shape consumed by ``blueprint_to_v4_payload``; see the
+    blueprint modules for examples.
+    """
+    spec = {
+        "name": name,
+        "object_type": object_type,
+        "enrollment": enrollment,
+        "actions": actions,
+    }
     try:
+        payload = blueprint_to_v4_payload(spec)
         resp = await client.post(
             "/automation/v4/flows",
             portal_id=portal_id,
-            body={"name": name, "type": workflow_type, "actions": actions, "enrollment": enrollment},
+            body=payload,
             expected_scopes=["automation"],
         )
         return resp.body
     except (HubSpotError, RateLimitError, ScopeError) as exc:
         return {"error": str(exc), "tool": "hubspot_create_workflow"}
+    except ValueError as exc:
+        return {
+            "error": str(exc),
+            "tool": "hubspot_create_workflow",
+            "hint": (
+                "Use the blueprint-spec shape for enrollment/actions, or use "
+                "hubspot_create_workflow_from_blueprint for a template."
+            ),
+        }
+
+
+# Server-managed fields the V4 docs say to remove from a GET response before
+# re-PUTting it as an update; keeping them causes validation errors.
+_PUT_STRIP_FIELDS = ("createdAt", "updatedAt", "dataSources", "id")
+
+
+def _strip_for_put(body: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in body.items() if k not in _PUT_STRIP_FIELDS}
 
 
 @tool(name="hubspot_update_workflow", description="Update an existing HubSpot workflow.")
 async def hubspot_update_workflow(
     workflow_id: str,
-    updates: dict[str, Any],
+    revision_id: str,
+    body: dict[str, Any],
     client: HubSpotClient,
     portal_id: str,
 ) -> dict[str, Any]:
+    """Update a workflow via the V4 Flows API (PUT).
+
+    V4 requires PUT with the workflow's current ``revisionId`` in the body, and
+    any field omitted from the body is deleted from the workflow. ``body`` must
+    therefore be a *full* workflow payload — typically a prior GET response,
+    optionally with caller edits merged in. GET the workflow first to obtain
+    ``revision_id`` and the current body.
+    """
     try:
-        resp = await client.patch(
+        resp = await client.put(
             f"/automation/v4/flows/{quote(workflow_id, safe='')}",
             portal_id=portal_id,
-            body=updates,
+            body={**_strip_for_put(body), "revisionId": revision_id},
             expected_scopes=["automation"],
         )
         return resp.body

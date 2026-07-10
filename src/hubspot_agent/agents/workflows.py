@@ -141,9 +141,9 @@ async def _execute_workflows(
             "hubspot_create_workflow",
             portal_id,
             name=payload.get("name", "New Workflow"),
-            workflow_type=payload.get("workflow_type", "CONTACT_BASED"),
-            actions=payload.get("actions", []),
+            object_type=payload.get("object_type", "Contact-based"),
             enrollment=payload.get("enrollment", {}),
+            actions=payload.get("actions", []),
             client=client,
         )
         return {"status": "success", "data": {"result": result}}
@@ -153,11 +153,32 @@ async def _execute_workflows(
         workflow_id = payload.get("workflow_id")
         if not workflow_id:
             return {"status": "error", "message": "No workflow_id specified for update."}
+        # V4 updates are PUT-with-revisionId and delete any omitted field, so
+        # fetch the current body, merge caller edits over it, and PUT the whole.
+        current = await invoke_tool(
+            "hubspot_get_workflow",
+            portal_id,
+            workflow_id=workflow_id,
+            client=client,
+        )
+        if "error" in current:
+            return {
+                "status": "error",
+                "message": f"Could not fetch workflow {workflow_id} for update: {current['error']}",
+            }
+        revision_id = current.get("revisionId")
+        if not revision_id:
+            return {
+                "status": "error",
+                "message": f"Workflow {workflow_id} has no revisionId; cannot safely update.",
+            }
+        merged = {**current, **(payload.get("updates", {}))}
         result = await invoke_tool(
             "hubspot_update_workflow",
             portal_id,
             workflow_id=workflow_id,
-            updates=payload.get("updates", {}),
+            revision_id=revision_id,
+            body=merged,
             client=client,
         )
         return {"status": "success", "data": {"result": result}}
