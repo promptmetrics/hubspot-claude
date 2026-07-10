@@ -5,6 +5,7 @@ Source: reverse-engineered from portal 148408595 via GET /automation/v4/flows/{i
 
 from __future__ import annotations
 
+import copy
 import re
 from typing import Any
 
@@ -15,6 +16,7 @@ from hubspot_agent.blueprints.workflows.action_type_map import (
     resolve_flow_type,
     resolve_object_type_id,
 )
+from hubspot_agent.blueprints.workflows.schema import is_raw_action
 
 
 def _parse_delay(fields: dict[str, Any]) -> tuple[int, str]:
@@ -98,6 +100,31 @@ def _build_action_node(
     action: dict[str, Any],
     next_id: int | None,
 ) -> dict[str, Any]:
+    # Raw action: a verbatim V4 node captured by the extractor, carried as data
+    # so unknown/portal-specific actions can still be re-created. Deep-copy the
+    # stored node, stamp a fresh actionId, and rewire its connection to the
+    # neighbor. A raw LIST_BRANCH cannot be rewired generically (its branch
+    # edges and defaultBranch point at stale actionIds) — refuse it here as the
+    # second guard behind the extractor's topology check (R1).
+    if is_raw_action(action):
+        stored = action.get("node")
+        if not isinstance(stored, dict):
+            raise ValueError("Raw action is missing its stored 'node' payload.")
+        if stored.get("type") == "LIST_BRANCH":
+            raise ValueError(
+                "Raw LIST_BRANCH nodes cannot be re-wired generically; "
+                "extract this workflow as a native If/then branch instead."
+            )
+        node = copy.deepcopy(stored)
+        node["actionId"] = str(action_id)
+        if next_id is not None:
+            node["connection"] = {"edgeType": "STANDARD", "nextActionId": str(next_id)}
+        else:
+            # Last node in the sequence: the stored node's old connection points
+            # at a stale neighbor, so strip it.
+            node.pop("connection", None)
+        return node
+
     ui_action = action["ui_action"]
     fields = action.get("fields", {})
 
