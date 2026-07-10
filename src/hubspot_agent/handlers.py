@@ -24,7 +24,7 @@ from hubspot_agent.persistence import clear as _clear_pending
 from hubspot_agent.persistence import confirm as _confirm_pending
 from hubspot_agent.persistence import load as _load_pending
 from hubspot_agent.safety import apply_write
-from hubspot_agent.scope_registry import get_required_scopes
+from hubspot_agent.scope_registry import WRITE_TOOLS, get_required_scopes
 from hubspot_agent.snapshot import (
     delete_undo_snapshot,
     save_undo_snapshot_for_action,
@@ -61,7 +61,12 @@ def _ok(data: Any) -> dict[str, Any]:
     return {"ok": True, "data": data}
 
 
-def _is_write_tool(required_scopes: set[str]) -> bool:
+def _is_write_tool(required_scopes: set[str], tool_name: str | None = None) -> bool:
+    # Scope-suffix covers crm.objects.*.write/.delete etc. Workflow tools carry
+    # the bare ``automation`` scope (no suffix), so they also need an explicit
+    # name match against scope_registry.WRITE_TOOLS to hit the HITL write gate.
+    if tool_name is not None and tool_name in WRITE_TOOLS:
+        return True
     return any(s.endswith(suffix) for s in required_scopes for suffix in _WRITE_SCOPE_SUFFIXES)
 
 
@@ -170,7 +175,7 @@ async def handle_tool(client, cache, portal_config: PortalConfig, params: dict[s
     # matching the agent path's initialize_session).  No-op for standard types.
     await ensure_custom_schema_cached(portal_config, target_object)
 
-    if not _is_write_tool(required_scopes):
+    if not _is_write_tool(required_scopes, tool_name):
         result = await invoke_tool(tool_name, portal_id, client=client, **_tool_kwargs(tool_input))
         return _ok({"tool": tool_name, "result": result})
 

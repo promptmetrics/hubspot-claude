@@ -75,3 +75,52 @@ def record_unknown_actions(
         for rec in records:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     return log_path
+
+
+def pending_unknowns_summary(base_dir: Path | None = None) -> str:
+    """One-line summary of unknown actions logged by every portal's extractions.
+
+    Surfaces distinct unknown ``action_type_id``s across all
+    ``<base>/<portal>/blueprint_learning.jsonl`` files so the Workflows agent
+    prompt can point the user at coverage gaps. Returns "" when nothing is
+    logged. Only ``action_type_id``s (and portal count) are surfaced — never
+    field names or value previews (R11) — so no portal data leaks into the
+    agent's system prompt.
+    """
+    root = base_dir if base_dir is not None else Path.home() / ".claude" / "hubspot"
+    if not root.is_dir():
+        return ""
+    seen: dict[str, set[str]] = {}
+    for portal_dir in sorted(root.iterdir()):
+        if not portal_dir.is_dir():
+            continue
+        log_path = portal_dir / "blueprint_learning.jsonl"
+        if not log_path.is_file():
+            continue
+        try:
+            with log_path.open(encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    aid = rec.get("action_type_id") or ""
+                    if not aid:
+                        continue
+                    seen.setdefault(aid, set()).add(portal_dir.name)
+        except OSError:
+            continue
+    if not seen:
+        return ""
+    portals = len({p for members in seen.values() for p in members})
+    ids = sorted(seen, key=lambda s: (s == "", s))[:8]
+    listed = ", ".join(i or "<unknown>" for i in ids)
+    extra = "" if len(seen) <= 8 else f" (+{len(seen) - 8} more)"
+    return (
+        f"{len(seen)} unknown actionTypeIds logged across {portals} portal(s): "
+        f"{listed}{extra} — extract the source workflows and extend the converter "
+        f"to support them, or acknowledge them in the draft."
+    )

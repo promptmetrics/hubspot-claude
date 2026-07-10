@@ -102,6 +102,12 @@ _TOOL_SCOPES: dict[str, set[str] | Any] = {
     "hubspot_enroll_workflow": {"automation"},
     "hubspot_create_workflow_from_blueprint": {"automation"},
 
+    # Blueprint learning loop — extract reads HubSpot (automation); parameterize
+    # and promote are local-disk only (no HubSpot write) so they carry no scope.
+    "hubspot_extract_workflow_blueprint": {"automation"},
+    "hubspot_parameterize_blueprint_draft": set(),
+    "hubspot_promote_blueprint_draft": set(),
+
     # Pipelines — only `crm.pipelines.orders.*` exists; deal pipelines are
     # gated by crm.objects.deals.* / crm.schemas.deals.* (already required).
     "hubspot_list_pipelines": {"crm.pipelines.orders.read"},
@@ -254,6 +260,9 @@ _AGENT_TOOLS: dict[str, list[str]] = {
         "hubspot_enroll_workflow",
         "hubspot_toggle_workflow",
         "hubspot_create_workflow_from_blueprint",
+        "hubspot_extract_workflow_blueprint",
+        "hubspot_parameterize_blueprint_draft",
+        "hubspot_promote_blueprint_draft",
     ],
     "pipelines": [
         "hubspot_list_pipelines",
@@ -331,6 +340,23 @@ _AGENT_TOOLS: dict[str, list[str]] = {
         "hubspot_create_dashboard",
         "hubspot_schedule_email",
     ],
+}
+
+
+# Workflow write tools carry the bare scope ``{"automation"}`` (no ``.write``/
+# ``.delete`` suffix), so the scope-suffix ``_is_write_tool`` check misses them
+# and every workflow create/update/enroll/toggle POSTs with no HITL preview.
+# This explicit set is the second predicate: a tool is a write if its scopes
+# have a write/delete suffix OR its name is in ``WRITE_TOOLS``. No workflow
+# ``delete`` tool exists, so the five writes are create/update/enroll/toggle/
+# create-from-blueprint. The learning-loop tools are intentionally absent —
+# extract is a read, parameterize/promote touch only local disk.
+WRITE_TOOLS: set[str] = {
+    "hubspot_create_workflow",
+    "hubspot_update_workflow",
+    "hubspot_enroll_workflow",
+    "hubspot_toggle_workflow",
+    "hubspot_create_workflow_from_blueprint",
 }
 
 

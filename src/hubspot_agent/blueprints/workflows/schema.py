@@ -50,6 +50,10 @@ class Flag(BaseModel):
     kind: str
     value: Any = None
     suggestion: str = ""
+    # Set by the parameterize tool when the user accepts a portal-specific or
+    # unmodeled value as intentional. Promote refuses while any flag is
+    # unacknowledged (and not parameterized away) unless ``force=True``.
+    acknowledged: bool = False
 
 
 class BlueprintSpec(BaseModel):
