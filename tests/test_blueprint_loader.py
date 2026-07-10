@@ -10,6 +10,7 @@ from hubspot_agent.blueprints.workflows import (
 )
 from hubspot_agent.blueprints.workflows.loader import (
     list_drafts,
+    load_packaged_blueprints,
     load_user_blueprints,
 )
 
@@ -52,6 +53,29 @@ def _bp_json(name="user_one", **spec_overrides):
 def user_base(tmp_path):
     (tmp_path / "blueprints").mkdir()
     return tmp_path
+
+
+# --- load_packaged_blueprints (wheel-safe importlib.resources) -------------
+
+
+class TestPackagedBlueprints:
+    def test_returns_all_nineteen(self):
+        # Resolves via importlib.resources.files(__package__)/"data" — works
+        # identically from a source checkout and an installed wheel (R8).
+        bps = load_packaged_blueprints()
+        assert len(bps) == 19
+
+    def test_expected_names_present(self):
+        names = {bp.name for bp in load_packaged_blueprints()}
+        assert names >= {
+            "welcome_email", "lead_scoring", "deal_stage_task", "re_engagement",
+            "re_speed_to_lead", "re_stale_listing", "re_closing_day",
+        }
+
+    def test_packaged_blueprint_renders(self):
+        bp = {bp.name: bp for bp in load_packaged_blueprints()}["deal_stage_task"]
+        spec = bp.build({"stage": "closedwon", "due_days": 3})
+        assert spec["actions"][0]["fields"]["Due date"] == "{timestamp + 3d}"
 
 
 # --- load_user_blueprints ------------------------------------------------

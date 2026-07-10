@@ -3,31 +3,9 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import quote
 
-from hubspot_agent.blueprints.workflows import get_blueprint
+from hubspot_agent.blueprints.workflows import get_blueprint, list_blueprints
 from hubspot_agent.blueprints.workflows.converter import blueprint_to_v4_payload
 
-# Trigger blueprint self-registration
-from hubspot_agent.blueprints.workflows import (  # noqa: F401
-    deal_stage_task,
-    lead_scoring,
-    re_anniversary_touch,
-    re_buyer_appraisal_alert,
-    re_buyer_criteria_match,
-    re_buyer_financing_alert,
-    re_buyer_inspection_alert,
-    re_closing_day,
-    re_engagement,
-    re_hygiene_unassigned,
-    re_offer_present_seller,
-    re_open_house_followup,
-    re_pre_listing_prep,
-    re_showing_feedback,
-    re_speed_to_lead,
-    re_stale_buyer_deal,
-    re_stale_listing,
-    re_vendor_expiry,
-    welcome_email,
-)
 from hubspot_agent.client import HubSpotClient
 from hubspot_agent.errors import HubSpotError, RateLimitError, ScopeError
 from hubspot_agent.tools import tool
@@ -198,15 +176,13 @@ async def hubspot_create_workflow_from_blueprint(
     try:
         blueprint = get_blueprint(blueprint_name)
         if blueprint is None:
-            available = [b.name for b in __import__(
-                "hubspot_agent.blueprints.workflows", fromlist=["list_blueprints"]
-            ).list_blueprints()]
+            available = [b.name for b in list_blueprints()]
             return {
                 "error": f"Blueprint '{blueprint_name}' not found.",
                 "available_blueprints": available,
             }
 
-        merged_params = params or {}
+        merged_params = dict(params or {})
         # Merge parameter defaults from blueprint schema
         for key, info in blueprint.parameter_schema.items():
             if key not in merged_params:

@@ -9,10 +9,22 @@ from hubspot_agent.blueprints.workflows import (
     register_blueprint,
 )
 from hubspot_agent.blueprints.workflows.converter import blueprint_to_v4_payload
-from hubspot_agent.blueprints.workflows.deal_stage_task import _build as build_deal_stage_task
-from hubspot_agent.blueprints.workflows.lead_scoring import _build as build_lead_scoring
-from hubspot_agent.blueprints.workflows.re_engagement import _build as build_re_engagement
-from hubspot_agent.blueprints.workflows.welcome_email import _build as build_welcome_email
+
+
+def build_welcome_email(params):
+    return get_blueprint("welcome_email").build(dict(params))
+
+
+def build_lead_scoring(params):
+    return get_blueprint("lead_scoring").build(dict(params))
+
+
+def build_deal_stage_task(params):
+    return get_blueprint("deal_stage_task").build(dict(params))
+
+
+def build_re_engagement(params):
+    return get_blueprint("re_engagement").build(dict(params))
 
 
 @pytest.fixture(autouse=True)

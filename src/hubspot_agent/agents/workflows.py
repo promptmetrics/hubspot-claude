@@ -5,28 +5,6 @@ from hubspot_agent.agents._base import AgentPrompt, build_agent_prompt
 from hubspot_agent.blueprints.workflows import build_blueprint_context
 from hubspot_agent.config import PortalConfig
 
-# Import blueprint modules to trigger self-registration
-from hubspot_agent.blueprints.workflows import (  # noqa: F401
-    deal_stage_task,
-    lead_scoring,
-    re_anniversary_touch,
-    re_buyer_appraisal_alert,
-    re_buyer_criteria_match,
-    re_buyer_financing_alert,
-    re_buyer_inspection_alert,
-    re_closing_day,
-    re_engagement,
-    re_hygiene_unassigned,
-    re_offer_present_seller,
-    re_open_house_followup,
-    re_pre_listing_prep,
-    re_showing_feedback,
-    re_speed_to_lead,
-    re_stale_buyer_deal,
-    re_stale_listing,
-    re_vendor_expiry,
-    welcome_email,
-)
 from hubspot_agent.dispatch import register_execute, register_preview, register_reconcile
 from hubspot_agent.models import PreviewResult, TaskIntent
 from hubspot_agent.tools import get_tool, invoke_tool
