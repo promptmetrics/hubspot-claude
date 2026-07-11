@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import quote
 
-from hubspot_agent.blueprints.workflows import get_blueprint, list_blueprints
+from hubspot_agent.blueprints.workflows import get_blueprint, list_blueprints, reload_blueprints
 from hubspot_agent.blueprints.workflows.converter import blueprint_to_v4_payload
 
 from hubspot_agent.client import HubSpotClient
@@ -174,6 +174,10 @@ async def hubspot_create_workflow_from_blueprint(
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
+        # Fresh processes load only packaged blueprints at import (by design, for
+        # test isolation). Reload from disk so a user-promoted blueprint is visible
+        # to this create call in any process — daemon, in-process CLI, or fresh run.
+        reload_blueprints()
         blueprint = get_blueprint(blueprint_name)
         if blueprint is None:
             available = [b.name for b in list_blueprints()]

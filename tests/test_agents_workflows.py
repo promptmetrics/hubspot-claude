@@ -7,7 +7,7 @@ import pytest
 import hubspot_agent.agents  # noqa: F401 — populate tool registry
 import hubspot_agent.blueprints.workflows as _registry
 from hubspot_agent.agents.workflows import _build_workflows_preview, _execute_workflows, get_workflows_agent_prompt
-from hubspot_agent.blueprints.workflows import get_blueprint, reload_blueprints
+from hubspot_agent.blueprints.workflows import get_blueprint, load_packaged_blueprints, register_blueprint, reload_blueprints
 from hubspot_agent.client import HubSpotClient
 from hubspot_agent.config import PortalConfig
 from hubspot_agent.models import RiskLevel, TaskIntent
@@ -380,3 +380,87 @@ async def test_preview_create_no_blueprint_falls_back_manual():
     preview = await _build_workflows_preview("workflows", intent, client=None, portal_id="123")
     assert "blueprint_name" not in preview.proposed_payload
     assert preview.proposed_payload["name"] == "create a totally bespoke automation"
+
+
+# ---------------------------------------------------------------------------
+# Fresh-process user-blueprint loading (regression for R9-worse).
+# ---------------------------------------------------------------------------
+
+def _write_user_blueprint(name: str, slug: str) -> Path:
+    """Write a minimal, converter-safe user blueprint to the isolated home dir."""
+    user_bp = {
+        "format_version": 1, "name": name,
+        "description": "set lead status (user blueprint)", "tags": [],
+        "source": {"origin": "user"}, "notes": [], "flags": [], "parameters": {},
+        "spec": {
+            "ui_path": "Settings > Automation > Workflows > Create workflow",
+            "object_type": "Contact-based",
+            "enrollment": {
+                "type": "LIST_BASED",
+                "filter_branch": {
+                    "filterBranches": [],
+                    "filters": [
+                        {"property": "lifecyclestage", "filterType": "PROPERTY",
+                         "operation": {"operator": "IS_ANY_OF", "includeObjectsWithNoValueSet": False,
+                                       "values": ["lead"], "operationType": "ENUMERATION"}},
+                    ],
+                    "filterBranchType": "AND", "filterBranchOperator": "AND",
+                },
+            },
+            "actions": [
+                {"ui_action": "Set property value",
+                 "fields": {"Property": "hs_lead_status", "Value": "IN_PROGRESS"}},
+            ],
+            "prerequisites": [], "validation": [],
+        },
+    }
+    user_dir = Path.home() / ".claude" / "hubspot" / "blueprints"
+    user_dir.mkdir(parents=True, exist_ok=True)
+    path = user_dir / f"{slug}.json"
+    path.write_text(json.dumps(user_bp))
+    return path
+
+
+def _simulate_fresh_import() -> None:
+    """A fresh process loads only packaged blueprints at import (by design, for
+    test isolation). Reset the in-memory registry to that state so the create
+    path must reload user blueprints from disk to find them."""
+    _registry._BLUEPRINT_REGISTRY.clear()
+    for bp in load_packaged_blueprints():
+        register_blueprint(bp)
+
+
+@pytest.mark.asyncio
+async def test_create_reloads_user_blueprints_in_fresh_process(env, respx_mock):
+    """Regression: a fresh process loads only packaged blueprints at import, so a
+    user-promoted blueprint is absent from the registry until the tool layer
+    reloads from disk. create_workflow_from_blueprint must reload and find it
+    (else it returns 'Blueprint not found' even though the file is on disk)."""
+    bp_name = "Fresh Process Lead Status"
+    _write_user_blueprint(bp_name, "fresh_process_lead_status")
+
+    _simulate_fresh_import()
+    assert get_blueprint(bp_name) is None  # bug precondition: not in memory
+
+    respx_mock.post("https://api.hubapi.com/automation/v4/flows").mock(
+        return_value=httpx.Response(200, json={"id": "new-flow"})
+    )
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    out = await invoke_tool(
+        "hubspot_create_workflow_from_blueprint", "123",
+        blueprint_name=bp_name, client=c, params={},
+    )
+    assert "error" not in out, out
+    assert out["id"] == "new-flow"
+    await c.close()
+
+    # Preview path reloads too: a request naming the user blueprint matches it
+    # even when the in-memory registry was packaged-only at call time.
+    _simulate_fresh_import()
+    assert get_blueprint(bp_name) is None
+    intent = TaskIntent(
+        intent_type="create", description=f"create a {bp_name} workflow",
+        risk_level=RiskLevel.MEDIUM,
+    )
+    preview = await _build_workflows_preview("workflows", intent, client=None, portal_id="123")
+    assert preview.proposed_payload.get("blueprint_name") == bp_name

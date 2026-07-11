@@ -6,7 +6,7 @@ import hubspot_agent.tools.workflows  # noqa: F401 — registers tools
 import hubspot_agent.tools.blueprint_library  # noqa: F401 — registers tools
 from hubspot_agent.agents._base import AgentPrompt, build_agent_prompt
 from hubspot_agent.blueprints.workflows import build_blueprint_context
-from hubspot_agent.blueprints.workflows import list_blueprints
+from hubspot_agent.blueprints.workflows import list_blueprints, reload_blueprints
 from hubspot_agent.blueprints.workflows.converter import blueprint_to_v4_payload
 from hubspot_agent.config import PortalConfig
 
@@ -115,6 +115,9 @@ def _preview_create(intent: TaskIntent) -> PreviewResult:
     builder's proposed_payload), so the execute path can route to
     ``hubspot_create_workflow_from_blueprint`` instead of manual construction.
     """
+    # Fresh processes load only packaged blueprints at import (by design). Reload
+    # from disk so a user-promoted blueprint is matchable in any process.
+    reload_blueprints()
     bp = _match_blueprint(intent)
     if bp is None:
         return PreviewResult(
