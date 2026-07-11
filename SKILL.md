@@ -64,6 +64,21 @@ For each request:
 
 `--pattern '<sample request>'` runs sample-verify-scale batch approval.
 
+## Workflow blueprints (learning loop)
+
+The plugin ships 19 JSON workflow blueprint templates and a learning loop that turns an existing portal workflow into a reusable, parameterized blueprint. Because sub-agents are stateless, the loop is two dispatches: extract returns flags + a summary to the parent, the user decides the parameterization, then the parent parameterizes and promotes.
+
+```bash
+hubspot tool hubspot_extract_workflow_blueprint      --input '{"workflow_id":"777","name":"My Workflow"}'      # read-only (no gate): GET → draft + learning-log
+hubspot tool hubspot_parameterize_blueprint_draft    --input '{"name":"My Workflow","edits":[{"path":"...","param_name":"x"}]}'  # local disk only
+hubspot tool hubspot_promote_blueprint_draft         --input '{"name":"My Workflow"}'                        # local disk only; gates on unresolved flags
+hubspot tool hubspot_create_workflow_from_blueprint  --input '{"blueprint_name":"My Workflow","params":{...}}' # WRITE → preview + action_id
+```
+
+All five workflow write tools (`hubspot_create_workflow`, `hubspot_update_workflow`, `hubspot_enroll_workflow`, `hubspot_toggle_workflow`, `hubspot_create_workflow_from_blueprint`) gate behind `apply_write` — they return a preview + `action_id` and only mutate HubSpot on `approve`. `extract` only GETs; `parameterize`/`promote` touch local disk only and do not gate.
+
+Extraction flags portal-specific values (list IDs, marketing email `content_id`, team/user IDs, custom object types) and dropped workflow-level settings (goals, re-enrollment, suppression, time windows); `promote` refuses while any flag is unresolved unless `force`. A promoted blueprint overrides a shipped one of the same name. Reload only refreshes the calling process — restart the daemon (`hubspot serve stop`) to load a promoted blueprint there. See `docs/BLUEPRINTS.md` for the format spec and draft review checklist.
+
 ## Warm-client daemon
 
 Read and write-preview tool calls route through a warm-client daemon (one reused `HubSpotClient` + schema cache) for speed; everything else (`approve`, `reject`, `loop *`, `route`, `agents`) runs in-process. The daemon is lazy-started on the first tool call and self-exits after idle. Manage it explicitly when needed:

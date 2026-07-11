@@ -1,32 +1,15 @@
 from __future__ import annotations
 
+from typing import Any
+
 import hubspot_agent.tools.workflows  # noqa: F401 — registers tools
+import hubspot_agent.tools.blueprint_library  # noqa: F401 — registers tools
 from hubspot_agent.agents._base import AgentPrompt, build_agent_prompt
 from hubspot_agent.blueprints.workflows import build_blueprint_context
+from hubspot_agent.blueprints.workflows import list_blueprints, reload_blueprints
+from hubspot_agent.blueprints.workflows.converter import blueprint_to_v4_payload
 from hubspot_agent.config import PortalConfig
 
-# Import blueprint modules to trigger self-registration
-from hubspot_agent.blueprints.workflows import (  # noqa: F401
-    deal_stage_task,
-    lead_scoring,
-    re_anniversary_touch,
-    re_buyer_appraisal_alert,
-    re_buyer_criteria_match,
-    re_buyer_financing_alert,
-    re_buyer_inspection_alert,
-    re_closing_day,
-    re_engagement,
-    re_hygiene_unassigned,
-    re_offer_present_seller,
-    re_open_house_followup,
-    re_pre_listing_prep,
-    re_showing_feedback,
-    re_speed_to_lead,
-    re_stale_buyer_deal,
-    re_stale_listing,
-    re_vendor_expiry,
-    welcome_email,
-)
 from hubspot_agent.dispatch import register_execute, register_preview, register_reconcile
 from hubspot_agent.models import PreviewResult, TaskIntent
 from hubspot_agent.tools import get_tool, invoke_tool
@@ -39,6 +22,9 @@ _TOOL_NAMES = [
     "hubspot_update_workflow",
     "hubspot_enroll_workflow",
     "hubspot_toggle_workflow",
+    "hubspot_extract_workflow_blueprint",
+    "hubspot_parameterize_blueprint_draft",
+    "hubspot_promote_blueprint_draft",
 ]
 
 _DOMAIN = (
@@ -100,17 +86,87 @@ async def _build_workflows_preview(
         )
 
     if intent.intent_type == "create":
-        return PreviewResult(
-            preview={"message": "Will create a new workflow"},
-            impact_count=1,
-            risk_level=intent.risk_level,
-            proposed_payload={"name": intent.description, "actions": []},
-        )
+        return _preview_create(intent)
 
     return PreviewResult(
         preview={"message": f"{intent.intent_type} operation on workflows"},
         impact_count=intent.estimated_impact or 1,
         risk_level=intent.risk_level,
+    )
+
+
+def _match_blueprint(intent: TaskIntent):
+    """Best-effort: pick the shipped/user blueprint whose name appears in the request.
+
+    The preview builder cannot receive a caller-provided blueprint name, so it
+    infers one from the request text. Returns ``None`` when nothing matches.
+    """
+    text = intent.description.lower()
+    for bp in list_blueprints():
+        if bp.name and bp.name.lower() in text:
+            return bp
+    return None
+
+
+def _preview_create(intent: TaskIntent) -> PreviewResult:
+    """Richer create preview: resolve a blueprint, render its spec, attempt V4
+    conversion, and surface raw-node / cross-portal warnings (R5). The blueprint
+    name survives into execute via ``proposed_payload`` (apply_write persists the
+    builder's proposed_payload), so the execute path can route to
+    ``hubspot_create_workflow_from_blueprint`` instead of manual construction.
+    """
+    # Fresh processes load only packaged blueprints at import (by design). Reload
+    # from disk so a user-promoted blueprint is matchable in any process.
+    reload_blueprints()
+    bp = _match_blueprint(intent)
+    if bp is None:
+        return PreviewResult(
+            preview={"message": "Will create a new workflow (no matching blueprint; manual construction)."},
+            impact_count=1,
+            risk_level=intent.risk_level,
+            proposed_payload={"name": intent.description, "actions": []},
+        )
+
+    warnings: list[str] = []
+    params: dict[str, Any] = {}
+    spec = bp.build(params) if bp.build is not None else {}
+    raw_action_count = sum(1 for a in spec.get("actions", []) if isinstance(a, dict) and a.get("raw") is True)
+    v4_ok = True
+    try:
+        blueprint_to_v4_payload({**spec, "name": bp.name})
+    except ValueError as exc:
+        v4_ok = False
+        warnings.append(f"Blueprint does not auto-convert to V4: {exc}")
+
+    if raw_action_count:
+        warnings.append(
+            f"Blueprint contains {raw_action_count} raw action node(s) the converter "
+            "cannot generically re-create; review before creating."
+        )
+    if bp.origin == "user":
+        # Extracted/user blueprints may carry portal-specific values (list IDs,
+        # content IDs, team/user IDs) from their source portal (R5).
+        warnings.append(
+            "This blueprint originated from another portal; verify portal-specific "
+            "values (list IDs, marketing email content IDs, team/user IDs) before creating."
+        )
+
+    proposed_payload: dict[str, Any] = {
+        "blueprint_name": bp.name,
+        "params": params,
+        "object_type": spec.get("object_type", "Contact-based"),
+        "raw_action_count": raw_action_count,
+        "v4_ok": v4_ok,
+    }
+    message = f"Will create a workflow from blueprint '{bp.name}' [{bp.origin}]"
+    if warnings:
+        message += ". Warnings: " + "; ".join(warnings)
+
+    return PreviewResult(
+        preview={"message": message, "warnings": warnings},
+        impact_count=1,
+        risk_level=intent.risk_level,
+        proposed_payload=proposed_payload,
     )
 
 
@@ -137,6 +193,15 @@ async def _execute_workflows(
 
     if intent.intent_type == "create":
         payload = proposed_payload or {}
+        if payload.get("blueprint_name"):
+            result = await invoke_tool(
+                "hubspot_create_workflow_from_blueprint",
+                portal_id,
+                blueprint_name=payload["blueprint_name"],
+                params=payload.get("params") or {},
+                client=client,
+            )
+            return {"status": "success", "data": {"result": result}}
         result = await invoke_tool(
             "hubspot_create_workflow",
             portal_id,

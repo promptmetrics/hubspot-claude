@@ -128,6 +128,11 @@ async def apply_write(
 
     action_id = str(uuid.uuid4())[:8]
     normalized_sources = normalize_informing_sources(preview.informing_sources)
+    # Prefer the preview builder's proposed_payload when it set one: the builder
+    # is the component that inspected the intent and knows what to create (e.g.
+    # a workflow blueprint reference). Falls back to the caller's argument (the
+    # tool path passes ``tool_input`` here) so direct-tool dispatch is unchanged.
+    persisted_payload = preview.proposed_payload or proposed_payload or {}
     preview_data = {
         "agent_name": agent_name,
         "tool_name": tool_name,
@@ -136,7 +141,7 @@ async def apply_write(
         "preview": preview.model_dump(mode="json"),
         "trace_id": trace_id,
         "batch_mode": batch_mode.value,
-        "proposed_payload": proposed_payload or {},
+        "proposed_payload": persisted_payload,
         "informing_sources": normalized_sources,
         "required_confirmation": preview.impact_count,
         "confirmed_count": None,
