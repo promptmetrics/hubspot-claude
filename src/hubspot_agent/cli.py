@@ -1101,7 +1101,7 @@ def _handle_tool(args: str, working_dir: str, portal_id: str | None) -> str:
         if missing:
             return _tool_scope_error(tool_name, missing)
 
-    if _is_write_tool(required):
+    if _is_write_tool(required, tool_name):
         return _run_async(_tool_write, tool_name, portal_id, portal_config, tool_input, required)
     return _run_async(_tool_read, tool_name, portal_id, portal_config, tool_input)
 

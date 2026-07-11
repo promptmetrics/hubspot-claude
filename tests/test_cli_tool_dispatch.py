@@ -223,6 +223,36 @@ def test_tool_write_routes_through_apply_write(tmp_path, monkeypatch):
     assert captured["proposed_payload"]["properties"]["firstname"] == "Izzy"
 
 
+def test_tool_workflow_create_from_blueprint_routes_through_apply_write(tmp_path, monkeypatch):
+    """Regression: hubspot_create_workflow_from_blueprint carries the bare
+    {"automation"} scope (no .write suffix), so it only gates via WRITE_TOOLS
+    membership. The CLI _handle_tool path must pass tool_name to _is_write_tool
+    or the write bypasses HITL and POSTs directly. (The 0.2.0 HITL fix only
+    reached the daemon path, handlers.py; this guards the CLI/in-process path.)"""
+    cli, _ = _bootstrap_portal(tmp_path, monkeypatch)
+
+    captured: dict = {}
+
+    async def fake_apply_write(*, client, portal_config, preview_builder, **kwargs):
+        captured.update(kwargs)
+        return _fake_apply_write_result(kwargs.get("tool_name", "hubspot_create_workflow_from_blueprint"))
+
+    monkeypatch.setattr(cli, "_apply_write", fake_apply_write)
+
+    out = hubspot_command(
+        'tool hubspot_create_workflow_from_blueprint --input {"blueprint_name":"welcome_email","params":{}}',
+        working_dir=str(tmp_path),
+    )
+    payload = json.loads(out)
+    assert payload["status"] == "preview"
+    assert payload["tool"] == "hubspot_create_workflow_from_blueprint"
+    assert payload["action_id"] == "abcd1234"
+    # The write routed through apply_write (HITL), not invoke_tool direct (POST).
+    assert captured["tool_name"] == "hubspot_create_workflow_from_blueprint"
+    assert captured["agent_name"] is None
+    assert captured["proposed_payload"]["blueprint_name"] == "welcome_email"
+
+
 def test_tool_delete_classified_destructive(tmp_path, monkeypatch):
     cli, _ = _bootstrap_portal(tmp_path, monkeypatch)
 
