@@ -13,9 +13,13 @@ low-frequency and the in-process path shares the same
 FR-17/18 undo, FR-17 audit) as the daemon handler, so both paths behave
 identically.
 
-Crash recovery (FR-15): a stale PID → unlink socket + restart; an RPC failure
-or timeout → kill the daemon + restart once + retry.  Any daemon failure falls
-back to the in-process CLI so the caller always gets a correct result.
+Crash recovery (FR-15): a stale PID → unlink socket + restart; a PRE-send
+failure (connect refused / stale socket — the request never reached the
+daemon) → kill + restart once + retry, else fall back to the in-process CLI.
+A POST-send failure (recv timeout / EOF) means the daemon may have already
+persisted a pending preview, so a WRITE tool is never re-sent and never falls
+back — the caller gets a warning pointing at ``hubspot pending`` instead of a
+duplicate/orphan preview.  Reads stay retryable (re-running a read is safe).
 """
 from __future__ import annotations
 
@@ -30,8 +34,16 @@ from pathlib import Path
 from typing import Any
 
 DAEMON_IDLE_TIMEOUT = 600.0
-RPC_TIMEOUT = 5.0
+# 2x the client's per-request httpx timeout (30s): a tool RPC is a handful of
+# HubSpot requests at most (writes only build a read-based preview).  The old
+# 5s value SIGTERM'd a healthy daemon mid-request and re-ran the call up to
+# three times, persisting a distinct pending preview per pass (M11).
+RPC_TIMEOUT = 60.0
 LAZY_START_TIMEOUT = 5.0
+
+
+class DaemonUnreachable(OSError):
+    """Connect failed — the request never reached the daemon (safe to retry)."""
 
 
 def plugin_data_dir() -> Path:
@@ -125,7 +137,10 @@ def rpc_call(method: str, params: dict[str, Any], *, timeout: float = RPC_TIMEOU
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
-        s.connect(str(socket_path()))
+        try:
+            s.connect(str(socket_path()))
+        except OSError as exc:
+            raise DaemonUnreachable(str(exc)) from exc
         s.sendall(payload)
         buf = bytearray()
         while not buf.endswith(b"\n"):
@@ -224,21 +239,38 @@ def _is_portal_mismatch(resp: dict[str, Any]) -> bool:
     return isinstance(err, dict) and err.get("kind") == "portal_mismatch"
 
 
-def _rpc_tool(params: dict[str, Any]) -> dict[str, Any] | None:
-    """One ``tool`` RPC; None on any transport/parse failure."""
+def _rpc_tool(params: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    """One ``tool`` RPC.  Returns ``(response, failure_kind)`` where
+    failure_kind is ``""`` on success, ``"unreachable"`` when the request never
+    reached the daemon, or ``"post_send"`` when it may have been processed."""
     try:
-        return rpc_call("tool", params)
+        return rpc_call("tool", params), ""
+    except DaemonUnreachable:
+        return None, "unreachable"
     except (OSError, TimeoutError, json.JSONDecodeError):
-        return None
+        return None, "post_send"
 
 
-def _daemon_tool_path(tokens: list[str], portal_id: str) -> str | None:
+def _is_write_tool_call(tool_name: str, tool_input: dict[str, Any]) -> bool:
+    """Registry-driven write classification (never tool-name heuristics)."""
+    from hubspot_agent.handlers import _is_write_tool
+    from hubspot_agent.scope_registry import get_required_scopes
+
+    target = tool_input.get("object_type") if isinstance(tool_input, dict) else None
+    return _is_write_tool(get_required_scopes([tool_name], target), tool_name, tool_input)
+
+
+def _post_send_write_warning(tool_name: str) -> str:
+    return (
+        f"error: the daemon did not answer within {int(RPC_TIMEOUT)}s for {tool_name}. "
+        "The write preview may still have been stored — run `hubspot pending` and "
+        "`hubspot reject <action_id>` on any orphan before retrying."
+    )
+
+
+def _daemon_tool_path(tool_name: str, tool_input: dict[str, Any], portal_id: str) -> str | None:
     """Try the warm-client daemon for a tool call.  Return formatted output or
     None when the daemon path fails (caller falls back to the in-process CLI)."""
-    try:
-        tool_name, tool_input = _parse_tool_argv(tokens)
-    except ValueError as exc:
-        return f"Usage: hubspot tool <name> [--input <json>|-]\n  error: {exc}"
     # The socket is global (one per plugin data dir), so a live daemon may serve a
     # different portal than requested.  Send the target portal so the daemon can
     # reject a mismatch; on rejection we restart it bound to the right portal
@@ -259,12 +291,17 @@ def _daemon_tool_path(tokens: list[str], portal_id: str) -> str | None:
             return None
         if not _wait_for_socket():
             return None
-    resp = _rpc_tool(params)
+    resp, failure = _rpc_tool(params)
     if resp is not None and not _is_portal_mismatch(resp):
         return _format_tool_response(resp)
+    if resp is None and failure == "post_send" and _is_write_tool_call(tool_name, tool_input):
+        # The daemon may have already persisted this write's pending preview;
+        # re-sending (or falling back in-process) would mint a second one.
+        return _post_send_write_warning(tool_name)
 
-    # Attempt 2: the live daemon serves a different portal, or the RPC failed —
-    # kill it, restart one bound to THIS portal, and retry once (FR-15).
+    # Attempt 2: the live daemon serves a different portal, or the request
+    # never got through / a read failed post-send — kill the daemon, restart
+    # one bound to THIS portal, and retry once (FR-15; reads are re-runnable).
     _kill_daemon()
     try:
         start_daemon(portal_id)
@@ -272,8 +309,10 @@ def _daemon_tool_path(tokens: list[str], portal_id: str) -> str | None:
         return None
     if not _wait_for_socket():
         return None
-    resp = _rpc_tool(params)
+    resp, failure = _rpc_tool(params)
     if resp is None:
+        if failure == "post_send" and _is_write_tool_call(tool_name, tool_input):
+            return _post_send_write_warning(tool_name)
         return None
     return _format_tool_response(resp)
 
@@ -282,6 +321,20 @@ def _cli_fallback(remaining: list[str], working_dir: str, portal_id: str | None)
     from hubspot_agent.cli import hubspot_command
 
     return hubspot_command(" ".join(remaining), working_dir, portal_id=portal_id)
+
+
+def _cli_fallback_tool(
+    tool_name: str, tool_input: dict[str, Any], working_dir: str, portal_id: str | None
+) -> str:
+    """In-process fallback for a tool call, re-serializing the ALREADY-parsed
+    input so ``--input -`` stdin is consumed exactly once (router-side); the
+    CLI parser must never re-read an exhausted stdin into a ``{}`` preview."""
+    from hubspot_agent.cli import hubspot_command
+
+    args = f"tool {tool_name}"
+    if tool_input:
+        args += f" --input {json.dumps(tool_input)}"
+    return hubspot_command(args, working_dir, portal_id=portal_id)
 
 
 def route(argv: list[str]) -> int:
@@ -298,14 +351,20 @@ def route(argv: list[str]) -> int:
     head = remaining[0].lower()
 
     if head == "tool":
+        # Parse ONCE (consumes `--input -` stdin here and nowhere else).
+        try:
+            tool_name, tool_input = _parse_tool_argv(remaining[1:])
+        except ValueError as exc:
+            print(f"Usage: hubspot tool <name> [--input <json>|-]\n  error: {exc}")
+            return 0
         pid = portal_id or detect_default_portal(working_dir)
         if pid:
-            out = _daemon_tool_path(remaining[1:], pid)
+            out = _daemon_tool_path(tool_name, tool_input, pid)
             if out is not None:
                 print(out)
                 return 0
         # No portal, or daemon path failed → in-process CLI fallback.
-        print(_cli_fallback(remaining, working_dir, portal_id))
+        print(_cli_fallback_tool(tool_name, tool_input, working_dir, portal_id))
         return 0
 
     if head == "serve":
