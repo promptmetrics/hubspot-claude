@@ -175,6 +175,32 @@ async def _build_tool_preview(
                     original_values[str(result["id"])] = result.get("properties", {})
             except Exception:
                 continue
+    elif tool_name == "hubspot_bulk_update_objects":
+        # Bug 5b: bulk update is MEDIUM risk (``.write`` scope, not destructive),
+        # so it never hit the destructive-count gate and the snapshot pre-fetch
+        # above skipped it — a snapshot was saved with ``undoable=True`` but
+        # empty ``original_values``, so ``undo`` failed with "No original values
+        # recorded".  The records are enumerated in the payload anyway; fetch
+        # each one's current values so the snapshot can restore all of them.
+        object_type = tool_input.get("object_type")
+        for rec in tool_input.get("records", []) or []:
+            if not isinstance(rec, dict):
+                continue
+            object_id = rec.get("id")
+            if not object_id or not object_type:
+                continue
+            try:
+                result = await invoke_tool(
+                    "hubspot_get_object",
+                    portal_id,
+                    object_id=str(object_id),
+                    object_type=str(object_type),
+                    client=client,
+                )
+                if isinstance(result, dict) and not result.get("error") and "id" in result:
+                    original_values[str(result["id"])] = result.get("properties", {})
+            except Exception:
+                continue
 
     return PreviewResult(
         preview={"tool": tool_name, "input": tool_input, "message": f"Preview of {tool_name}"},
@@ -244,6 +270,8 @@ async def handle_tool(client, cache, portal_config: PortalConfig, params: dict[s
         request_text=f"tool {tool_name}",
         proposed_payload=tool_input,
         batch_mode=BatchApprovalMode(params.get("batch_mode", "single")),
+        trace_id=params.get("trace_id"),
+        loop_step_number=params.get("loop_step_number"),
     )
     return _ok(
         {
@@ -323,13 +351,21 @@ async def execute_pending_write(
         raise ExecuteError("not_found", f"No pending preview found with ID {action_id}.")
 
     required = preview_data.get("required_confirmation") or 0
-    if _is_destructive(preview_data):
+    # Bug 5a: the exact-count gate fired only for destructive previews, so a
+    # multi-record bulk update (MEDIUM risk, ``required > 1``) could be
+    # bare-approved and execute against N records with no count confirmation.
+    # Gate any preview that is destructive OR names more than one record.
+    if _is_destructive(preview_data) or required > 1:
         already_confirmed = preview_data.get("confirmed_count") == required
         if confirm_count is None:
             if not already_confirmed:
                 raise ExecuteError(
                     "validation",
-                    "Destructive actions require an exact impact count.",
+                    (
+                        "Destructive actions require an exact impact count."
+                        if _is_destructive(preview_data)
+                        else f"Multi-record actions require an exact impact count ({required} records)."
+                    ),
                     retryable=False,
                     guidance=f"Re-run as `approve {action_id} {required}` — the count must equal the impact ({required}).",
                 )

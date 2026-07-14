@@ -39,6 +39,13 @@ class PlanStep(BaseModel):
     expected_artifact_keys: list[str] = Field(default_factory=list)
     prerequisites: list[str] = Field(default_factory=list)
     risk_level: RiskLevel | None = None
+    # Durable-loop verbatim tool path (PR 2 / bug 2): when ``tool_name`` is set,
+    # the loop executes this step through ``handle_tool`` with the exact
+    # ``tool_input`` payload instead of free-text agent dispatch.  Both default
+    # so persisted LoopState/plans written before this field existed still load
+    # (legacy text-only steps have ``tool_name=None`` → unchanged behavior).
+    tool_name: str | None = None
+    tool_input: dict[str, Any] = Field(default_factory=dict)
 
 
 class ExecutionPlan(BaseModel):
