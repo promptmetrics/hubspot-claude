@@ -372,3 +372,83 @@ def test_cli_approve_soft_failure_keeps_preview(tmp_path, monkeypatch):
     # Preview still on disk (retryable); snapshot dropped (nothing changed).
     assert load_pending("123", action_id) is not None
     assert not (Path(snapshot_dir_for_portal("123")) / f"{action_id}.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Bug #3: --portal / portal_id kwarg must be honored across the HITL lifecycle,
+# not silently overwritten by detect_default_portal(.hubspot-portal).
+# ---------------------------------------------------------------------------
+
+
+def test_approve_uses_portal_id_kwarg_not_default_portal(tmp_path, monkeypatch):
+    """Regression (Bug #3): ``hubspot approve <id> --portal <id>`` must honor the
+    --portal flag, not silently fall back to ``.hubspot-portal``.  A pending
+    preview created under portal 999 must be approvable via ``portal_id=999``
+    even when the default portal (.hubspot-portal) is 123.
+    """
+    _bootstrap_portal(tmp_path, monkeypatch)
+    # Portal 999 is the --portal target; give it a config too.
+    save_portal_config(PortalConfig(portal_id="999", token="test-token-999", tier="Professional"))
+
+    from hubspot_agent.persistence import load as load_pending
+
+    # Create a pending preview under portal 999 via the tool write path.
+    out = hubspot_command(
+        'tool hubspot_create_object --input {"object_type":"contacts","properties":{"firstname":"Izzy"}}',
+        working_dir=str(tmp_path), portal_id="999",
+    )
+    action_id = json.loads(out)["action_id"]
+
+    # The preview is portal-scoped to 999; the default portal (123) has nothing.
+    assert load_pending("999", action_id) is not None
+    assert load_pending("123", action_id) is None
+
+    # Approve with NO portal_id -> default-detects 123 -> not found.  Proves the
+    # preview is invisible to the default portal and that default detection is
+    # unchanged by the fix.
+    result_default = hubspot_command(f"approve {action_id}", working_dir=str(tmp_path))
+    assert "No pending preview found" in result_default
+    assert load_pending("999", action_id) is not None  # untouched by the miss
+
+    # Approve WITH portal_id=999 -> finds and executes against portal 999.
+    executed: dict = {}
+
+    async def mock_invoke(tool_name, portal_id, **kwargs):
+        executed["tool"] = tool_name
+        executed["portal_id"] = portal_id
+        executed["kwargs"] = kwargs
+        return {"id": "999", "properties": kwargs.get("properties", {})}
+
+    monkeypatch.setattr("hubspot_agent.handlers.invoke_tool", mock_invoke)
+
+    result = hubspot_command(f"approve {action_id}", working_dir=str(tmp_path), portal_id="999")
+    assert "Approved and executed" in result
+    assert executed["portal_id"] == "999"
+    assert executed["tool"] == "hubspot_create_object"
+    assert executed["kwargs"]["properties"]["firstname"] == "Izzy"
+    # Preview cleared after a successful execute.
+    assert load_pending("999", action_id) is None
+
+
+def test_reject_uses_portal_id_kwarg(tmp_path, monkeypatch):
+    """Bug #3 generalizes beyond approve: ``reject <id> --portal <id>`` must also
+    honor the portal flag.  A preview stored only under portal 999 is rejectable
+    via ``portal_id=999`` and invisible to the default portal (123)."""
+    _bootstrap_portal(tmp_path, monkeypatch)
+
+    from hubspot_agent.persistence import load as load_pending
+    from hubspot_agent.persistence import store as store_pending
+
+    store_pending("999", "rej-portal-a", {"agent_name": "objects", "tool_name": "hubspot_create_object"})
+    assert load_pending("999", "rej-portal-a") is not None
+    assert load_pending("123", "rej-portal-a") is None
+
+    # Default portal (123) cannot see it.
+    result_default = hubspot_command("reject rej-portal-a", working_dir=str(tmp_path))
+    assert "No pending preview found with ID rej-portal-a" in result_default
+    assert load_pending("999", "rej-portal-a") is not None  # untouched
+
+    # portal_id=999 finds and rejects it.
+    result = hubspot_command("reject rej-portal-a", working_dir=str(tmp_path), portal_id="999")
+    assert "Rejected preview rej-portal-a" in result
+    assert load_pending("999", "rej-portal-a") is None  # cleared

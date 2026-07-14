@@ -101,58 +101,58 @@ def hubspot_command(request: str, working_dir: str = ".", *, portal_id: str | No
         return _handle_portal_command(request[7:].strip(), working_dir)
 
     if request.lower() == "refresh":
-        return _handle_refresh(working_dir)
+        return _handle_refresh(working_dir, portal_id)
 
     if request.lower() == "status":
-        return _handle_status(working_dir)
+        return _handle_status(working_dir, portal_id)
 
     if request.lower().startswith("setup"):
         return _handle_setup(request[5:].strip(), working_dir)
 
     if request.lower().startswith("approve "):
-        return _handle_approve(request[8:].strip(), working_dir)
+        return _handle_approve(request[8:].strip(), working_dir, portal_id)
 
     if request.lower() in ("y", "yes"):
-        return _handle_approve_last(working_dir)
+        return _handle_approve_last(working_dir, portal_id)
 
     if request.lower().startswith("reject "):
-        return _handle_reject(request[7:].strip(), working_dir)
+        return _handle_reject(request[7:].strip(), working_dir, portal_id)
 
     if request.lower() in ("n", "no", "reject"):
-        return _handle_reject_last(working_dir)
+        return _handle_reject_last(working_dir, portal_id)
 
     if request.isdigit():
-        return _handle_confirm(request, working_dir)
+        return _handle_confirm(request, working_dir, portal_id)
 
     if request.lower().startswith("confirm "):
-        return _handle_confirm(request[8:].strip(), working_dir)
+        return _handle_confirm(request[8:].strip(), working_dir, portal_id)
 
     if request.lower().startswith("undo"):
         subcommand = request[4:].strip()
         if subcommand.lower() == "list":
-            return _handle_undo_list(working_dir)
+            return _handle_undo_list(working_dir, portal_id)
         if subcommand:
-            return _handle_undo(subcommand, working_dir)
+            return _handle_undo(subcommand, working_dir, portal_id)
         return "Usage: /hubspot undo <action_id> or /hubspot undo list"
 
     if request.lower() == "continue":
-        return _handle_continue(working_dir)
+        return _handle_continue(working_dir, portal_id)
 
     if request.lower() == "abandon":
-        return _handle_abandon(working_dir)
+        return _handle_abandon(working_dir, portal_id)
 
     if request.lower().startswith("loop "):
         subcommand = request[5:].strip()
         if subcommand.lower() == "status":
-            return _handle_loop_status(working_dir)
+            return _handle_loop_status(working_dir, portal_id)
         if subcommand.lower() == "log":
-            return _handle_loop_log(working_dir)
+            return _handle_loop_log(working_dir, portal_id=portal_id)
         if subcommand.lower() == "checkpoint":
-            return _handle_loop_checkpoint(working_dir)
+            return _handle_loop_checkpoint(working_dir, portal_id)
         if subcommand.lower() == "continue":
-            return _handle_continue(working_dir)
+            return _handle_continue(working_dir, portal_id)
         if subcommand.lower() == "abandon":
-            return _handle_abandon(working_dir)
+            return _handle_abandon(working_dir, portal_id)
         return "Usage: /hubspot loop {status | log | checkpoint | continue | abandon}"
 
     if request.lower() == "route" or request.lower().startswith("route "):
@@ -470,8 +470,9 @@ def _format_expiry(expires_at: float | None) -> str:
     return f"{hours}h"
 
 
-def _handle_status(working_dir: str) -> str:
-    portal_id = detect_default_portal(working_dir)
+def _handle_status(working_dir: str, portal_id: str | None = None) -> str:
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
     if not portal_id:
         return "No default portal found. Create a `.hubspot-portal` file to use status."
 
@@ -526,8 +527,9 @@ def _handle_status(working_dir: str) -> str:
     return "\n".join(lines)
 
 
-def _handle_refresh(working_dir: str) -> str:
-    portal_id = detect_default_portal(working_dir)
+def _handle_refresh(working_dir: str, portal_id: str | None = None) -> str:
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
     if not portal_id:
         return "No default portal found to refresh."
 
@@ -568,8 +570,9 @@ def _error_json(
     return json.dumps({"error": error}, indent=2)
 
 
-def _handle_approve(action_id: str, working_dir: str) -> str:
-    portal_id = detect_default_portal(working_dir)
+def _handle_approve(action_id: str, working_dir: str, portal_id: str | None = None) -> str:
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
     if not portal_id:
         return "No default portal found."
 
@@ -610,8 +613,9 @@ def _handle_approve(action_id: str, working_dir: str) -> str:
     return f"✅ Approved and executed action {action_id}.\n\n{message}"
 
 
-def _handle_approve_last(working_dir: str) -> str:
-    portal_id = detect_default_portal(working_dir)
+def _handle_approve_last(working_dir: str, portal_id: str | None = None) -> str:
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
     if not portal_id:
         return "No default portal found."
 
@@ -625,11 +629,12 @@ def _handle_approve_last(working_dir: str) -> str:
         required = preview_data.get("required_confirmation", 0)
         return _present_destructive_preview(action_id, required)
 
-    return _handle_approve(action_id, working_dir)
+    return _handle_approve(action_id, working_dir, portal_id)
 
 
-def _handle_confirm(count_str: str, working_dir: str) -> str:
-    portal_id = detect_default_portal(working_dir)
+def _handle_confirm(count_str: str, working_dir: str, portal_id: str | None = None) -> str:
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
     if not portal_id:
         return "No default portal found."
 
@@ -648,7 +653,7 @@ def _handle_confirm(count_str: str, working_dir: str) -> str:
             required = preview_data.get("required_confirmation", 0)
             return _present_destructive_preview(action_id, required)
 
-    return _handle_approve(action_id, working_dir)
+    return _handle_approve(action_id, working_dir, portal_id)
 
 
 async def _undo_action(snapshot: dict[str, Any], portal_id: str, portal_config) -> str:
@@ -700,8 +705,9 @@ async def _undo_action(snapshot: dict[str, Any], portal_id: str, portal_config) 
         await client.close()
 
 
-def _handle_undo(action_id: str, working_dir: str) -> str:
-    portal_id = detect_default_portal(working_dir)
+def _handle_undo(action_id: str, working_dir: str, portal_id: str | None = None) -> str:
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
     if not portal_id:
         return "No default portal found."
 
@@ -726,8 +732,9 @@ def _handle_undo(action_id: str, working_dir: str) -> str:
     return result
 
 
-def _handle_undo_list(working_dir: str) -> str:
-    portal_id = detect_default_portal(working_dir)
+def _handle_undo_list(working_dir: str, portal_id: str | None = None) -> str:
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
     if not portal_id:
         return "No default portal found."
 
@@ -758,14 +765,15 @@ def _handle_undo_list(working_dir: str) -> str:
     return "\n".join(lines)
 
 
-def _handle_reject(action_id: str, working_dir: str) -> str:
+def _handle_reject(action_id: str, working_dir: str, portal_id: str | None = None) -> str:
     """``hubspot reject <id>`` — clear one pending preview by ID (FR-19/§7 step 4)."""
-    portal_id = detect_default_portal(working_dir)
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
     if not portal_id:
         return "No default portal found."
     action_id = action_id.split()[0] if action_id else ""
     if not action_id:
-        return _handle_reject_last(working_dir)
+        return _handle_reject_last(working_dir, portal_id)
     preview_data = _load_pending_preview(portal_id, action_id)
     if not preview_data:
         return f"No pending preview found with ID {action_id}."
@@ -774,8 +782,9 @@ def _handle_reject(action_id: str, working_dir: str) -> str:
     return f"❌ Rejected preview {action_id} for {agent}."
 
 
-def _handle_reject_last(working_dir: str) -> str:
-    portal_id = detect_default_portal(working_dir)
+def _handle_reject_last(working_dir: str, portal_id: str | None = None) -> str:
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
     if not portal_id:
         return "No default portal found."
 
@@ -793,8 +802,9 @@ def _handle_reject_last(working_dir: str) -> str:
     return "No pending previews to reject."
 
 
-def _handle_continue(working_dir: str) -> str:
-    portal_id = detect_default_portal(working_dir)
+def _handle_continue(working_dir: str, portal_id: str | None = None) -> str:
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
     if not portal_id:
         return "No default portal found."
 
@@ -813,8 +823,9 @@ def _handle_continue(working_dir: str) -> str:
     return _run_async(run_loop, state.request_text, portal_config, working_dir, trace_id)
 
 
-def _handle_abandon(working_dir: str) -> str:
-    portal_id = detect_default_portal(working_dir)
+def _handle_abandon(working_dir: str, portal_id: str | None = None) -> str:
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
     if not portal_id:
         return "No default portal found."
 
@@ -830,8 +841,9 @@ def _handle_abandon(working_dir: str) -> str:
     return f"✅ Abandoned active loop for portal {portal_id}."
 
 
-def _handle_loop_status(working_dir: str) -> str:
-    portal_id = detect_default_portal(working_dir)
+def _handle_loop_status(working_dir: str, portal_id: str | None = None) -> str:
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
     if not portal_id:
         return "No default portal found."
 
@@ -851,8 +863,9 @@ def _handle_loop_status(working_dir: str) -> str:
     return "\n".join(lines)
 
 
-def _handle_loop_log(working_dir: str, limit: int = 20) -> str:
-    portal_id = detect_default_portal(working_dir)
+def _handle_loop_log(working_dir: str, limit: int = 20, portal_id: str | None = None) -> str:
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
     if not portal_id:
         return "No default portal found."
 
@@ -871,8 +884,9 @@ def _handle_loop_log(working_dir: str, limit: int = 20) -> str:
     return "\n".join(lines)
 
 
-def _handle_loop_checkpoint(working_dir: str) -> str:
-    portal_id = detect_default_portal(working_dir)
+def _handle_loop_checkpoint(working_dir: str, portal_id: str | None = None) -> str:
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
     if not portal_id:
         return "No default portal found."
 

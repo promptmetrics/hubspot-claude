@@ -7,7 +7,7 @@
       "name": "hubspot",
       "source": "./",
       "description": "HubSpot CRM administration via natural language — specialist sub-agents, human-in-the-loop write approval, and a warm-client daemon.",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "author": { "name": "Izzy Aly" },
       "homepage": "https://github.com/promptmetrics/hubspot-claude",
       "repository": "https://github.com/promptmetrics/hubspot-claude",
