@@ -89,3 +89,101 @@ async def test_hubspot_batch_upsert_objects(respx_mock):
     assert result["progress"]["total_chunks"] == 1
     assert result["progress"]["completed_chunks"] == 1
     await c.close()
+
+
+# ---------------------------------------------------------------------------
+# M7: read-only id/hs_object_id keys must be stripped from batch properties
+# (HubSpot 400s the whole batch otherwise).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_batch_upsert_strips_record_ids_from_properties(respx_mock):
+    import json as _json
+
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    create_route = respx_mock.post("https://api.hubapi.com/crm/v3/objects/contacts/batch/create").mock(
+        return_value=httpx.Response(200, json={"results": [{"id": "3"}], "errors": []})
+    )
+    update_route = respx_mock.post("https://api.hubapi.com/crm/v3/objects/contacts/batch/update").mock(
+        return_value=httpx.Response(200, json={"results": [{"id": "101"}, {"id": "102"}], "errors": []})
+    )
+    records = [
+        {"id": "101", "email": "a@example.com", "city": "Berlin"},
+        {"hs_object_id": "102", "email": "b@example.com"},
+        {"email": "c@example.com"},
+    ]
+    await hubspot_batch_upsert_objects(object_type="contacts", records=records, client=c, portal_id="123")
+
+    update_inputs = _json.loads(update_route.calls[0].request.content)["inputs"]
+    assert {i["id"] for i in update_inputs} == {"101", "102"}
+    for i in update_inputs:
+        assert "id" not in i["properties"]
+        assert "hs_object_id" not in i["properties"]
+    assert update_inputs[0]["properties"]["email"] == "a@example.com"
+    assert update_inputs[0]["properties"]["city"] == "Berlin"
+
+    create_inputs = _json.loads(create_route.calls[0].request.content)["inputs"]
+    assert create_inputs == [{"properties": {"email": "c@example.com"}}]
+    await c.close()
+
+
+# ---------------------------------------------------------------------------
+# M6: checkpoint must record what actually happened — a whole-chunk failure is
+# succeeded=0 / failed=len(chunk), and create/update chunk indices must not
+# collide in the shared JSONL.
+# ---------------------------------------------------------------------------
+
+
+def _checkpoint_entries(action_id: str) -> list[dict]:
+    import json as _json
+    from pathlib import Path
+
+    base = Path.home() / ".claude" / "hubspot" / "123"
+    for sub in ("completed", "in_flight"):
+        path = base / sub / f"{action_id}.jsonl"
+        if path.exists():
+            return [_json.loads(line) for line in path.read_text().strip().splitlines()]
+    raise AssertionError(f"no checkpoint file for {action_id}")
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_exception_chunk_records_zero_succeeded(respx_mock):
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    respx_mock.post("https://api.hubapi.com/crm/v3/objects/contacts/batch/create").mock(
+        return_value=httpx.Response(400, json={"message": "bad batch"})
+    )
+    records = [{"email": "a@example.com"}, {"email": "b@example.com"}]
+    result = await hubspot_batch_upsert_objects(
+        object_type="contacts", records=records, client=c, portal_id="123", action_id="ckpt-fail"
+    )
+
+    assert result["succeeded"] == 0
+    entries = _checkpoint_entries("ckpt-fail")
+    assert entries[0]["succeeded"] == 0
+    assert entries[0]["failed"] == len(records)
+    await c.close()
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_chunk_indices_do_not_collide(respx_mock):
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    respx_mock.post("https://api.hubapi.com/crm/v3/objects/contacts/batch/create").mock(
+        return_value=httpx.Response(200, json={"results": [], "errors": []})
+    )
+    respx_mock.post("https://api.hubapi.com/crm/v3/objects/contacts/batch/update").mock(
+        return_value=httpx.Response(200, json={"results": [], "errors": []})
+    )
+    # 101 creates -> chunks 0,1; 101 updates -> chunks 2,3 (offset, no collision)
+    records = [{"email": f"c{i}@example.com"} for i in range(101)]
+    records += [{"id": str(1000 + i), "email": f"u{i}@example.com"} for i in range(101)]
+    await hubspot_batch_upsert_objects(
+        object_type="contacts", records=records, client=c, portal_id="123", action_id="ckpt-idx"
+    )
+
+    entries = _checkpoint_entries("ckpt-idx")
+    assert [e["chunk_index"] for e in entries] == [0, 1, 2, 3]
+    assert [e["operation"] for e in entries] == [
+        "batch_create", "batch_create", "batch_update", "batch_update",
+    ]
+    await c.close()

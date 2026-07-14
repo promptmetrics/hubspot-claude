@@ -863,3 +863,40 @@ async def test_execute_pending_write_create_without_id_is_loud(env, monkeypatch,
     # Loud warning emitted to stderr.
     captured = capsys.readouterr()
     assert "no created id found" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# M5: the shared preview builder captures BOTH records for a merge, and the
+# .delete scope makes the preview destructive.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_merge_preview_fetches_both_records(respx_mock):
+    import httpx
+
+    from hubspot_agent.client import HubSpotClient
+    from hubspot_agent.handlers import _build_tool_preview
+
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(
+        return_value=httpx.Response(200, json={"id": "1", "properties": {"email": "primary@example.com"}})
+    )
+    respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/2").mock(
+        return_value=httpx.Response(200, json={"id": "2", "properties": {"email": "dup@example.com"}})
+    )
+    preview = await _build_tool_preview(
+        "hubspot_merge_objects",
+        {"primary_object_id": "1", "object_id_to_merge": "2", "object_type": "contacts"},
+        {"crm.objects.contacts.write", "crm.objects.contacts.delete"},
+        c,
+        "123",
+    )
+    assert preview.original_values == {
+        "1": {"email": "primary@example.com"},
+        "2": {"email": "dup@example.com"},
+    }
+    assert preview.risk_level == RiskLevel.DESTRUCTIVE
+    # object_type rides in the preview input so HITL can see what's merged.
+    assert preview.preview["input"]["object_type"] == "contacts"
+    await c.close()

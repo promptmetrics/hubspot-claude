@@ -94,6 +94,36 @@ def test_approve_create_saves_empty_snapshot_with_metadata(portal_dir):
     assert snapshot["metadata"]["created_ids"] == ["contact-999"]
 
 
+def test_approve_merge_saves_snapshot_with_both_records(portal_dir):
+    # M5: merge is destructive (write+delete) and has no unmerge API — the
+    # approve path must capture both records' pre-merge state, marked
+    # non-undoable, for manual reconciliation.
+    action_id = "mrg-1"
+    data = _preview_data(
+        "merge",
+        "destructive",
+        1,
+        {"1": {"email": "primary@example.com"}, "2": {"email": "dup@example.com"}},
+    )
+    _store_pending_preview("123", action_id, data)
+
+    async def fake_dispatch(*args, **kwargs):
+        return AgentResult(agent_name="objects", status="success", data={"message": "merged"})
+
+    with patch("hubspot_agent.orchestrator.dispatch_agent", side_effect=fake_dispatch):
+        hubspot_command(f"approve {action_id} 1", working_dir=str(portal_dir))
+
+    snapshot_file = portal_dir / "123" / "undo_snapshots" / f"{action_id}.json"
+    assert snapshot_file.exists()
+    snapshot = json.loads(snapshot_file.read_text())
+    assert snapshot["original_values"] == {
+        "1": {"email": "primary@example.com"},
+        "2": {"email": "dup@example.com"},
+    }
+    assert snapshot["metadata"]["intent_type"] == "merge"
+    assert snapshot["metadata"]["undoable"] is False
+
+
 @pytest.mark.asyncio
 async def test_execute_plan_saves_snapshot_for_write_step(portal_dir):
     plan = LoopPlan(

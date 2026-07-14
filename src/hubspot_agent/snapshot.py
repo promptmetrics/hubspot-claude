@@ -35,6 +35,9 @@ def save_undo_snapshot_for_action(
     preview = preview_data.get("preview") or {}
     original_values = preview.get("original_values", {})
 
+    # "merge" is deliberately absent: HubSpot has no unmerge API, so a merge
+    # snapshot (both records' pre-merge properties) exists for manual
+    # reconciliation only and must never offer an automated undo.
     undoable = intent_type in ("create", "update")
     metadata: dict[str, Any] = {
         "intent_type": intent_type,

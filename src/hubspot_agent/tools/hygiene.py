@@ -52,22 +52,29 @@ async def hubspot_find_duplicates(
         return {"error": str(exc), "tool": "hubspot_find_duplicates"}
 
 
-@tool(name="hubspot_merge_objects", description="Merge two HubSpot contact records.")
+@tool(name="hubspot_merge_objects", description="Merge two HubSpot object records of the same object type.")
 async def hubspot_merge_objects(
     primary_object_id: str,
     object_id_to_merge: str,
     client: HubSpotClient,
     portal_id: str,
+    object_type: str = "contacts",
 ) -> dict[str, Any]:
+    _validate_object_type(object_type, portal_id)
     try:
         resp = await client.post(
-            "/crm/v3/objects/contacts/merge",
+            f"/crm/v3/objects/{object_type}/merge",
             portal_id=portal_id,
             body={
                 "primaryObjectId": primary_object_id,
                 "objectIdToMerge": object_id_to_merge,
             },
-            expected_scopes=["crm.objects.contacts.write"],
+            # Matches the registry's write+delete classification for merge —
+            # the secondary record is destroyed, so a 403 should name both.
+            expected_scopes=[
+                f"crm.objects.{object_type}.write",
+                f"crm.objects.{object_type}.delete",
+            ],
         )
         return resp.body
     except (HubSpotError, RateLimitError, ScopeError) as exc:

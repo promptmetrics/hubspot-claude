@@ -48,6 +48,40 @@ async def test_hubspot_bulk_update_objects(respx_mock):
 
 
 # ---------------------------------------------------------------------------
+# M9: merge honors object_type (default contacts) and expects write+delete
+# scopes, matching the registry's destructive classification.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_merge_objects_companies_endpoint(respx_mock):
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    route = respx_mock.post("https://api.hubapi.com/crm/v3/objects/companies/merge").mock(
+        return_value=httpx.Response(200, json={"id": "9"})
+    )
+    result = await hubspot_merge_objects(
+        primary_object_id="9", object_id_to_merge="10", client=c, portal_id="123", object_type="companies"
+    )
+    assert result["id"] == "9"
+    import json as _json
+    body = _json.loads(route.calls[0].request.content)
+    assert body == {"primaryObjectId": "9", "objectIdToMerge": "10"}
+    await c.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_objects_invalid_object_type_raises(respx_mock):
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    with pytest.raises(ValueError, match="Invalid object_type"):
+        await hubspot_merge_objects(
+            primary_object_id="1", object_id_to_merge="2", client=c, portal_id="123",
+            object_type="contacts/merge?",
+        )
+    assert len(respx_mock.calls) == 0
+    await c.close()
+
+
+# ---------------------------------------------------------------------------
 # M8: object_type must be validated before URL construction — a crafted value
 # like "contacts/batch/archive?" would otherwise redirect a bulk update to the
 # archive endpoint without tripping the destructive-count gate.
