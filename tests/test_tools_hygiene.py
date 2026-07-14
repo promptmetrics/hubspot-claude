@@ -131,3 +131,94 @@ async def test_hubspot_preview_segment(respx_mock):
     result = await hubspot_preview_segment(object_type="contacts", query={}, client=c, portal_id="123")
     assert result["total"] == 5
     await c.close()
+
+
+# ---------------------------------------------------------------------------
+# Bug 3: find_duplicates must request `properties` + `limit` and paginate, or
+# phone/domain duplicates come back empty and large portals look dup-free past
+# the first 100-record page.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_find_duplicates_requests_properties_and_limit(respx_mock):
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    route = respx_mock.post("https://api.hubapi.com/crm/v3/objects/contacts/search").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    await hubspot_find_duplicates(object_type="contacts", search_field="email", client=c, portal_id="123")
+    import json as _json
+    body = _json.loads(route.calls[0].request.content)
+    assert body["properties"] == ["email"]
+    assert body["limit"] == 100
+    await c.close()
+
+
+@pytest.mark.asyncio
+async def test_find_duplicates_phone_requests_calculated_field(respx_mock):
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    route = respx_mock.post("https://api.hubapi.com/crm/v3/objects/contacts/search").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    await hubspot_find_duplicates(object_type="contacts", search_field="phone", client=c, portal_id="123")
+    import json as _json
+    body = _json.loads(route.calls[0].request.content)
+    assert "hs_searchable_calculated_phone_number" in body["properties"]
+    assert "phone" in body["properties"]
+    await c.close()
+
+
+@pytest.mark.asyncio
+async def test_find_duplicates_paginates_across_pages(respx_mock):
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    same_email = "dup@example.com"
+    page1 = httpx.Response(
+        200,
+        json={
+            "results": [
+                {"id": "1", "properties": {"email": same_email}},
+                {"id": "2", "properties": {"email": same_email}},
+            ],
+            "paging": {"next": {"after": "2"}},
+        },
+    )
+    page2 = httpx.Response(
+        200,
+        json={"results": [{"id": "3", "properties": {"email": same_email}}]},
+    )
+
+    calls = {"i": 0}
+
+    def _side(request):
+        calls["i"] += 1
+        return page1 if calls["i"] == 1 else page2
+
+    respx_mock.post("https://api.hubapi.com/crm/v3/objects/contacts/search").mock(side_effect=_side)
+    result = await hubspot_find_duplicates(object_type="contacts", search_field="email", client=c, portal_id="123")
+    assert calls["i"] == 2  # paginated to a second page
+    assert result["total_duplicates"] == 3
+    assert result["records_scanned"] == 3
+    assert result["truncated"] is False
+    await c.close()
+
+
+@pytest.mark.asyncio
+async def test_find_duplicates_reports_truncated_at_scan_cap(respx_mock, monkeypatch):
+    from hubspot_agent.tools import hygiene as hygiene_mod
+
+    # Force a tiny cap so we don't need 21 real pages to exercise truncation.
+    monkeypatch.setattr(hygiene_mod, "_MAX_SCAN_RECORDS", 2)
+
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    page = httpx.Response(
+        200,
+        json={
+            "results": [{"id": "1", "properties": {"email": "a@example.com"}}],
+            "paging": {"next": {"after": "1"}},  # always another page -> hits the cap
+        },
+    )
+    respx_mock.post("https://api.hubapi.com/crm/v3/objects/contacts/search").mock(return_value=page)
+    result = await hubspot_find_duplicates(object_type="contacts", search_field="email", client=c, portal_id="123")
+    assert result["truncated"] is True
+    assert result["records_scanned"] == 2
+    await c.close()

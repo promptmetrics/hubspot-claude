@@ -567,6 +567,30 @@ def _present_destructive_preview(action_id: str, impact_count: int) -> str:
     )
 
 
+def _requires_count_preview(preview_data: dict[str, Any]) -> bool:
+    """Bug 5a: a preview needs an exact count if it is destructive OR affects
+    more than one record (e.g. a bulk update).  Mirrors the
+    ``execute_pending_write`` gate so the bare ``approve``/``confirm`` paths
+    prompt for the count instead of executing a multi-record write blind.
+    """
+    if _is_destructive_preview(preview_data):
+        return True
+    required = preview_data.get("required_confirmation") or 0
+    return required > 1
+
+
+def _present_count_preview(action_id: str, impact_count: int, destructive: bool) -> str:
+    if destructive:
+        return _present_destructive_preview(action_id, impact_count)
+    return (
+        f"⚠️ This action affects **{impact_count}** records.\n\n"
+        f"To confirm, type one of:\n"
+        f"- `approve {action_id} {impact_count}`\n"
+        f"- `{impact_count}`\n"
+        f"- `confirm {impact_count}`"
+    )
+
+
 def _error_json(
     kind: str, message: str, *, retryable: bool = False, retry_after=None, guidance: str | None = None
 ) -> str:
@@ -654,9 +678,9 @@ def _handle_approve_last(working_dir: str, portal_id: str | None = None) -> str:
 
     action_id = files[0].stem
     preview_data = _load_pending_preview(portal_id, action_id)
-    if preview_data and _is_destructive_preview(preview_data):
+    if preview_data and _requires_count_preview(preview_data):
         required = preview_data.get("required_confirmation", 0)
-        return _present_destructive_preview(action_id, required)
+        return _present_count_preview(action_id, required, _is_destructive_preview(preview_data))
 
     return _handle_approve(action_id, working_dir, portal_id)
 
@@ -677,10 +701,10 @@ def _handle_confirm(count_str: str, working_dir: str, portal_id: str | None = No
     action_id = files[0].stem
     count = int(count_str)
     preview_data = _load_pending_preview(portal_id, action_id)
-    if preview_data and _is_destructive_preview(preview_data):
+    if preview_data and _requires_count_preview(preview_data):
         if not _confirm_pending_preview(portal_id, action_id, count):
             required = preview_data.get("required_confirmation", 0)
-            return _present_destructive_preview(action_id, required)
+            return _present_count_preview(action_id, required, _is_destructive_preview(preview_data))
 
     return _handle_approve(action_id, working_dir, portal_id)
 

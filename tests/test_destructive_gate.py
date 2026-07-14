@@ -249,3 +249,101 @@ def test_cli_main_approve_wrong_count_exits_2(portal_dir, monkeypatch, capsys):
     assert exc.value.code == 2
     payload = json.loads(capsys.readouterr().out)
     assert payload["error"]["kind"] == "validation"
+
+
+# ---------------------------------------------------------------------------
+# Bug 5a: a MEDIUM-risk multi-record write (e.g. bulk update, required > 1)
+# is not destructive, so the old gate let it be bare-approved against N records
+# with no count.  The gate now fires for destructive OR required > 1.
+# ---------------------------------------------------------------------------
+
+
+def _bulk_preview_data(impact_count: int = 3) -> dict:
+    data = _destructive_preview_data(impact_count)
+    # A bulk update is medium risk, not destructive, but still multi-record.
+    data["intent"]["intent_type"] = "update"
+    data["intent"]["risk_level"] = "medium"
+    data["intent"]["description"] = "bulk update contacts"
+    data["preview"]["risk_level"] = "medium"
+    return data
+
+
+def test_bulk_bare_approve_refused(portal_dir):
+    action_id = "blk1"
+    _store_pending_preview("123", action_id, _bulk_preview_data(3))
+
+    result = hubspot_command(f"approve {action_id}", working_dir=str(portal_dir))
+    payload = json.loads(result)
+    assert payload["error"]["kind"] == "validation"
+    assert "Multi-record" in payload["error"]["message"]
+    assert f"approve {action_id} 3" in payload["error"]["guidance"]
+    # Not executed — pending still present.
+    assert _load_pending_preview("123", action_id) is not None
+
+
+def test_bulk_wrong_count_refused(portal_dir):
+    action_id = "blk1"
+    _store_pending_preview("123", action_id, _bulk_preview_data(3))
+
+    result = hubspot_command(f"approve {action_id} 2", working_dir=str(portal_dir))
+    payload = json.loads(result)
+    assert payload["error"]["kind"] == "validation"
+    assert "impact is 3" in payload["error"]["message"]
+
+
+def test_bulk_exact_count_executes(portal_dir):
+    action_id = "blk1"
+    _store_pending_preview("123", action_id, _bulk_preview_data(3))
+
+    async def fake_dispatch(*args, **kwargs):
+        return AgentResult(agent_name="objects", status="success", data={"message": "updated 3"})
+
+    with patch("hubspot_agent.orchestrator.dispatch_agent", side_effect=fake_dispatch):
+        result = hubspot_command(f"approve {action_id} 3", working_dir=str(portal_dir))
+    assert "Approved and executed" in result
+    assert (portal_dir / "123" / "undo_snapshots" / f"{action_id}.json").exists()
+
+
+def test_bare_yes_prompts_for_count_on_bulk_preview(portal_dir):
+    action_id = "blk1"
+    _store_pending_preview("123", action_id, _bulk_preview_data(3))
+
+    result = hubspot_command("y", working_dir=str(portal_dir))
+    # Not executed — the bare yes shows the multi-record count prompt instead.
+    assert "**3**" in result
+    assert f"approve {action_id} 3" in result
+    assert "Approved and executed" not in result
+
+
+def test_confirm_wrong_count_prompts_on_bulk_preview(portal_dir):
+    action_id = "blk1"
+    _store_pending_preview("123", action_id, _bulk_preview_data(3))
+
+    result = hubspot_command("confirm 2", working_dir=str(portal_dir))
+    assert "**3**" in result
+    assert "Approved and executed" not in result
+
+
+def test_confirm_exact_count_executes_on_bulk_preview(portal_dir):
+    action_id = "blk1"
+    _store_pending_preview("123", action_id, _bulk_preview_data(3))
+
+    async def fake_dispatch(*args, **kwargs):
+        return AgentResult(agent_name="objects", status="success", data={"message": "updated 3"})
+
+    with patch("hubspot_agent.orchestrator.dispatch_agent", side_effect=fake_dispatch) as mock_dispatch:
+        result = hubspot_command("confirm 3", working_dir=str(portal_dir))
+    assert "Approved and executed" in result
+    mock_dispatch.assert_called_once()
+
+
+def test_router_bulk_bare_approve_exits_2(portal_dir, capsys):
+    from hubspot_agent import router
+
+    action_id = "blk1"
+    _store_pending_preview("123", action_id, _bulk_preview_data(3))
+
+    rc = router.route(["--working-dir", str(portal_dir), "approve", action_id])
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"]["kind"] == "validation"

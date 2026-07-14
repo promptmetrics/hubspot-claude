@@ -59,8 +59,9 @@ def test_approve_update_saves_original_values_snapshot(portal_dir):
     async def fake_dispatch(*args, **kwargs):
         return AgentResult(agent_name="objects", status="success", data={"message": "updated"})
 
+    # Bug 5a: a multi-record update (impact 2) now requires the exact count.
     with patch("hubspot_agent.orchestrator.dispatch_agent", side_effect=fake_dispatch):
-        hubspot_command(f"approve {action_id}", working_dir=str(portal_dir))
+        hubspot_command(f"approve {action_id} 2", working_dir=str(portal_dir))
 
     snapshot_file = portal_dir / "123" / "undo_snapshots" / f"{action_id}.json"
     assert snapshot_file.exists()
