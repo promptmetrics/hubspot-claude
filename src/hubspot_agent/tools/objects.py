@@ -156,10 +156,13 @@ def _partition_records(
         if key:
             seen[key] = record
         obj_id = record.get("id") or record.get("hs_object_id")
+        # id/hs_object_id are read-only in HubSpot; leaving them inside
+        # `properties` 400s the whole batch.
+        props = {k: v for k, v in record.items() if k not in ("id", "hs_object_id")}
         if obj_id:
-            updates.append({"id": str(obj_id), "properties": record})
+            updates.append({"id": str(obj_id), "properties": props})
         else:
-            creates.append({"properties": record})
+            creates.append({"properties": props})
     return seen, creates, updates
 
 
@@ -210,9 +213,13 @@ async def hubspot_batch_upsert_objects(
             chunk_errors.extend(body.get("errors", []))
         except (HubSpotError, RateLimitError, ScopeError) as exc:
             chunk_errors.append({"message": str(exc), "category": "BATCH_CREATE"})
+            # The whole POST failed: nothing in this chunk landed.
+            chunk_failed = len(chunk)
+        else:
+            chunk_failed = len(chunk_errors)
         errors.extend(chunk_errors)
         last_error = chunk_errors[0].get("message") if chunk_errors else None
-        checkpoint.record_chunk(idx, "batch_create", len(chunk) - len(chunk_errors), len(chunk_errors), chunk_errors)
+        checkpoint.record_chunk(idx, "batch_create", chunk_succeeded, chunk_failed, chunk_errors)
         progress.record_chunk(idx, chunk_succeeded, len(chunk_errors), last_error)
 
     for idx, chunk in enumerate(update_chunks):
@@ -232,9 +239,14 @@ async def hubspot_batch_upsert_objects(
             chunk_errors.extend(body.get("errors", []))
         except (HubSpotError, RateLimitError, ScopeError) as exc:
             chunk_errors.append({"message": str(exc), "category": "BATCH_UPDATE"})
+            chunk_failed = len(chunk)
+        else:
+            chunk_failed = len(chunk_errors)
         errors.extend(chunk_errors)
         last_error = chunk_errors[0].get("message") if chunk_errors else None
-        checkpoint.record_chunk(idx, "batch_update", len(chunk) - len(chunk_errors), len(chunk_errors), chunk_errors)
+        # Offset like progress does so create/update chunks don't collide in
+        # the shared checkpoint JSONL (last_completed_chunk stays monotonic).
+        checkpoint.record_chunk(len(create_chunks) + idx, "batch_update", chunk_succeeded, chunk_failed, chunk_errors)
         progress.record_chunk(len(create_chunks) + idx, chunk_succeeded, len(chunk_errors), last_error)
 
     checkpoint.finalize()

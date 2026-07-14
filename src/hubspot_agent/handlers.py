@@ -11,6 +11,7 @@ Handlers never own the client lifecycle — the caller (daemon or fallback) does
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 from dataclasses import dataclass
 from typing import Any
@@ -154,6 +155,26 @@ async def _build_tool_preview(
                     original_values = {str(result["id"]): result.get("properties", {})}
             except Exception:
                 original_values = {}
+    elif tool_name == "hubspot_merge_objects":
+        # A merge absorbs the secondary record destructively and HubSpot has no
+        # unmerge API, so capture BOTH records pre-merge — the snapshot is the
+        # only artifact for manual reconciliation.
+        object_type = tool_input.get("object_type", "contacts")
+        for oid in (tool_input.get("primary_object_id"), tool_input.get("object_id_to_merge")):
+            if not oid:
+                continue
+            try:
+                result = await invoke_tool(
+                    "hubspot_get_object",
+                    portal_id,
+                    object_id=str(oid),
+                    object_type=str(object_type),
+                    client=client,
+                )
+                if isinstance(result, dict) and not result.get("error") and "id" in result:
+                    original_values[str(result["id"])] = result.get("properties", {})
+            except Exception:
+                continue
 
     return PreviewResult(
         preview={"tool": tool_name, "input": tool_input, "message": f"Preview of {tool_name}"},
@@ -295,7 +316,9 @@ async def execute_pending_write(
     since nothing was changed to undo.
     """
     portal_id = portal_config.portal_id
-    preview_data = _load_pending(portal_id, action_id)
+    # Pending-store calls flock + fsync; offload so the event loop (shared with
+    # the daemon's other connections) is never blocked on disk I/O.
+    preview_data = await asyncio.to_thread(_load_pending, portal_id, action_id)
     if preview_data is None:
         raise ExecuteError("not_found", f"No pending preview found with ID {action_id}.")
 
@@ -310,7 +333,7 @@ async def execute_pending_write(
                     retryable=False,
                     guidance=f"Re-run as `approve {action_id} {required}` — the count must equal the impact ({required}).",
                 )
-        elif not _confirm_pending(portal_id, action_id, confirm_count):
+        elif not await asyncio.to_thread(_confirm_pending, portal_id, action_id, confirm_count):
             raise ExecuteError(
                 "validation",
                 f"Wrong confirmation count: {confirm_count} (impact is {required}).",
@@ -325,7 +348,7 @@ async def execute_pending_write(
     # that into an ExecuteError so it never escapes raw and the caller sees a
     # structured "snapshot" failure rather than a traceback.  Nothing has been
     # written yet, so no cleanup is needed on this path.
-    if intent_type in ("create", "update", "delete"):
+    if intent_type in ("create", "update", "delete", "merge"):
         try:
             save_undo_snapshot_for_action(portal_id, action_id, preview_data)
         except Exception as exc:
@@ -455,7 +478,7 @@ async def execute_pending_write(
                     file=sys.stderr,
                 )
 
-    _clear_pending(portal_id, action_id)
+    await asyncio.to_thread(_clear_pending, portal_id, action_id)
     audit_failed = False
     try:
         audit.log_write(
@@ -515,11 +538,11 @@ async def handle_reject(client, cache, portal_config: PortalConfig, params: dict
     if not action_id:
         raise HandlerError("validation", "Missing 'action_id' in params.")
     portal_id = portal_config.portal_id
-    preview_data = _load_pending(portal_id, action_id)
+    preview_data = await asyncio.to_thread(_load_pending, portal_id, action_id)
     if preview_data is None:
         raise HandlerError("not_found", f"No pending preview found with ID {action_id}.")
     who = preview_data.get("agent_name") or preview_data.get("tool_name") or "tool"
-    _clear_pending(portal_id, action_id)
+    await asyncio.to_thread(_clear_pending, portal_id, action_id)
     return _ok({"rejected": action_id, "for": who})
 
 

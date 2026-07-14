@@ -23,7 +23,7 @@ from hubspot_agent.agents import (
     group_agents_by_category,
     list_agent_names,
 )
-from hubspot_agent.models import PreviewResult, RiskLevel, TaskIntent
+from hubspot_agent.models import RiskLevel, TaskIntent
 from hubspot_agent.safety import apply_write as _apply_write
 from hubspot_agent.scope_registry import get_required_scopes
 from hubspot_agent.setup import REQUIRED_SCOPES
@@ -61,6 +61,7 @@ from hubspot_agent.handlers import (
     ExecuteError,
     execute_pending_write,
     _WRITE_SCOPE_SUFFIXES,
+    _build_tool_preview,
     _is_write_tool,
     _tool_impact_count,
     _tool_intent_type,
@@ -663,7 +664,12 @@ def _handle_confirm(count_str: str, working_dir: str, portal_id: str | None = No
     return _handle_approve(action_id, working_dir, portal_id)
 
 
-async def _undo_action(snapshot: dict[str, Any], portal_id: str, portal_config) -> str:
+async def _undo_action(snapshot: dict[str, Any], portal_id: str, portal_config) -> tuple[bool, str]:
+    """Attempt the undo; return ``(succeeded, message)``.
+
+    ``succeeded`` is False whenever nothing was changed in HubSpot — the caller
+    must then keep the snapshot (it's the only reconciliation artifact).
+    """
     from hubspot_agent.client import HubSpotClient
 
     metadata = snapshot.get("metadata", {})
@@ -671,17 +677,17 @@ async def _undo_action(snapshot: dict[str, Any], portal_id: str, portal_config) 
     object_type = metadata.get("target_object")
 
     if intent_type == "delete":
-        return "❌ Deletes are not undoable through HubSpot."
+        return False, "❌ Deletes are not undoable through HubSpot."
 
     if not metadata.get("undoable", False):
-        return "❌ This action is not undoable."
+        return False, "❌ This action is not undoable."
 
     client = HubSpotClient(portal_config)
     try:
         if intent_type == "update":
             original_values = snapshot.get("original_values", {})
             if not original_values:
-                return "❌ No original values recorded; cannot undo update."
+                return False, "❌ No original values recorded; cannot undo update."
             for object_id, properties in original_values.items():
                 await invoke_tool(
                     "hubspot_update_object",
@@ -691,12 +697,12 @@ async def _undo_action(snapshot: dict[str, Any], portal_id: str, portal_config) 
                     properties=properties,
                     client=client,
                 )
-            return f"✅ Restored {len(original_values)} {object_type or 'record(s)'} to their original values."
+            return True, f"✅ Restored {len(original_values)} {object_type or 'record(s)'} to their original values."
 
         if intent_type == "create":
             created_ids = metadata.get("created_ids", [])
             if not created_ids:
-                return "❌ No created IDs recorded; cannot undo create."
+                return False, "❌ No created IDs recorded; cannot undo create."
             for object_id in created_ids:
                 await invoke_tool(
                     "hubspot_delete_object",
@@ -705,9 +711,9 @@ async def _undo_action(snapshot: dict[str, Any], portal_id: str, portal_config) 
                     object_type=str(object_type),
                     client=client,
                 )
-            return f"✅ Deleted {len(created_ids)} created {object_type or 'record(s)'} to undo the create."
+            return True, f"✅ Deleted {len(created_ids)} created {object_type or 'record(s)'} to undo the create."
 
-        return "❌ Unknown action type; cannot undo."
+        return False, "❌ Unknown action type; cannot undo."
     finally:
         await client.close()
 
@@ -726,17 +732,20 @@ def _handle_undo(action_id: str, working_dir: str, portal_id: str | None = None)
     if not snapshot:
         return f"No undo snapshot found for action {action_id}."
 
-    result = _run_async(_undo_action, snapshot, portal_id, portal_config)
-    delete_undo_snapshot(_snapshot_dir_for_portal(portal_id), action_id)
+    succeeded, message = _run_async(_undo_action, snapshot, portal_id, portal_config)
+    if succeeded:
+        # Only a real undo consumes the snapshot and earns an audit entry; a
+        # failed attempt must keep the one artifact enabling manual
+        # reconciliation and must not log an undo that never happened.
+        delete_undo_snapshot(_snapshot_dir_for_portal(portal_id), action_id)
+        audit.log_write(
+            portal_id=portal_id,
+            action=f"undo:{action_id}",
+            agent=snapshot.get("metadata", {}).get("intent_type", "unknown"),
+            result_summary={"message": message},
+        )
 
-    audit.log_write(
-        portal_id=portal_id,
-        action=f"undo:{action_id}",
-        agent=snapshot.get("metadata", {}).get("intent_type", "unknown"),
-        result_summary={"message": result},
-    )
-
-    return result
+    return message
 
 
 def _handle_undo_list(working_dir: str, portal_id: str | None = None) -> str:
@@ -1071,49 +1080,6 @@ def _tool_scope_error(tool_name: str, missing: list[str]) -> str:
     for scope in missing:
         lines.append(f"- {scope}")
     return "\n".join(lines)
-
-
-async def _capture_original_values(
-    tool_name: str, tool_input: dict[str, Any], client, portal_id: str
-) -> dict[str, Any]:
-    """Best-effort fetch of current state for update/delete so undo can restore it."""
-    if tool_name not in ("hubspot_update_object", "hubspot_delete_object"):
-        return {}
-    object_id = tool_input.get("object_id")
-    object_type = tool_input.get("object_type")
-    if not object_id or not object_type:
-        return {}
-    try:
-        result = await invoke_tool(
-            "hubspot_get_object",
-            portal_id,
-            object_id=str(object_id),
-            object_type=str(object_type),
-            client=client,
-        )
-    except Exception:
-        return {}
-    if not isinstance(result, dict) or result.get("error") or "id" not in result:
-        return {}
-    return {str(result["id"]): result.get("properties", {})}
-
-
-async def _build_tool_preview(
-    tool_name: str,
-    tool_input: dict[str, Any],
-    required_scopes: set[str],
-    client,
-    portal_id: str,
-) -> PreviewResult:
-    risk = _tool_risk_level(required_scopes)
-    original_values = await _capture_original_values(tool_name, tool_input, client, portal_id)
-    return PreviewResult(
-        preview={"tool": tool_name, "input": tool_input, "message": f"Preview of {tool_name}"},
-        impact_count=_tool_impact_count(tool_name, tool_input),
-        risk_level=risk,
-        original_values=original_values,
-        informing_sources=[],
-    )
 
 
 async def _tool_read(tool_name, portal_id, portal_config, tool_input):

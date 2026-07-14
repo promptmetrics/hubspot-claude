@@ -90,6 +90,64 @@ def test_undo_delete_returns_not_undoable(portal_dir, mock_client, mock_invoke_t
     mock_invoke_tool.assert_not_called()
 
 
+# ---------------------------------------------------------------------------
+# M13: a failed undo must keep the snapshot (only reconciliation artifact) and
+# must not write an `undo:<id>` audit entry for an undo that never happened.
+# ---------------------------------------------------------------------------
+
+
+def test_failed_undo_keeps_snapshot_and_skips_audit(portal_dir, mock_client, mock_invoke_tool):
+    snapshot_dir = str(portal_dir / "123" / "undo_snapshots")
+    save_undo_snapshot(
+        snapshot_dir,
+        "del-1",
+        {},
+        metadata={"intent_type": "delete", "target_object": "contacts", "undoable": False},
+    )
+
+    result = hubspot_command("undo del-1", working_dir=str(portal_dir))
+
+    assert "not undoable" in result.lower()
+    assert (portal_dir / "123" / "undo_snapshots" / "del-1.json").exists()
+    audit_file = Path.home() / ".claude" / "hubspot" / "123" / "audit.log"
+    assert not audit_file.exists() or "undo:del-1" not in audit_file.read_text()
+
+
+def test_successful_undo_deletes_snapshot_and_audits(portal_dir, mock_client, mock_invoke_tool):
+    snapshot_dir = str(portal_dir / "123" / "undo_snapshots")
+    save_undo_snapshot(
+        snapshot_dir,
+        "upd-9",
+        {"1": {"email": "old@example.com"}},
+        metadata={"intent_type": "update", "target_object": "contacts", "undoable": True},
+    )
+
+    result = hubspot_command("undo upd-9", working_dir=str(portal_dir))
+
+    assert "Restored 1" in result
+    assert not (portal_dir / "123" / "undo_snapshots" / "upd-9.json").exists()
+    audit_file = Path.home() / ".claude" / "hubspot" / "123" / "audit.log"
+    assert audit_file.exists() and "undo:upd-9" in audit_file.read_text()
+
+
+def test_undo_merge_snapshot_not_undoable_and_survives(portal_dir, mock_client, mock_invoke_tool):
+    # M5: merge snapshots exist for manual reconciliation; undo must refuse
+    # and leave the artifact in place.
+    snapshot_dir = str(portal_dir / "123" / "undo_snapshots")
+    save_undo_snapshot(
+        snapshot_dir,
+        "mrg-1",
+        {"1": {"email": "primary@example.com"}, "2": {"email": "dup@example.com"}},
+        metadata={"intent_type": "merge", "target_object": "contacts", "undoable": False},
+    )
+
+    result = hubspot_command("undo mrg-1", working_dir=str(portal_dir))
+
+    assert "not undoable" in result.lower()
+    mock_invoke_tool.assert_not_called()
+    assert (portal_dir / "123" / "undo_snapshots" / "mrg-1.json").exists()
+
+
 def test_undo_list_shows_actions(portal_dir):
     snapshot_dir = str(portal_dir / "123" / "undo_snapshots")
     save_undo_snapshot(
