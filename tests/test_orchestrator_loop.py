@@ -352,3 +352,29 @@ async def test_execute_mode_errors_for_handler_less_agent():
     result = await dispatch_agent("analytics", "run a report", _portal_config(), mode="execute")
     assert result.status == "error"
     assert "no execute handler" in (result.error_message or "")
+
+
+# ---------------------------------------------------------------------------
+# M12 residual: an unexpected raise inside the drive loop must park the loop
+# as "failed" on disk — not leave it "running", where the next continue would
+# resume straight into the same crash.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unexpected_raise_marks_loop_failed():
+    from hubspot_agent import loop_log
+
+    async def _boom(portal_config, state, working_dir):
+        raise RuntimeError("artifact resolution exploded")
+
+    with patch("hubspot_agent.orchestrator._drive_loop", side_effect=_boom):
+        result = await run_loop("create a property", _portal_config(), "/tmp", "trace-crash", plan=_write_plan())
+
+    assert "Loop crashed" in result
+    state = loop_state.load("123")
+    assert state is not None
+    assert state.status == "failed"
+    assert "artifact resolution exploded" in (state.last_error or "")
+    events = loop_log.get_recent("123", trace_id="trace-crash")
+    assert any(e["event_type"] == "loop_crashed" for e in events)
