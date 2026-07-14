@@ -872,6 +872,25 @@ async def _resume_awaiting_approval(portal_config, state: loop_state.LoopState, 
     )
 
 
+async def _drive_loop_guarded(portal_config, state: loop_state.LoopState, working_dir: str) -> str:
+    """Fail-safe wrapper around ``_drive_loop``.
+
+    The tool layer returns error dicts rather than raising, so ``_drive_loop``
+    handles expected failures itself — but an unexpected raise (pydantic,
+    artifact resolution, disk) must not leave the on-disk state parked as
+    ``running``, where the next ``loop continue`` would resume straight into
+    the same crash.  Park it as ``failed`` with the error recorded instead.
+    """
+    try:
+        return await _drive_loop(portal_config, state, working_dir)
+    except Exception as exc:
+        state.status = "failed"
+        state.last_error = str(exc)
+        loop_state.save(state)
+        loop_log.log_event(state.portal_id, state.trace_id, "loop_crashed", {"error": str(exc)})
+        return _format_loop_result(portal_config, state, f"Loop crashed: {exc}")
+
+
 async def run_loop(
     request_text: str,
     portal_config,
@@ -908,7 +927,7 @@ async def run_loop(
             "current_step": state.current_step,
             "iterations": state.iterations,
         })
-        return await _drive_loop(portal_config, state, working_dir)
+        return await _drive_loop_guarded(portal_config, state, working_dir)
 
     # No existing loop — a plan is required (Claude does triage, not Python).
     if plan is None:
@@ -933,7 +952,7 @@ async def run_loop(
         "goal": plan.goal,
         "step_count": len(plan.steps),
     })
-    return await _drive_loop(portal_config, state, working_dir)
+    return await _drive_loop_guarded(portal_config, state, working_dir)
 
 
 async def loop_verify(
@@ -983,7 +1002,7 @@ async def loop_verify(
         state.status = "running"
         state.pending_action_id = None
         loop_state.save(state)
-        return await _drive_loop(portal_config, state, working_dir)
+        return await _drive_loop_guarded(portal_config, state, working_dir)
 
     if decision.action == "retry":
         # A retry re-drives the same step, which re-previews and (after another
@@ -1019,7 +1038,7 @@ async def loop_verify(
             "reason": decision.reason,
             "iteration": state.iterations,
         })
-        return await _drive_loop(portal_config, state, working_dir)
+        return await _drive_loop_guarded(portal_config, state, working_dir)
 
     # escalate / stop
     state.status = decision.action
