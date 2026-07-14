@@ -443,3 +443,50 @@ async def test_daemon_bind_failure_cleans_pid_file(env, tmp_path, monkeypatch):
     with pytest.raises(OSError):
         await daemon.serve()
     assert not pid_path().exists()
+
+# ---------------------------------------------------------------------------
+# M3: socket dir 0700, socket 0600, chmod failure fatal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_socket_dir_and_socket_modes(env):
+    import shutil
+    import stat
+
+    sock_dir = Path(f"/tmp/hsd-test-{os.getpid()}-mode")
+    sock_dir.mkdir(mode=0o755, exist_ok=True)
+    sock = sock_dir / "d.sock"
+    daemon = HubSpotDaemon(_portal(), sock_path=sock, idle_timeout=30)
+    _fake_warm(daemon)
+    task = asyncio.create_task(daemon.serve())
+    try:
+        await _wait_for_socket(sock)
+        assert stat.S_IMODE(os.stat(sock_dir).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(sock).st_mode) == 0o600
+    finally:
+        daemon._stop.set()
+        await asyncio.wait_for(task, timeout=5)
+        shutil.rmtree(sock_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_socket_chmod_failure_is_fatal(env, monkeypatch):
+    # A socket the daemon cannot restrict to 0600 must not serve: any local
+    # user who connects can drive approve over JSON-RPC.
+    sock = _short_sock("chmodfatal")
+    daemon = HubSpotDaemon(_portal(), sock_path=sock, idle_timeout=30)
+    _fake_warm(daemon)
+
+    real_chmod = Path.chmod
+
+    def _fail(self, mode, *a, **kw):
+        if self == sock:
+            raise OSError("chmod denied")
+        return real_chmod(self, mode, *a, **kw)
+
+    monkeypatch.setattr(Path, "chmod", _fail)
+    with pytest.raises(OSError, match="chmod denied"):
+        await daemon.serve()
+    assert not sock.exists()
+    assert not pid_path().exists()

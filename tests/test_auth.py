@@ -204,6 +204,60 @@ def test_get_authorization_url_eu_region(tmp_path, monkeypatch):
     assert "client_id=client-eu" in url
 
 
+# ---------------------------------------------------------------------------
+# M1: OAuth `state` path traversal must not reach the filesystem
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exchange_rejects_traversal_state(tmp_path, monkeypatch):
+    # A crafted state of "../<portal_id>" used to resolve to the portal token
+    # file, which _load_oauth_state unlinked (no expires_at -> "expired").
+    from pathlib import Path
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("hubspot_agent.config.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr("hubspot_agent.auth.CONFIG_DIR", tmp_path)
+
+    from hubspot_agent.app_credentials import save_app_credentials
+    save_app_credentials("client-123", "secret-456")
+    save_portal_config(PortalConfig(portal_id="123", token="precious-token"))
+
+    with pytest.raises(ValueError, match="Invalid or expired OAuth state"):
+        await exchange_code_for_token("123", "auth-code-abc", "../123")
+
+    # The portal credential file must survive the attempt.
+    assert (tmp_path / "123.json").exists()
+    assert load_portal_config("123").token == "precious-token"
+
+
+def test_load_oauth_state_invalid_chars_returns_none(tmp_path, monkeypatch):
+    monkeypatch.setattr("hubspot_agent.auth.CONFIG_DIR", tmp_path)
+    from hubspot_agent.auth import _load_oauth_state
+
+    assert _load_oauth_state("../123") is None
+    assert _load_oauth_state("a/b") is None
+    assert _load_oauth_state("state.json") is None
+    assert _load_oauth_state("") is None
+
+
+def test_oauth_state_file_mode_0o600(tmp_path, monkeypatch):
+    # M2: the state file carries the PKCE code_verifier and must be 0600 from
+    # birth, not narrowed after a world-readable window.
+    import os
+    import stat
+    from pathlib import Path
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("hubspot_agent.auth.CONFIG_DIR", tmp_path)
+
+    from hubspot_agent.app_credentials import save_app_credentials
+    save_app_credentials("client-123", "secret-456")
+
+    get_authorization_url("123", ["crm.objects.contacts.read"])
+    state_files = list((tmp_path / "oauth_states").glob("*.json"))
+    assert state_files
+    assert stat.S_IMODE(os.stat(state_files[0]).st_mode) == 0o600
+
+
 @pytest.mark.asyncio
 async def test_exchange_code_for_token_eu_region(respx_mock, monkeypatch, tmp_path):
     from pathlib import Path

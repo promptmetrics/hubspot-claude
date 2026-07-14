@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -32,10 +33,10 @@ def log_event(
         "event_type": event_type,
         "payload": payload or {},
     }
-    with log_file.open("a", encoding="utf-8") as fh:
+    fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(event, default=str) + "\n")
         fh.flush()
-    log_file.chmod(0o600)
     return log_file
 
 

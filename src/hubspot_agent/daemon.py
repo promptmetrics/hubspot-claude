@@ -108,6 +108,16 @@ class HubSpotDaemon:
 
     async def _serve_forever(self) -> None:
         self.sock_path.parent.mkdir(parents=True, exist_ok=True)
+        # Any local user who can connect can drive the JSON-RPC surface (the
+        # daemon does not authenticate the peer), so the socket dir must not be
+        # traversable and the socket itself never world-connectable.  The dir
+        # chmod is defense-in-depth and skipped when the parent isn't ours
+        # (e.g. a socket placed in /tmp); the socket's own 0600 below is the
+        # hard gate and IS fatal on failure.
+        try:
+            os.chmod(self.sock_path.parent, 0o700)
+        except PermissionError:
+            pass
         cleanup_stale_socket(self.sock_path)
         self.sock_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -117,6 +127,9 @@ class HubSpotDaemon:
         # unlink the just-bound socket.  Closes the startup TOCTOU race (#3).
         pid_path().parent.mkdir(parents=True, exist_ok=True)
         pid_path().write_text(str(os.getpid()))
+        # Bind under a restrictive umask so the socket is 0600 from birth, not
+        # narrowed after a world-connectable window.
+        old_umask = os.umask(0o177)
         try:
             self._server = await asyncio.start_unix_server(self._handle_conn, path=str(self.sock_path))
         except OSError:
@@ -124,10 +137,18 @@ class HubSpotDaemon:
             # cleanup_stale_socket / a later start isn't confused by a stale PID.
             pid_path().unlink(missing_ok=True)
             raise
+        finally:
+            os.umask(old_umask)
         try:
             self.sock_path.chmod(0o600)
         except OSError:
-            pass
+            # A socket we can't restrict must not serve: tear down and exit
+            # rather than run world-connectable.
+            self._server.close()
+            await self._server.wait_closed()
+            self.sock_path.unlink(missing_ok=True)
+            pid_path().unlink(missing_ok=True)
+            raise
 
         watchdog = asyncio.create_task(self._idle_watchdog())
         stop_wait = asyncio.create_task(self._stop.wait())

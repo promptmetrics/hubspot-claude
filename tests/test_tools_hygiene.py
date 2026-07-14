@@ -47,6 +47,47 @@ async def test_hubspot_bulk_update_objects(respx_mock):
     await c.close()
 
 
+# ---------------------------------------------------------------------------
+# M8: object_type must be validated before URL construction — a crafted value
+# like "contacts/batch/archive?" would otherwise redirect a bulk update to the
+# archive endpoint without tripping the destructive-count gate.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_type", ["contacts/batch/archive?", "../pipelines", "contacts#frag"])
+async def test_find_duplicates_rejects_crafted_object_type(respx_mock, bad_type):
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    with pytest.raises(ValueError, match="Invalid object_type"):
+        await hubspot_find_duplicates(object_type=bad_type, search_field="email", client=c, portal_id="123")
+    assert len(respx_mock.calls) == 0
+    await c.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_type", ["contacts/batch/archive?", "../pipelines"])
+async def test_bulk_update_rejects_crafted_object_type(respx_mock, bad_type):
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    with pytest.raises(ValueError, match="Invalid object_type"):
+        await hubspot_bulk_update_objects(
+            object_type=bad_type,
+            records=[{"id": "1", "properties": {"email": "a@example.com"}}],
+            client=c,
+            portal_id="123",
+        )
+    assert len(respx_mock.calls) == 0
+    await c.close()
+
+
+@pytest.mark.asyncio
+async def test_preview_segment_rejects_crafted_object_type(respx_mock):
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    with pytest.raises(ValueError, match="Invalid object_type"):
+        await hubspot_preview_segment(object_type="contacts/batch/archive?", query={}, client=c, portal_id="123")
+    assert len(respx_mock.calls) == 0
+    await c.close()
+
+
 @pytest.mark.asyncio
 async def test_hubspot_preview_segment(respx_mock):
     c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
