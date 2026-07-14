@@ -168,3 +168,27 @@ def test_loop_unknown_subcommand_returns_usage(tmp_path, monkeypatch):
     assert "checkpoint" in result
     assert "continue" in result
     assert "abandon" in result
+    assert "start" in result
+    assert "verify" in result
+
+
+def test_extract_flag_value_forms():
+    from hubspot_agent.cli import _extract_flag_value
+
+    assert _extract_flag_value('--plan {"a": 1}', "plan") == '{"a": 1}'
+    assert _extract_flag_value('--plan={"a": 1}', "plan") == '{"a": 1}'
+    # Bare text with no recognized flag yields "" so the caller shows usage.
+    assert _extract_flag_value("foo bar", "plan") == ""
+    assert _extract_flag_value("", "plan") == ""
+
+
+def test_loop_start_without_flag_returns_usage(tmp_path, monkeypatch):
+    _setup_portal(tmp_path, monkeypatch)
+    result = hubspot_command("loop start foo bar", working_dir=str(tmp_path))
+    assert "Usage: /hubspot loop start --plan" in result
+
+
+def test_loop_verify_without_flag_returns_usage(tmp_path, monkeypatch):
+    _setup_portal(tmp_path, monkeypatch)
+    result = hubspot_command("loop verify garbage", working_dir=str(tmp_path))
+    assert "Usage: /hubspot loop verify --result" in result

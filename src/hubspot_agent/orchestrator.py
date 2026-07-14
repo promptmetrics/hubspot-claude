@@ -21,12 +21,18 @@ from hubspot_agent.safety import ScopeBlocked, apply_write, normalize_informing_
 from hubspot_agent.tools import invoke_tool
 
 # Loop engineering imports (Group 1)
-from hubspot_agent.agent_dispatch import build_triage_prompt, spawn_agent
-from hubspot_agent.planning import parse_plan, plan_to_markdown, validate_plan
-from hubspot_agent.sequential_dispatch import execute_plan
+from hubspot_agent.planning import parse_verification_result, plan_to_markdown, validate_plan
+from hubspot_agent.sequential_dispatch import (
+    _build_step_request,
+    _capture_artifacts,
+    _resolve_artifacts,
+    execute_plan,
+    is_write_step,
+)
+from hubspot_agent.snapshot import load_undo_snapshot, snapshot_dir_for_portal
 from hubspot_agent.validation import format_scope_error, validate_scopes
 from hubspot_agent.loop_controller import LoopController
-from hubspot_agent import loop_log, loop_state
+from hubspot_agent import audit, loop_log, loop_state
 
 
 async def initialize_session(portal_id: str) -> None:
@@ -327,6 +333,7 @@ async def dispatch_agent(
     trace_id: str | None = None,
     batch_mode: BatchApprovalMode = BatchApprovalMode.SINGLE,
     proposed_payload: dict[str, Any] | None = None,
+    loop_step_number: int | None = None,
 ) -> AgentResult:
     """Dispatch a single agent with preview or execute mode."""
     from hubspot_agent.agents import get_agent_category, get_agent_emoji, get_agent_prompt
@@ -374,6 +381,7 @@ async def dispatch_agent(
                     trace_id=trace_id,
                     batch_mode=batch_mode,
                     proposed_payload=proposed_payload,
+                    loop_step_number=loop_step_number,
                 )
             except ScopeBlocked as exc:
                 return AgentResult(
@@ -464,10 +472,21 @@ async def dispatch_agent(
                 emoji=get_agent_emoji(agent_name),
             )
 
+        # No execute handler registered for this agent.  Previously this
+        # fabricated ``status="success"`` with a fake message — a write that
+        # never happened would be reported as done, and (on the approve path)
+        # an undo snapshot would reference a mutation that never occurred.
+        # Return an error instead so a handler-less agent can never masquerade
+        # as a completed write.  (Handler-less agents are all read-only:
+        # analytics, forecasts, audit_logs, etc.; a plan that routes a write to
+        # one is rejected at plan-validation time in ``validate_plan``.)
         return AgentResult(
             agent_name=agent_name,
-            status="success",
-            data={"message": f"Executed {agent_name} for: {request_text}"},
+            status="error",
+            error_message=(
+                f"Agent '{agent_name}' has no execute handler; it cannot perform writes. "
+                f"This agent is read-only."
+            ),
             category=get_agent_category(agent_name),
             emoji=get_agent_emoji(agent_name),
         )
@@ -557,14 +576,6 @@ def _build_loop_capability_matrix(portal_config) -> dict[str, bool]:
     }
 
 
-def _is_clarifying_response(raw: str) -> bool:
-    """Heuristic: if the triage response is not valid JSON, treat it as clarifying questions."""
-    if not raw or raw.strip().startswith("["):
-        return True
-    parsed = parse_plan(raw)
-    return parsed is None
-
-
 def _format_loop_result(
     portal_config,
     state: loop_state.LoopState,
@@ -590,164 +601,431 @@ def _format_loop_result(
     return "\n".join(summary_lines)
 
 
-async def run_loop(
-    request_text: str,
-    portal_config,
-    working_dir: str,
-    trace_id: str,
-    approve_callback: Any = None,
-) -> str:
-    """Run the durable closed-loop planner/executor/verifier.
+# ---------------------------------------------------------------------------
+# Durable loop: deferred-approval state machine
+#
+# The loop plans (Claude, in-session), executes deterministically (Python),
+# pauses at each write for a real ``approve``, resumes on ``loop continue``, and
+# verifies with a Claude-supplied verdict.  Statuses:
+#
+#   running               actively driving; between CLI calls this means
+#                          "ready to drive the next step".
+#   awaiting_approval      paused at a write step; ``pending_action_id`` names
+#                          the preview the human must ``approve``.  Exempt from
+#                          the staleness reaper (loop_state.is_stale).
+#   awaiting_verification  a write executed; waiting for Claude to re-read the
+#                          records and supply a VerificationResult via
+#                          ``loop verify``.  Also staleness-exempt.
+#   completed/failed/escalate/stop   terminal; cleared or halted.
+#
+# The safety-critical execute path (handlers.execute_pending_write, run by
+# ``hubspot approve``) stays fully decoupled from this orchestrator — resume
+# reads only the persisted pending record, undo snapshot, and audit log.
+# ---------------------------------------------------------------------------
 
-    If a non-stale LoopState exists for the portal, execution resumes from
-    the saved step.  State is checkpointed after each step and cleared on
-    completion or terminal failure.
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "escalate", "stop"})
+
+# A step needs a HITL pause if it is a write by action-verb OR the plan marked
+# it medium/high/destructive risk.  Keying on risk too closes the gap where a
+# destructive step phrased with a verb outside ``is_write_step``'s set (e.g.
+# "purge"/"archive"/"deactivate"/"remove") would otherwise be treated as a read
+# and executed with no approval.  Fail safe: an over-cautious pause on a
+# misclassified read is harmless; skipping approval on a real write is not.
+_APPROVAL_RISK_LEVELS = frozenset({RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.DESTRUCTIVE})
+
+
+def _requires_approval(step) -> bool:
+    return is_write_step(step) or step.risk_level in _APPROVAL_RISK_LEVELS
+
+
+def _loop_header(portal_config) -> str:
+    return f"📍 Portal: {portal_config.portal_id} ({portal_config.tier})"
+
+
+def _needs_plan_message(portal_config) -> str:
+    return (
+        f"{_loop_header(portal_config)}\n\n"
+        "This request needs a plan before the durable loop can run. "
+        "Produce a `LoopPlan` JSON for the goal, then start the loop with:\n\n"
+        "```\n"
+        "hubspot loop start --plan '<LoopPlan JSON>'\n"
+        "```"
+    )
+
+
+def _format_pause_message(portal_config, state: loop_state.LoopState, preview: AgentResult) -> str:
+    step = state.plan.steps[state.current_step]
+    data = preview.data
+    action_id = data.get("action_id")
+    risk = data.get("risk_level", "unknown")
+    impact = data.get("impact_count", "unknown")
+    lines = [
+        _loop_header(portal_config),
+        f"**Goal:** {state.plan.goal}",
+        "",
+        f"⏸️  Loop paused at step {step.step_number} of {len(state.plan.steps)} "
+        f"({step.agent}) — approval required before this write.",
+        "",
+        f"⚠️  Preview (action: {action_id})",
+        f"Risk: {risk}  ·  Impact: {impact} record(s)",
+    ]
+    preview_text = data.get("preview")
+    if preview_text:
+        lines.append(str(preview_text))
+    approve_cmd = (
+        f"hubspot approve {action_id} {impact}"
+        if risk == RiskLevel.DESTRUCTIVE.value
+        else f"hubspot approve {action_id}"
+    )
+    lines.extend([
+        "",
+        "To continue the loop:",
+        f"1. `{approve_cmd}`  (or reject with `hubspot reject {action_id}`)",
+        "2. `hubspot loop continue`",
+    ])
+    return "\n".join(lines)
+
+
+def _prompt_for_verification_message(portal_config, state: loop_state.LoopState) -> str:
+    step = state.plan.steps[state.current_step]
+    return (
+        f"{_loop_header(portal_config)}\n\n"
+        f"✅ Step {step.step_number} ({step.agent}) executed. "
+        "Re-read the affected record(s) to confirm the change landed, then report the result:\n\n"
+        "```\n"
+        "hubspot loop verify --result '<VerificationResult JSON>'\n"
+        "```"
+    )
+
+
+def _artifact_from_snapshot(portal_id: str, action_id: str, step) -> StepArtifact:
+    """Build a StepArtifact for a write that executed out-of-band via ``approve``.
+
+    Reads the undo snapshot (written by ``execute_pending_write``) for the
+    created IDs and target object; the loop never re-touches the execute path.
+    """
+    snapshot = load_undo_snapshot(snapshot_dir_for_portal(portal_id), action_id) or {}
+    metadata = snapshot.get("metadata", {}) if isinstance(snapshot, dict) else {}
+    created_ids = [str(c) for c in metadata.get("created_ids", []) if c]
+
+    outputs: dict[str, Any] = {}
+    if created_ids:
+        outputs["created_ids"] = list(created_ids)
+        # Surface the first created id under the step's declared artifact key
+        # (e.g. ``property_id``) so downstream steps can resolve it.
+        for key in step.expected_artifact_keys:
+            outputs[key] = created_ids[0]
+            break
+    return StepArtifact(
+        step_number=step.step_number,
+        agent=step.agent,
+        outputs=outputs,
+        created_ids=created_ids,
+    )
+
+
+async def _drive_loop(portal_config, state: loop_state.LoopState, working_dir: str) -> str:
+    """Advance the loop from ``current_step`` until a write pause or completion.
+
+    Read steps execute immediately (no approval).  A write step builds a
+    preview, persists a pending action, parks the loop at ``awaiting_approval``,
+    and returns — nothing is mutated until the human runs ``hubspot approve``.
     """
     portal_id = portal_config.portal_id
-    existing_state = loop_state.load(portal_id)
-
-    if existing_state is not None:
-        if (
-            loop_state.is_stale(existing_state)
-            # ``escalate``/``stop`` are the terminal statuses written by the
-            # controller (see below: ``state.status = controller_action.action``).
-            # The value is ``escalate``, not ``escalated`` — the old spelling
-            # never matched, so an escalated loop resumed and re-ran the write
-            # that triggered the human-review halt.
-            or existing_state.status in {"completed", "failed", "escalate", "stop"}
-        ):
-            loop_state.clear(portal_id)
-            existing_state = None
-
-    if existing_state is not None:
-        state = existing_state
-        plan = state.plan
-        loop_log.log_event(portal_id, trace_id, "loop_resumed", {
-            "current_step": state.current_step,
-            "iterations": state.iterations,
-        })
-    else:
-        triage_prompt = build_triage_prompt(request_text, portal_config)
-        triage_raw = spawn_agent("triage", triage_prompt, context={"working_dir": working_dir})
-
-        if _is_clarifying_response(triage_raw):
-            return (
-                f"📍 Portal: {portal_config.portal_id} ({portal_config.tier})\n\n"
-                f"I need a bit more clarity before I can plan this:\n\n{triage_raw.strip()}"
-            )
-
-        parsed_plan = parse_plan(triage_raw)
-        if parsed_plan is None:
-            return (
-                f"📍 Portal: {portal_config.portal_id} ({portal_config.tier})\n\n"
-                f"I could not build a plan from that request. Could you rephrase?"
-            )
-        plan = parsed_plan
-
-        capability_matrix = _build_loop_capability_matrix(portal_config)
-        validation_errors = validate_plan(plan, capability_matrix)
-        if validation_errors:
-            return (
-                f"📍 Portal: {portal_config.portal_id} ({portal_config.tier})\n\n"
-                f"The generated plan cannot be executed:\n"
-                + "\n".join(f"- {e}" for e in validation_errors)
-                + "\n\nPlease adjust your request or upgrade the portal capabilities."
-            )
-
-        state = loop_state.LoopState(
-            portal_id=portal_id,
-            request_text=request_text,
-            trace_id=trace_id,
-            plan=plan,
-        )
-        loop_log.log_event(portal_id, trace_id, "loop_started", {
-            "goal": plan.goal,
-            "step_count": len(plan.steps),
-        })
-
-    controller = LoopController(max_iterations=plan.max_iterations)
+    plan = state.plan
 
     while state.current_step < len(plan.steps):
         step = plan.steps[state.current_step]
-        loop_log.log_event(portal_id, trace_id, "step_started", {
+        resolved = _resolve_artifacts(step, {a.step_number: a for a in state.artifacts})
+        step_request = _build_step_request(step, state.request_text, resolved)
+        loop_log.log_event(portal_id, state.trace_id, "step_started", {
             "step_number": step.step_number,
             "agent": step.agent,
             "action": step.action,
         })
 
-        try:
-            from hubspot_agent.sequential_dispatch import execute_single_step, is_write_step
-
-            artifact = await execute_single_step(
-                step,
-                state.request_text,
+        if _requires_approval(step):
+            preview = await dispatch_agent(
+                step.agent,
+                step_request,
                 portal_config,
-                {a.step_number: a for a in state.artifacts},
-                approve_callback=approve_callback,
+                mode="preview",
+                trace_id=state.trace_id,
+                loop_step_number=step.step_number,
             )
-        except RuntimeError as exc:
-            state.status = "failed"
-            state.last_error = str(exc)
+            if preview.status == "error":
+                state.status = "failed"
+                state.last_error = preview.error_message
+                loop_state.save(state)
+                loop_log.log_event(portal_id, state.trace_id, "step_failed", {
+                    "step_number": step.step_number,
+                    "error": preview.error_message,
+                })
+                return _format_loop_result(
+                    portal_config,
+                    state,
+                    f"Execution stopped at step {step.step_number}: {preview.error_message}",
+                )
+            state.pending_action_id = preview.data.get("action_id")
+            state.status = "awaiting_approval"
             loop_state.save(state)
-            loop_log.log_event(portal_id, trace_id, "step_failed", {
+            loop_log.log_event(portal_id, state.trace_id, "awaiting_approval", {
                 "step_number": step.step_number,
-                "error": str(exc),
+                "action_id": state.pending_action_id,
+            })
+            return _format_pause_message(portal_config, state, preview)
+
+        # Low-risk read step (no write verb, low/no risk): execute directly,
+        # capture the artifact, advance — no approval needed.
+        result = await dispatch_agent(
+            step.agent,
+            step_request,
+            portal_config,
+            mode="execute",
+            trace_id=state.trace_id,
+        )
+        if result.status == "error":
+            state.status = "failed"
+            state.last_error = result.error_message
+            loop_state.save(state)
+            loop_log.log_event(portal_id, state.trace_id, "step_failed", {
+                "step_number": step.step_number,
+                "error": result.error_message,
             })
             return _format_loop_result(
                 portal_config,
                 state,
-                f"Execution stopped at step {step.step_number}: {exc}",
+                f"Execution stopped at step {step.step_number}: {result.error_message}",
             )
-
+        artifact = _capture_artifacts(result, step)
         state.artifacts.append(artifact)
-        loop_log.log_event(portal_id, trace_id, "step_completed", {
+        state.current_step += 1
+        loop_state.save(state)
+        loop_log.log_event(portal_id, state.trace_id, "step_completed", {
             "step_number": step.step_number,
             "outputs": artifact.outputs,
         })
 
-        if is_write_step(step):
-            from hubspot_agent.sequential_dispatch import verify_step
-
-            decision, verification = await verify_step(step, artifact, portal_config)
-            loop_log.log_event(portal_id, trace_id, "verification", {
-                "step_number": step.step_number,
-                "decision": decision,
-                "status": verification.status.value,
-                "message": verification.message,
-            })
-
-            controller_action = controller.next_action(state, verification=verification)
-            if controller_action.action == "retry":
-                controller.record_iteration(state)
-                loop_state.save(state)
-                loop_log.log_event(portal_id, trace_id, "retry", {
-                    "step_number": step.step_number,
-                    "reason": controller_action.reason,
-                    "iteration": state.iterations,
-                })
-                # Re-run the same step on the next loop iteration.
-                continue
-            if controller_action.action in ("escalate", "stop"):
-                state.status = controller_action.action
-                loop_state.save(state)
-                return _format_loop_result(
-                    portal_config,
-                    state,
-                    f"Loop halted: {controller_action.reason}",
-                )
-
-        state.current_step += 1
-        loop_state.save(state)
-
     state.status = "completed"
     loop_state.save(state)
-    loop_log.log_event(portal_id, trace_id, "loop_completed", {
+    loop_log.log_event(portal_id, state.trace_id, "loop_completed", {
         "iterations": state.iterations,
         "steps_completed": state.current_step,
     })
     result = _format_loop_result(portal_config, state, "Loop completed successfully.")
     loop_state.clear(portal_id)
     return result
+
+
+async def _resume_awaiting_approval(portal_config, state: loop_state.LoopState, working_dir: str) -> str:
+    """Resume a loop parked at a write step, disambiguating the pending action.
+
+    Reads only shared artifacts (pending record, audit log, undo snapshot) — no
+    coupling to the execute path:
+
+    - pending still on disk  → still awaiting → re-emit the ``approve`` prompt.
+    - pending gone + audit has ``approve:<id>`` → executed → capture artifact,
+      move to ``awaiting_verification``.
+    - pending gone + no approve entry → rejected/cancelled → stop the loop.
+    """
+    portal_id = portal_config.portal_id
+    action_id = state.pending_action_id
+    step = state.plan.steps[state.current_step]
+
+    if action_id and _load_pending_preview(portal_id, action_id) is not None:
+        return (
+            f"{_loop_header(portal_config)}\n\n"
+            f"⏸️  Step {step.step_number} ({step.agent}) is still awaiting approval. "
+            f"Run `hubspot approve {action_id}` (then `hubspot loop continue`), "
+            f"or `hubspot reject {action_id}` to stop the loop."
+        )
+
+    audits = audit.get_recent_audits(portal_id, limit=200)
+    approved = any(a.get("action") == f"approve:{action_id}" for a in audits)
+
+    if approved:
+        artifact = _artifact_from_snapshot(portal_id, action_id, step)
+        # Replace any prior artifact for this step (e.g. from a retry) so the
+        # step_number keying stays 1:1.
+        state.artifacts = [a for a in state.artifacts if a.step_number != step.step_number]
+        state.artifacts.append(artifact)
+        state.status = "awaiting_verification"
+        loop_state.save(state)
+        loop_log.log_event(portal_id, state.trace_id, "write_executed", {
+            "step_number": step.step_number,
+            "action_id": action_id,
+            "created_ids": artifact.created_ids,
+        })
+        return _prompt_for_verification_message(portal_config, state)
+
+    # Pending gone and never approved → treat as rejected/cancelled.
+    state.status = "stop"
+    loop_state.save(state)
+    loop_log.log_event(portal_id, state.trace_id, "write_rejected", {
+        "step_number": step.step_number,
+        "action_id": action_id,
+    })
+    return _format_loop_result(
+        portal_config,
+        state,
+        f"Loop stopped: the pending write for step {step.step_number} was rejected or cancelled.",
+    )
+
+
+async def run_loop(
+    request_text: str,
+    portal_config,
+    working_dir: str,
+    trace_id: str,
+    plan: LoopPlan | None = None,
+) -> str:
+    """Run or resume the durable loop.
+
+    - With an existing non-terminal ``LoopState``: resume it (drive, or handle a
+      pending approval / awaiting verification).
+    - With a Claude-supplied ``plan`` and no existing state: validate, persist a
+      fresh ``LoopState``, and drive until the first write pause or completion.
+    - With neither: return guidance to produce a plan and run ``loop start``.
+
+    Writes never execute here — a write step pauses at ``awaiting_approval`` and
+    is applied out-of-band by ``hubspot approve`` (the unchanged safety path).
+    """
+    portal_id = portal_config.portal_id
+    existing_state = loop_state.load(portal_id)
+
+    if existing_state is not None:
+        if existing_state.status in _TERMINAL_STATUSES or loop_state.is_stale(existing_state):
+            loop_state.clear(portal_id)
+            existing_state = None
+
+    if existing_state is not None:
+        state = existing_state
+        if state.status == "awaiting_approval":
+            return await _resume_awaiting_approval(portal_config, state, working_dir)
+        if state.status == "awaiting_verification":
+            return _prompt_for_verification_message(portal_config, state)
+        loop_log.log_event(portal_id, state.trace_id, "loop_resumed", {
+            "current_step": state.current_step,
+            "iterations": state.iterations,
+        })
+        return await _drive_loop(portal_config, state, working_dir)
+
+    # No existing loop — a plan is required (Claude does triage, not Python).
+    if plan is None:
+        return _needs_plan_message(portal_config)
+
+    validation_errors = validate_plan(plan, _build_loop_capability_matrix(portal_config))
+    if validation_errors:
+        return (
+            f"{_loop_header(portal_config)}\n\n"
+            "The plan cannot be executed:\n"
+            + "\n".join(f"- {e}" for e in validation_errors)
+            + "\n\nAdjust the plan or upgrade the portal capabilities."
+        )
+
+    state = loop_state.LoopState(
+        portal_id=portal_id,
+        request_text=request_text or plan.goal,
+        trace_id=trace_id,
+        plan=plan,
+    )
+    loop_log.log_event(portal_id, trace_id, "loop_started", {
+        "goal": plan.goal,
+        "step_count": len(plan.steps),
+    })
+    return await _drive_loop(portal_config, state, working_dir)
+
+
+async def loop_verify(
+    result_json: str,
+    portal_config,
+    working_dir: str,
+) -> str:
+    """Consume a Claude-supplied VerificationResult for a paused-after-write loop.
+
+    Feeds the verdict to ``LoopController.next_action``:
+    - proceed  → advance past the verified write and drive to the next pause.
+    - retry    → drop the step's artifact, re-drive the same step (re-previews,
+      re-pauses for a fresh approval).  Bounded by the controller's iteration /
+      plateau / error-budget guards.
+    - escalate/stop → halt for human review.
+    """
+    portal_id = portal_config.portal_id
+    state = loop_state.load(portal_id)
+    if state is None:
+        return "No active loop for this portal."
+    if state.status != "awaiting_verification":
+        return (
+            f"{_loop_header(portal_config)}\n\n"
+            f"No write is awaiting verification (loop status: {state.status})."
+        )
+
+    verification = parse_verification_result(result_json)
+    if verification is None:
+        return (
+            f"{_loop_header(portal_config)}\n\n"
+            "Could not parse the verification result. Provide a VerificationResult JSON "
+            "with a `status` of verified / mismatch / partial / error."
+        )
+
+    step = state.plan.steps[state.current_step]
+    controller = LoopController(max_iterations=state.plan.max_iterations)
+    decision = controller.next_action(state, verification=verification)
+    loop_log.log_event(portal_id, state.trace_id, "verification", {
+        "step_number": step.step_number,
+        "decision": decision.action,
+        "status": verification.status.value,
+        "message": verification.message,
+    })
+
+    if decision.action == "proceed":
+        state.current_step += 1
+        state.status = "running"
+        state.pending_action_id = None
+        loop_state.save(state)
+        return await _drive_loop(portal_config, state, working_dir)
+
+    if decision.action == "retry":
+        # A retry re-drives the same step, which re-previews and (after another
+        # approval) re-executes it.  For a step whose committed write CREATED
+        # records, re-executing would create duplicates — HubSpot creates are
+        # not idempotent.  Escalate for human review instead of silently
+        # duplicating.  (Updates/deletes carry no created_ids and re-drive
+        # safely.)
+        step_artifact = next((a for a in state.artifacts if a.step_number == step.step_number), None)
+        if step_artifact and step_artifact.created_ids:
+            state.status = "escalate"
+            state.pending_action_id = None
+            loop_state.save(state)
+            loop_log.log_event(portal_id, state.trace_id, "escalate", {
+                "step_number": step.step_number,
+                "reason": "verification failed after a create; retry would duplicate records",
+                "created_ids": step_artifact.created_ids,
+            })
+            return _format_loop_result(
+                portal_config,
+                state,
+                f"Loop halted: step {step.step_number} created {step_artifact.created_ids} but "
+                f"verification failed. Retrying would create duplicate records, so this needs "
+                f"human review (fix or undo the created record(s), then start a new loop).",
+            )
+        controller.record_iteration(state)
+        state.artifacts = [a for a in state.artifacts if a.step_number != step.step_number]
+        state.status = "running"
+        state.pending_action_id = None
+        loop_state.save(state)
+        loop_log.log_event(portal_id, state.trace_id, "retry", {
+            "step_number": step.step_number,
+            "reason": decision.reason,
+            "iteration": state.iterations,
+        })
+        return await _drive_loop(portal_config, state, working_dir)
+
+    # escalate / stop
+    state.status = decision.action
+    state.pending_action_id = None
+    loop_state.save(state)
+    return _format_loop_result(portal_config, state, f"Loop halted: {decision.reason}")
 
 
 # DEAD CODE — NFR-13: flat single-domain dispatch, superseded by the durable

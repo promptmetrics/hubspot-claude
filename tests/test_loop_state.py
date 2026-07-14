@@ -88,6 +88,40 @@ def test_is_stale():
     assert is_stale(state, max_age_hours=4) is False
 
 
+def test_pending_action_id_roundtrip():
+    state = _make_state()
+    state.status = "awaiting_approval"
+    state.pending_action_id = "abc12345"
+    restored = LoopState.from_dict(state.to_dict())
+    assert restored.pending_action_id == "abc12345"
+    assert restored.status == "awaiting_approval"
+
+
+def test_pending_action_id_defaults_none_on_legacy_state():
+    # A state dict written before pending_action_id existed still loads.
+    data = _make_state().to_dict()
+    data.pop("pending_action_id")
+    restored = LoopState.from_dict(data)
+    assert restored.pending_action_id is None
+
+
+@pytest.mark.parametrize("status", ["awaiting_approval", "awaiting_verification"])
+def test_human_wait_states_never_stale(status):
+    # A loop parked on a human decision must survive the 2h reaper — clearing it
+    # would drop an already-previewed (or already-executed) write.
+    state = _make_state()
+    state.status = status
+    state.updated_at = datetime.now(timezone.utc) - timedelta(hours=48)
+    assert is_stale(state) is False
+
+
+def test_running_state_still_goes_stale():
+    state = _make_state()
+    state.status = "running"
+    state.updated_at = datetime.now(timezone.utc) - timedelta(hours=48)
+    assert is_stale(state) is True
+
+
 def test_save_updates_timestamp():
     state = _make_state()
     state.updated_at = datetime.now(timezone.utc) - timedelta(hours=1)

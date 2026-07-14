@@ -95,22 +95,27 @@ async def test_dispatch_agent_skips_validation_when_no_scopes_recorded(agent_pro
 
 
 @pytest.mark.asyncio
-async def test_run_loop_surfaces_scope_error_before_executing(agent_prompt):
-    plan_json = """
-    {
-      "goal": "Delete contacts",
-      "steps": [
-        {"step_number": 1, "agent": "objects", "action": "delete contacts",
-         "risk_level": "destructive"}
-      ],
-      "overall_risk": "destructive"
-    }
-    """
+async def test_run_loop_surfaces_scope_error_before_executing(agent_prompt, monkeypatch, tmp_path):
+    root = tmp_path / ".claude" / "hubspot"
+    monkeypatch.setattr("hubspot_agent.loop_state.CONFIG_DIR", root)
+    monkeypatch.setattr("hubspot_agent.loop_log.CONFIG_DIR", root)
+
+    from hubspot_agent.models import LoopPlan, PlanStep
+
+    plan = LoopPlan(
+        goal="Delete contacts",
+        steps=[
+            PlanStep(step_number=1, agent="objects", action="delete contacts",
+                     risk_level=RiskLevel.DESTRUCTIVE)
+        ],
+        overall_risk=RiskLevel.DESTRUCTIVE,
+    )
 
     portal = _portal_config(["crm.objects.contacts.read"])
 
-    with patch("hubspot_agent.orchestrator.spawn_agent", return_value=plan_json):
-        result = await run_loop("delete all contacts", portal, ".", "trace-scope")
+    # The loop previews the destructive write first (deferred approval); the
+    # scope block fires during preview, before anything is persisted or mutated.
+    result = await run_loop("delete all contacts", portal, ".", "trace-scope", plan=plan)
 
     assert "Missing HubSpot OAuth scopes:" in result
     assert "crm.objects.contacts.delete" in result

@@ -107,6 +107,7 @@ async def apply_write(
     trace_id: str | None = None,
     batch_mode: BatchApprovalMode = BatchApprovalMode.SINGLE,
     proposed_payload: dict[str, Any] | None = None,
+    loop_step_number: int | None = None,
 ) -> ApplyWriteResult:
     """Run the shared write-safety path and persist a pending preview.
 
@@ -146,6 +147,12 @@ async def apply_write(
         "required_confirmation": preview.impact_count,
         "confirmed_count": None,
     }
+    # When a paused durable-loop step produced this write, tag the pending
+    # record with its loop step so the preview is correlatable to the loop.
+    # Purely informational — resume correlates via LoopState.pending_action_id,
+    # so execute_pending_write need not know about loops.
+    if loop_step_number is not None:
+        preview_data["loop_step_number"] = loop_step_number
     # Resolve the store binding lazily from the orchestrator module so that
     # tests which monkeypatch ``hubspot_agent.orchestrator._store_pending_preview``
     # still intercept the write (the call site moved here from dispatch_agent,

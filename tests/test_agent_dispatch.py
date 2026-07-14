@@ -1,36 +1,13 @@
-from unittest.mock import MagicMock, patch
-
-from hubspot_agent.agent_dispatch import build_triage_prompt, build_verify_prompt, spawn_agent
+from hubspot_agent.agent_dispatch import build_verify_prompt, spawn_agent
 from hubspot_agent.config import PortalConfig
 
 
-def test_spawn_agent_without_runtime_returns_placeholder():
-    result = spawn_agent("triage", "do something")
-    assert result == "[agent:triage:no_runtime]"
-
-
-def test_spawn_agent_with_runtime():
-    fake_agent = MagicMock(return_value="plan json here")
-    with patch.dict("sys.modules", {"claude_code": MagicMock(Agent=fake_agent)}):
-        # Force re-import path by patching the local reference
-        import hubspot_agent.agent_dispatch as dispatch_module
-
-        original = getattr(dispatch_module, "RuntimeAgent", None)
-        dispatch_module.RuntimeAgent = fake_agent
-        try:
-            result = spawn_agent("verify", "verify this")
-            assert result == "plan json here"
-        finally:
-            if original is not None:
-                dispatch_module.RuntimeAgent = original
-            else:
-                del dispatch_module.RuntimeAgent
-
-
-def test_build_triage_prompt_contains_request():
-    prompt = build_triage_prompt("create a property and workflow")
-    assert "create a property and workflow" in prompt
-    assert "LoopPlan" in prompt
+def test_spawn_agent_always_returns_no_runtime_placeholder():
+    # There is no in-process Python runtime for spawning sub-agents: the durable
+    # loop's reasoning is done by Claude in-session via the loop CLI subcommands.
+    # spawn_agent is a stub retained only for the legacy execute_plan verify path.
+    assert spawn_agent("triage", "do something") == "[agent:triage:no_runtime]"
+    assert spawn_agent("verify", "verify this") == "[agent:verify:no_runtime]"
 
 
 def test_build_verify_prompt_contains_expected_state():

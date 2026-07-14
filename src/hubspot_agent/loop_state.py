@@ -36,6 +36,7 @@ class LoopState:
         last_error: str | None = None,
         last_verification_hash: str | None = None,
         plateau_count: int = 0,
+        pending_action_id: str | None = None,
     ) -> None:
         self.portal_id = portal_id
         self.request_text = request_text
@@ -50,6 +51,11 @@ class LoopState:
         self.last_error = last_error
         self.last_verification_hash = last_verification_hash
         self.plateau_count = plateau_count
+        # Set while the loop is paused at a write step (status
+        # ``awaiting_approval``): the ``action_id`` of the persisted pending
+        # preview the human must ``approve``.  Cleared once the write is
+        # verified and the loop advances.
+        self.pending_action_id = pending_action_id
 
     @property
     def total_steps(self) -> int:
@@ -70,6 +76,7 @@ class LoopState:
             "last_error": self.last_error,
             "last_verification_hash": self.last_verification_hash,
             "plateau_count": self.plateau_count,
+            "pending_action_id": self.pending_action_id,
         }
 
     @classmethod
@@ -88,6 +95,7 @@ class LoopState:
             last_error=data.get("last_error"),
             last_verification_hash=data.get("last_verification_hash"),
             plateau_count=data.get("plateau_count", 0),
+            pending_action_id=data.get("pending_action_id"),
         )
 
 
@@ -144,7 +152,21 @@ def clear(portal_id: str) -> None:
         path.unlink()
 
 
+# Statuses where the loop is deliberately parked waiting on a human
+# (an ``approve`` or a verification verdict).  These are exempt from the
+# staleness reaper: a paused loop must survive across turns and a lunch break,
+# so we never clear it just because 2h elapsed with no update.
+_HUMAN_WAIT_STATUSES = frozenset({"awaiting_approval", "awaiting_verification"})
+
+
 def is_stale(state: LoopState, max_age_hours: int = 2) -> bool:
-    """Return True if the loop state has not been updated recently."""
+    """Return True if the loop state has not been updated recently.
+
+    A loop parked on a human decision (``awaiting_approval`` /
+    ``awaiting_verification``) is never stale — clearing it would silently drop
+    an in-flight, already-previewed (or already-executed) write.
+    """
+    if state.status in _HUMAN_WAIT_STATUSES:
+        return False
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
     return state.updated_at < cutoff

@@ -51,16 +51,31 @@ For each request:
 4. **Approve** — surface the preview to the user. On approval, run `hubspot approve <action_id> [<count>]`. Destructive actions **require** the expected count (e.g. `approve abc123 3`); a bare `approve <id>` is rejected for destructive ops. Reject with `hubspot reject <action_id>`.
 5. **Verify** — re-fetch the affected record(s) with a read tool and confirm the change landed.
 
-## Loop mode
+## Loop mode (durable, deferred-approval)
 
-`/hubspot --loop '<goal>'` runs the durable closed loop (triage → sequential step execution → verify → checkpoint). Inspect or steer it with:
+`/hubspot --loop '<goal>'` runs a durable, resumable loop for multi-step goals. **You (Claude) are the planner and verifier; the CLI is the deterministic executor.** There is no Python triage — you produce the plan and the verification verdicts, and the loop pauses at every write for real human approval.
+
+The protocol, per goal:
+
+1. **Plan (you).** Turn the goal into a `LoopPlan` JSON — an ordered list of `steps`, each with `step_number`, `agent`, `action` (include a verb like *create/update/delete* for write steps), optional `prerequisites` (step numbers), `expected_artifact_keys`, and `risk_level`. Include `goal`, `success_criteria`, `overall_risk`, and `max_iterations`.
+2. **Start.** `hubspot loop start --plan '<LoopPlan JSON>'`. The loop validates the plan, then executes deterministically: read steps run immediately; at the **first write step it pauses** and returns a preview + `action_id` — nothing is mutated yet.
+3. **Approve (human-in-the-loop).** Show the preview to the user. On approval run `hubspot approve <action_id> [<count>]` (count is mandatory for destructive steps), or `hubspot reject <action_id>` to stop the loop.
+4. **Continue.** `hubspot loop continue` — the loop detects the approved write, captures its artifact (e.g. a created ID, threaded into later steps), and moves to verification.
+5. **Verify (you).** Re-read the affected record(s) with a read tool, then report the result: `hubspot loop verify --result '<VerificationResult JSON>'` (`status`: `verified` / `mismatch` / `partial` / `error`). The controller decides: **verified → proceed** to the next step (looping back to step 2 for the next write); **mismatch/partial → retry** the step (re-previews, re-pauses for approval); **error / repeated mismatch / iteration budget → escalate** for human review.
+6. Repeat until the loop reports **completed** (or halts).
+
+Inspect or steer a running loop:
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/bin/hubspot" loop status       # current step / iteration / state
-"${CLAUDE_PLUGIN_ROOT}/bin/hubspot" loop log          # NDJSON event log
-"${CLAUDE_PLUGIN_ROOT}/bin/hubspot" loop continue     # resume a deferred loop
-"${CLAUDE_PLUGIN_ROOT}/bin/hubspot" loop abandon      # stop and clear loop state
+"${CLAUDE_PLUGIN_ROOT}/bin/hubspot" loop start --plan '<json>'    # begin a planned loop
+"${CLAUDE_PLUGIN_ROOT}/bin/hubspot" loop continue                # resume after an approve
+"${CLAUDE_PLUGIN_ROOT}/bin/hubspot" loop verify --result '<json>' # report a write's verdict
+"${CLAUDE_PLUGIN_ROOT}/bin/hubspot" loop status                  # current step / status / pending action
+"${CLAUDE_PLUGIN_ROOT}/bin/hubspot" loop log                     # NDJSON event log
+"${CLAUDE_PLUGIN_ROOT}/bin/hubspot" loop abandon                 # stop and clear loop state
 ```
+
+State is checkpointed to disk after every step, so a loop survives across turns: a loop parked on an approval or a verification is never reaped by the staleness timer. Approval runs through the same unchanged `approve` → execute → undo-snapshot → audit path as every other write.
 
 `--pattern '<sample request>'` runs sample-verify-scale batch approval.
 
