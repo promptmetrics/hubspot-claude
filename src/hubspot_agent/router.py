@@ -317,10 +317,24 @@ def _daemon_tool_path(tool_name: str, tool_input: dict[str, Any], portal_id: str
     return _format_tool_response(resp)
 
 
+def _server_error_envelope(message: str) -> str:
+    """Daemon-shaped NFR-15 error envelope for an unexpected in-process failure.
+
+    Matches ``daemon.py``'s top-level ``{"error": {"kind": "server", ...}}`` so a
+    crash in the in-process fallback path (e.g. an unhandled ``ValueError`` from
+    ``emit_trace``, a pydantic ``ValidationError``) renders as structured JSON
+    instead of a raw traceback — identical shape to a daemon RPC failure.
+    """
+    return json.dumps({"error": {"kind": "server", "message": message, "retryable": True}})
+
+
 def _cli_fallback(remaining: list[str], working_dir: str, portal_id: str | None) -> str:
     from hubspot_agent.cli import hubspot_command
 
-    return hubspot_command(" ".join(remaining), working_dir, portal_id=portal_id)
+    try:
+        return hubspot_command(" ".join(remaining), working_dir, portal_id=portal_id)
+    except Exception as exc:
+        return _server_error_envelope(str(exc) or repr(exc))
 
 
 def _cli_fallback_tool(
@@ -334,19 +348,23 @@ def _cli_fallback_tool(
     args = f"tool {tool_name}"
     if tool_input:
         args += f" --input {json.dumps(tool_input)}"
-    return hubspot_command(args, working_dir, portal_id=portal_id)
+    try:
+        return hubspot_command(args, working_dir, portal_id=portal_id)
+    except Exception as exc:
+        return _server_error_envelope(str(exc) or repr(exc))
 
 
 def route(argv: list[str]) -> int:
-    from hubspot_agent.cli import _strip_global_flags
+    from hubspot_agent.cli import _exit_code_for, _strip_global_flags
     from hubspot_agent.config import detect_default_portal
 
     remaining, working_dir, portal_id = _strip_global_flags(list(argv))
     if working_dir is None:
         working_dir = os.getcwd()
     if not remaining:
-        print(_cli_fallback(remaining, working_dir, portal_id))
-        return 0
+        out = _cli_fallback(remaining, working_dir, portal_id)
+        print(out)
+        return _exit_code_for(out)
 
     head = remaining[0].lower()
 
@@ -392,8 +410,11 @@ def route(argv: list[str]) -> int:
         return daemon_main([pid])
 
     # approve/reject (undo+audit), loop_* (local disk), route/agents/tools/agent-prompt/status/…
-    print(_cli_fallback(remaining, working_dir, portal_id))
-    return 0
+    out = _cli_fallback(remaining, working_dir, portal_id)
+    print(out)
+    # Bug 8f: a refused write (validation error envelope from approve/confirm)
+    # exits 2; success/preview/read stays 0. Only validation refusals are non-zero.
+    return _exit_code_for(out)
 
 
 def main(argv: list[str] | None = None) -> int:

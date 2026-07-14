@@ -88,7 +88,34 @@ async def test_hubspot_batch_upsert_objects(respx_mock):
     assert result["progress"]["action_id"] == result["action_id"]
     assert result["progress"]["total_chunks"] == 1
     assert result["progress"]["completed_chunks"] == 1
+    assert result["skipped_duplicates"] == 0
     await c.close()
+
+
+@pytest.mark.asyncio
+async def test_batch_upsert_counts_skipped_duplicates(respx_mock):
+    """Bug 8d: repeated unique_keys are dropped but counted, and the result
+    reconciles: succeeded + failed + skipped_duplicates == total."""
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    respx_mock.post("https://api.hubapi.com/crm/v3/objects/contacts/batch/create").mock(
+        return_value=httpx.Response(200, json={"results": [{"id": "3"}, {"id": "4"}], "errors": []})
+    )
+    respx_mock.post("https://api.hubapi.com/crm/v3/objects/contacts/batch/update").mock(
+        return_value=httpx.Response(200, json={"results": [], "errors": []})
+    )
+    records = [
+        {"email": "dup@example.com"},
+        {"email": "dup@example.com"},  # duplicate of row 0 → skipped
+        {"email": "dup@example.com"},  # duplicate of row 0 → skipped
+        {"email": "unique@example.com"},
+    ]
+    result = await hubspot_batch_upsert_objects(
+        object_type="contacts", records=records, client=c, portal_id="123"
+    )
+    assert result["skipped_duplicates"] == 2
+    assert result["succeeded"] == 2
+    assert result["failed"] == 0
+    assert result["succeeded"] + result["failed"] + result["skipped_duplicates"] == result["total"]
 
 
 # ---------------------------------------------------------------------------

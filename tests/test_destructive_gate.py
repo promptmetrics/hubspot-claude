@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
+from hubspot_agent import cli
 from hubspot_agent.cli import (
     _is_destructive_preview,
     _present_destructive_preview,
@@ -184,3 +185,67 @@ def test_non_destructive_y_still_approves(portal_dir):
     mock_dispatch.assert_called_once()
     snapshot_file = portal_dir / "123" / "undo_snapshots" / f"{action_id}.json"
     assert snapshot_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# Bug 8f: a refused write (wrong/missing destructive count) exits 2 while the
+# JSON error still prints on stdout; successful previews/reads stay 0.
+# ---------------------------------------------------------------------------
+
+
+def test_router_approve_wrong_count_exits_2_with_json(portal_dir, capsys):
+    from hubspot_agent import router
+
+    action_id = "abc123"
+    _store_pending_preview("123", action_id, _destructive_preview_data(5))
+
+    rc = router.route(["--working-dir", str(portal_dir), "approve", action_id, "3"])
+    assert rc == 2
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["error"]["kind"] == "validation"
+
+
+def test_router_approve_bare_destructive_exits_2(portal_dir, capsys):
+    from hubspot_agent import router
+
+    action_id = "abc123"
+    _store_pending_preview("123", action_id, _destructive_preview_data(5))
+
+    rc = router.route(["--working-dir", str(portal_dir), "approve", action_id])
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"]["kind"] == "validation"
+
+
+def test_router_approve_exact_count_exits_0(portal_dir, capsys):
+    from hubspot_agent import router
+
+    action_id = "abc123"
+    _store_pending_preview("123", action_id, _destructive_preview_data(5))
+
+    async def fake_dispatch(*args, **kwargs):
+        return AgentResult(
+            agent_name="objects", status="success", data={"message": "deleted 5"}
+        )
+
+    with patch("hubspot_agent.orchestrator.dispatch_agent", side_effect=fake_dispatch):
+        rc = router.route(["--working-dir", str(portal_dir), "approve", action_id, "5"])
+    assert rc == 0
+    assert "Approved and executed" in capsys.readouterr().out
+
+
+def test_cli_main_approve_wrong_count_exits_2(portal_dir, monkeypatch, capsys):
+    import sys
+
+    action_id = "abc123"
+    _store_pending_preview("123", action_id, _destructive_preview_data(5))
+
+    monkeypatch.setattr(
+        sys, "argv", ["hubspot", "--working-dir", str(portal_dir), "approve", action_id, "3"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"]["kind"] == "validation"

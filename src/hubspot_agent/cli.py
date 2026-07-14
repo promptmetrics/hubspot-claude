@@ -42,6 +42,7 @@ from hubspot_agent.orchestrator import (
     run_simple,
 )
 from hubspot_agent.planning import parse_plan
+from hubspot_agent import planning
 from hubspot_agent import loop_log, loop_state
 from hubspot_agent.persistence import (
     clear as _clear_pending_preview,
@@ -578,6 +579,26 @@ def _error_json(
     return json.dumps({"error": error}, indent=2)
 
 
+def _exit_code_for(output: str) -> int:
+    """Process exit code for a CLI/router result string (Bug 8f).
+
+    A refused write — ``approve``/``confirm`` with a wrong or missing destructive
+    count — returns ``_error_json("validation", ...)``; that path exits **2** so a
+    script or sub-agent harness can detect the refusal while the JSON error still
+    prints on stdout.  Everything else (successful reads/previews, plain-text
+    usage, server/runtime errors) stays 0 — only a validation refusal is a
+    non-zero exit, matching the plan's narrow scope.
+    """
+    try:
+        payload = json.loads(output)
+    except (ValueError, TypeError):
+        return 0
+    err = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(err, dict) and err.get("kind") == "validation":
+        return 2
+    return 0
+
+
 def _handle_approve(action_id: str, working_dir: str, portal_id: str | None = None) -> str:
     if portal_id is None:
         portal_id = detect_default_portal(working_dir)
@@ -897,10 +918,14 @@ def _handle_loop_start(args: str, working_dir: str, portal_id: str | None = None
         return "Usage: /hubspot loop start --plan '<LoopPlan JSON>'"
     plan = parse_plan(raw)
     if plan is None:
-        return (
+        field_error = planning.last_parse_error()
+        msg = (
             "❌ Could not parse the LoopPlan JSON. Provide a plan with a `goal` and a "
             "`steps` array (see `docs/`)."
         )
+        if field_error:
+            msg += f"\n  Field error: {field_error}"
+        return msg
 
     existing = loop_state.load(portal_id)
     if (
@@ -1278,6 +1303,13 @@ def main() -> None:
             print(f"error: {exc}", file=sys.stderr)
             sys.exit(2)
     request = " ".join(remaining)
-    print(hubspot_command(request, working_dir, portal_id=portal_id))
+    output = hubspot_command(request, working_dir, portal_id=portal_id)
+    print(output)
+    # Bug 8f: a refused write (validation error envelope) exits 2; the JSON
+    # error still prints above. Success/preview/read stays 0 (no SystemExit),
+    # preserving the console-script contract used by the main-shim tests.
+    code = _exit_code_for(output)
+    if code:
+        sys.exit(code)
 
 

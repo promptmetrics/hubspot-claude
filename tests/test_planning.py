@@ -58,6 +58,37 @@ def test_parse_json_without_steps_returns_none():
     assert plan.steps == []
 
 
+def test_parse_validation_error_returns_none_not_traceback():
+    """Bug 7: well-formed JSON with a bad field (int prerequisites — pydantic v2
+    won't coerce to list[str]) returns None and stashes the first field error,
+    rather than raising a ValidationError traceback."""
+    from hubspot_agent.planning import last_parse_error
+
+    plan = parse_plan(
+        '{"goal": "do a thing", "steps": ['
+        '{"step_number": 1, "agent": "objects", "action": "search", "prerequisites": [1]}'
+        "]}"
+    )
+    assert plan is None
+    err = last_parse_error()
+    assert err is not None
+    assert "prerequisites" in err
+
+
+def test_parse_valid_plan_clears_last_error():
+    from hubspot_agent.planning import last_parse_error
+
+    parse_plan(
+        '{"goal": "x", "steps": [{"step_number": 1, "agent": "objects",'
+        ' "action": "search", "prerequisites": [1]}]}'
+    )
+    assert last_parse_error() is not None
+    # A subsequent valid parse must clear the stale error (no cross-call leakage).
+    plan = parse_plan(_PLAN_JSON)
+    assert plan is not None
+    assert last_parse_error() is None
+
+
 def test_validate_plan_no_errors():
     plan = parse_plan(_PLAN_JSON)
     assert validate_plan(plan) == []

@@ -192,3 +192,62 @@ def test_loop_verify_without_flag_returns_usage(tmp_path, monkeypatch):
     _setup_portal(tmp_path, monkeypatch)
     result = hubspot_command("loop verify garbage", working_dir=str(tmp_path))
     assert "Usage: /hubspot loop verify --result" in result
+
+
+@pytest.mark.asyncio
+async def test_loop_start_emits_trace_event_and_pauses(tmp_path, monkeypatch):
+    """Bug 1: ``loop start --plan`` must emit the ``loop_start`` trace event
+    (real, non-mocked ``emit_trace`` — previously crashed because ``loop_start``
+    was absent from ``EVENT_TYPES``) and park the loop at ``awaiting_approval``."""
+    import json as _json
+
+    from hubspot_agent import loop_state
+    from hubspot_agent.models import PreviewResult, RiskLevel
+    from hubspot_agent.trace import get_recent_traces
+
+    _setup_portal(tmp_path, monkeypatch)
+    # apply_write persists the pending preview via persistence.CONFIG_DIR; like
+    # test_loop_e2e.loop_dirs, point every on-disk root at the temp tree.
+    root = tmp_path / ".claude" / "hubspot"
+    monkeypatch.setattr("hubspot_agent.persistence.CONFIG_DIR", root)
+    monkeypatch.setattr("hubspot_agent.config.CONFIG_DIR", root)
+
+    async def _fake_preview(agent_name, intent, client, portal_id):
+        return PreviewResult(
+            preview={"message": "Will create property renewal_date"},
+            impact_count=1,
+            risk_level=RiskLevel.MEDIUM,
+            proposed_payload={"name": "renewal_date", "type": "date"},
+            original_values={},
+            informing_sources=[],
+        )
+
+    monkeypatch.setattr("hubspot_agent.orchestrator._build_preview_for_intent", _fake_preview)
+
+    plan = {
+        "goal": "Create a custom contact property renewal_date",
+        "success_criteria": ["property exists"],
+        "steps": [
+            {
+                "step_number": 1,
+                "agent": "properties",
+                "action": "create property renewal_date",
+                "expected_artifact_keys": ["property_id"],
+                "risk_level": "medium",
+            }
+        ],
+        "overall_risk": "medium",
+        "max_iterations": 3,
+    }
+    result = hubspot_command(
+        f"loop start --plan {_json.dumps(plan)}", working_dir=str(tmp_path)
+    )
+
+    assert "paused" in result.lower()
+    state = loop_state.load("123")
+    assert state is not None
+    assert state.status == "awaiting_approval"
+    assert state.pending_action_id
+
+    events = get_recent_traces("123")
+    assert any(e.event_type == "loop_start" for e in events)
