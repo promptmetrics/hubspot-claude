@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from hubspot_agent.client import HubSpotClient
 from hubspot_agent.config import PortalConfig
+from hubspot_agent.errors import HubSpotError
 
 
 class CapabilityMatrix(BaseModel):
@@ -79,6 +80,27 @@ _AGENT_CAPABILITY_REQUIREMENTS: dict[str, list[str]] = {
 }
 
 
+_NOT_ENTITLED_STATUSES = (401, 403, 404)
+
+
+async def _probe_bool(client: HubSpotClient, path: str, portal_id: str) -> bool | None:
+    """Probe one capability endpoint.
+
+    Returns True (entitled), False (definitively not entitled — 401/403/404),
+    or None for a transient failure (5xx/429/network), which must NOT be
+    cached: one blip would otherwise disable the gated agents for a full TTL.
+    """
+    try:
+        await client.get(path, portal_id=portal_id)
+        return True
+    except HubSpotError as exc:
+        if exc.status_code in _NOT_ENTITLED_STATUSES:
+            return False
+        return None
+    except Exception:
+        return None
+
+
 async def probe_portal(portal_config: PortalConfig) -> CapabilityMatrix:
     cache = CapabilityCache(portal_config.portal_id)
     cached = cache.get()
@@ -87,59 +109,57 @@ async def probe_portal(portal_config: PortalConfig) -> CapabilityMatrix:
 
     client = HubSpotClient(portal_config)
     matrix = CapabilityMatrix()
+    portal_id = portal_config.portal_id
+    cacheable = True
 
     try:
         try:
-            resp = await client.get("/account-info/v3/details", portal_id=portal_config.portal_id)
+            resp = await client.get("/account-info/v3/details", portal_id=portal_id)
             matrix.tier = resp.body.get("tier", "unknown")
+        except HubSpotError as exc:
+            if exc.status_code not in _NOT_ENTITLED_STATUSES:
+                cacheable = False
         except Exception:
-            pass
+            cacheable = False
+
+        bool_probes = (
+            ("custom_objects", "/crm/v3/schemas"),
+            # The workflow tools call /automation/v4/flows; probing the
+            # non-existent /automation/v4/workflows 404'd on live portals and
+            # cached workflows=False for 24h.
+            ("workflows", "/automation/v4/flows?limit=1"),
+            ("users", "/settings/v3/users?limit=1"),
+            ("marketing", "/marketing/v3/emails?limit=1"),
+            ("cms", "/cms/v3/pages/site-pages?limit=1"),
+        )
+        for field, path in bool_probes:
+            result = await _probe_bool(client, path, portal_id)
+            if result is None:
+                cacheable = False
+            else:
+                setattr(matrix, field, result)
 
         try:
-            await client.get("/crm/v3/schemas", portal_id=portal_config.portal_id)
-            matrix.custom_objects = True
-        except Exception:
-            matrix.custom_objects = False
-
-        try:
-            await client.get("/automation/v4/workflows?limit=1", portal_id=portal_config.portal_id)
-            matrix.workflows = True
-        except Exception:
-            matrix.workflows = False
-
-        try:
-            await client.get("/settings/v3/users?limit=1", portal_id=portal_config.portal_id)
-            matrix.users = True
-        except Exception:
-            matrix.users = False
-
-        try:
-            resp = await client.get("/crm/v3/properties/contacts", portal_id=portal_config.portal_id)
+            resp = await client.get("/crm/v3/properties/contacts", portal_id=portal_id)
             results = resp.body.get("results", [])
             has_calc = any(p.get("type") == "calculation" for p in results)
             if not has_calc:
-                resp2 = await client.get("/crm/v3/properties/companies", portal_id=portal_config.portal_id)
+                resp2 = await client.get("/crm/v3/properties/companies", portal_id=portal_id)
                 results2 = resp2.body.get("results", [])
                 has_calc = any(p.get("type") == "calculation" for p in results2)
             matrix.calculated_properties = has_calc
+        except HubSpotError as exc:
+            matrix.calculated_properties = False
+            if exc.status_code not in _NOT_ENTITLED_STATUSES:
+                cacheable = False
         except Exception:
             matrix.calculated_properties = False
-
-        try:
-            await client.get("/marketing/v3/emails?limit=1", portal_id=portal_config.portal_id)
-            matrix.marketing = True
-        except Exception:
-            matrix.marketing = False
-
-        try:
-            await client.get("/cms/v3/pages/site-pages?limit=1", portal_id=portal_config.portal_id)
-            matrix.cms = True
-        except Exception:
-            matrix.cms = False
+            cacheable = False
     finally:
         await client.close()
 
-    cache.set(matrix)
+    if cacheable:
+        cache.set(matrix)
     return matrix
 
 

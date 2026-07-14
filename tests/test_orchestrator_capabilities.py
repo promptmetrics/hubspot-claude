@@ -18,7 +18,7 @@ async def test_check_dispatch_readiness_all_clear(respx_mock, monkeypatch, tmp_p
     respx_mock.get("https://api.hubapi.com/crm/v3/schemas").mock(
         return_value=httpx.Response(200, json={"results": []})
     )
-    respx_mock.get("https://api.hubapi.com/automation/v4/workflows?limit=1").mock(
+    respx_mock.get("https://api.hubapi.com/automation/v4/flows?limit=1").mock(
         return_value=httpx.Response(200, json={"results": []})
     )
     respx_mock.get("https://api.hubapi.com/settings/v3/users?limit=1").mock(
@@ -49,7 +49,7 @@ async def test_check_dispatch_readiness_missing_capability(respx_mock, monkeypat
     respx_mock.get("https://api.hubapi.com/crm/v3/schemas").mock(
         return_value=httpx.Response(403, json={"message": "Forbidden"})
     )
-    respx_mock.get("https://api.hubapi.com/automation/v4/workflows?limit=1").mock(
+    respx_mock.get("https://api.hubapi.com/automation/v4/flows?limit=1").mock(
         return_value=httpx.Response(403, json={"message": "Forbidden"})
     )
     respx_mock.get("https://api.hubapi.com/settings/v3/users?limit=1").mock(
@@ -81,7 +81,7 @@ async def test_check_dispatch_readiness_missing_capability_on_starter_portal(res
     respx_mock.get("https://api.hubapi.com/crm/v3/schemas").mock(
         return_value=httpx.Response(403, json={"message": "Forbidden"})
     )
-    respx_mock.get("https://api.hubapi.com/automation/v4/workflows?limit=1").mock(
+    respx_mock.get("https://api.hubapi.com/automation/v4/flows?limit=1").mock(
         return_value=httpx.Response(403, json={"message": "Forbidden"})
     )
     respx_mock.get("https://api.hubapi.com/settings/v3/users?limit=1").mock(

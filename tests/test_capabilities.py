@@ -170,7 +170,7 @@ async def test_probe_portal_detects_tier(respx_mock, monkeypatch, tmp_path):
     respx_mock.get("https://api.hubapi.com/crm/v3/schemas").mock(
         return_value=httpx.Response(403, json={"message": "Forbidden"})
     )
-    respx_mock.get("https://api.hubapi.com/automation/v4/workflows?limit=1").mock(
+    respx_mock.get("https://api.hubapi.com/automation/v4/flows?limit=1").mock(
         return_value=httpx.Response(200, json={"results": []})
     )
     respx_mock.get("https://api.hubapi.com/settings/v3/users?limit=1").mock(
@@ -199,7 +199,7 @@ async def test_probe_portal_detects_custom_objects(respx_mock, monkeypatch, tmp_
     respx_mock.get("https://api.hubapi.com/crm/v3/schemas").mock(
         return_value=httpx.Response(200, json={"results": []})
     )
-    respx_mock.get("https://api.hubapi.com/automation/v4/workflows?limit=1").mock(
+    respx_mock.get("https://api.hubapi.com/automation/v4/flows?limit=1").mock(
         return_value=httpx.Response(403, json={"message": "Forbidden"})
     )
     respx_mock.get("https://api.hubapi.com/settings/v3/users?limit=1").mock(
@@ -228,7 +228,7 @@ async def test_probe_portal_detects_calculated_properties(respx_mock, monkeypatc
     respx_mock.get("https://api.hubapi.com/crm/v3/schemas").mock(
         return_value=httpx.Response(403, json={"message": "Forbidden"})
     )
-    respx_mock.get("https://api.hubapi.com/automation/v4/workflows?limit=1").mock(
+    respx_mock.get("https://api.hubapi.com/automation/v4/flows?limit=1").mock(
         return_value=httpx.Response(403, json={"message": "Forbidden"})
     )
     respx_mock.get("https://api.hubapi.com/settings/v3/users?limit=1").mock(
@@ -263,7 +263,7 @@ async def test_probe_portal_caches_result(respx_mock, monkeypatch, tmp_path):
     respx_mock.get("https://api.hubapi.com/crm/v3/schemas").mock(
         return_value=httpx.Response(403, json={"message": "Forbidden"})
     )
-    respx_mock.get("https://api.hubapi.com/automation/v4/workflows?limit=1").mock(
+    respx_mock.get("https://api.hubapi.com/automation/v4/flows?limit=1").mock(
         return_value=httpx.Response(200, json={"results": []})
     )
     respx_mock.get("https://api.hubapi.com/settings/v3/users?limit=1").mock(
@@ -271,6 +271,17 @@ async def test_probe_portal_caches_result(respx_mock, monkeypatch, tmp_path):
     )
     respx_mock.get("https://api.hubapi.com/crm/v3/properties/contacts").mock(
         return_value=httpx.Response(200, json={"results": []})
+    )
+    # Every probe must resolve definitively (entitled or 401/403/404) for the
+    # matrix to be cached — a transient failure skips the cache write (M10).
+    respx_mock.get("https://api.hubapi.com/crm/v3/properties/companies").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    respx_mock.get("https://api.hubapi.com/marketing/v3/emails?limit=1").mock(
+        return_value=httpx.Response(403, json={"message": "Forbidden"})
+    )
+    respx_mock.get("https://api.hubapi.com/cms/v3/pages/site-pages?limit=1").mock(
+        return_value=httpx.Response(403, json={"message": "Forbidden"})
     )
 
     portal = PortalConfig(portal_id="123", token="test-token")
@@ -296,7 +307,7 @@ async def test_probe_portal_handles_all_failures(respx_mock, monkeypatch, tmp_pa
     respx_mock.get("https://api.hubapi.com/crm/v3/schemas").mock(
         return_value=httpx.Response(500, text="Internal Server Error")
     )
-    respx_mock.get("https://api.hubapi.com/automation/v4/workflows?limit=1").mock(
+    respx_mock.get("https://api.hubapi.com/automation/v4/flows?limit=1").mock(
         return_value=httpx.Response(500, text="Internal Server Error")
     )
     respx_mock.get("https://api.hubapi.com/settings/v3/users?limit=1").mock(
@@ -313,3 +324,81 @@ async def test_probe_portal_handles_all_failures(respx_mock, monkeypatch, tmp_pa
     assert result.users is False
     assert result.custom_objects is False
     assert result.calculated_properties is False
+
+
+# ---------------------------------------------------------------------------
+# M10: probe hits /automation/v4/flows (what the workflow tools call), caches
+# a definitive 404 as not-entitled, and never caches a transient failure.
+# ---------------------------------------------------------------------------
+
+
+def _mock_all_probes_ok(respx_mock, *, flows=None):
+    respx_mock.get("https://api.hubapi.com/account-info/v3/details").mock(
+        return_value=httpx.Response(200, json={"tier": "Professional"})
+    )
+    respx_mock.get("https://api.hubapi.com/crm/v3/schemas").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    respx_mock.get("https://api.hubapi.com/automation/v4/flows?limit=1").mock(
+        return_value=flows or httpx.Response(200, json={"results": []})
+    )
+    respx_mock.get("https://api.hubapi.com/settings/v3/users?limit=1").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    respx_mock.get("https://api.hubapi.com/crm/v3/properties/contacts").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    respx_mock.get("https://api.hubapi.com/crm/v3/properties/companies").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    respx_mock.get("https://api.hubapi.com/marketing/v3/emails?limit=1").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    respx_mock.get("https://api.hubapi.com/cms/v3/pages/site-pages?limit=1").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+
+
+@pytest.mark.asyncio
+async def test_workflows_probe_hits_flows_endpoint(respx_mock, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "hubspot_agent.capabilities.CapabilityCache",
+        lambda portal_id, base_dir=None: CapabilityCache(portal_id, base_dir=tmp_path),
+    )
+    _mock_all_probes_ok(respx_mock)
+    result = await probe_portal(PortalConfig(portal_id="123", token="test-token"))
+    assert result.workflows is True
+    flows_calls = [c for c in respx_mock.calls if "automation/v4/flows" in str(c.request.url)]
+    assert len(flows_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_probe_404_caches_false(respx_mock, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "hubspot_agent.capabilities.CapabilityCache",
+        lambda portal_id, base_dir=None: CapabilityCache(portal_id, base_dir=tmp_path),
+    )
+    _mock_all_probes_ok(respx_mock, flows=httpx.Response(404, json={"message": "not found"}))
+    result = await probe_portal(PortalConfig(portal_id="123", token="test-token"))
+    assert result.workflows is False
+    cached = CapabilityCache("123", base_dir=tmp_path).get()
+    assert cached is not None and cached.workflows is False
+
+
+@pytest.mark.asyncio
+async def test_probe_5xx_does_not_cache_and_reprobes(respx_mock, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "hubspot_agent.capabilities.CapabilityCache",
+        lambda portal_id, base_dir=None: CapabilityCache(portal_id, base_dir=tmp_path),
+    )
+    _mock_all_probes_ok(respx_mock, flows=httpx.Response(503, text="Service Unavailable"))
+    portal = PortalConfig(portal_id="123", token="test-token")
+
+    result = await probe_portal(portal)
+    assert result.workflows is False  # safe default, but...
+    assert CapabilityCache("123", base_dir=tmp_path).get() is None  # ...not cached
+
+    # A second call re-probes instead of serving a poisoned matrix.
+    await probe_portal(portal)
+    flows_calls = [c for c in respx_mock.calls if "automation/v4/flows" in str(c.request.url)]
+    assert len(flows_calls) == 2

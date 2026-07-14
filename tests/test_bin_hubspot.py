@@ -173,6 +173,82 @@ def test_route_tool_parse_error_returns_usage(data_dir, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
+# M11: post-send failures never re-send a WRITE (the daemon may have already
+# persisted its pending preview); reads stay retryable; `--input -` stdin is
+# consumed exactly once and survives the in-process fallback.
+# ---------------------------------------------------------------------------
+
+
+def _write_argv():
+    return [
+        "tool", "hubspot_create_object",
+        "--input", '{"object_type":"contacts","properties":{"email":"a@example.com"}}',
+        "--portal", "123",
+    ]
+
+
+def test_write_tool_post_send_timeout_no_retry_no_fallback(data_dir, monkeypatch, capsys):
+    monkeypatch.setattr(router, "is_daemon_alive", lambda: True)
+
+    def _rpc(method, params, **k):
+        raise TimeoutError("hung daemon")
+
+    monkeypatch.setattr(router, "rpc_call", _rpc)
+    monkeypatch.setattr(router, "_kill_daemon", lambda: pytest.fail("write must not kill/retry post-send"))
+    monkeypatch.setattr(router, "start_daemon", lambda *a, **k: pytest.fail("write must not restart the daemon"))
+    monkeypatch.setattr("hubspot_agent.cli.hubspot_command", lambda *a, **k: pytest.fail("write must not fall back in-process"))
+    assert router.route(_write_argv()) == 0
+    out = capsys.readouterr().out
+    assert "did not answer" in out
+    assert "hubspot pending" in out
+
+
+def test_write_tool_unreachable_is_retried(data_dir, monkeypatch, capsys):
+    # Pre-send failure: the request never reached the daemon, so a write is
+    # safe to retry after a restart.
+    monkeypatch.setattr(router, "is_daemon_alive", lambda: True)
+    calls = {"rpc": 0}
+
+    def _rpc(method, params, **k):
+        calls["rpc"] += 1
+        if calls["rpc"] == 1:
+            raise router.DaemonUnreachable("connect refused")
+        return {"result": {"data": {"status": "preview", "action_id": "abc12345"}}}
+
+    monkeypatch.setattr(router, "rpc_call", _rpc)
+    monkeypatch.setattr(router, "_kill_daemon", lambda: None)
+    monkeypatch.setattr(router, "start_daemon", lambda *a, **k: object())
+    monkeypatch.setattr(router, "_wait_for_socket", lambda *a, **k: True)
+    assert router.route(_write_argv()) == 0
+    assert calls["rpc"] == 2
+    assert "abc12345" in capsys.readouterr().out
+
+
+def test_stdin_read_once_on_fallback(data_dir, monkeypatch, capsys):
+    # `--input -` used to be consumed by the router parse, then re-read (empty)
+    # by the CLI fallback — yielding a write preview for {}.
+    import io
+
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"object_type":"contacts","object_id":"42"}'))
+    monkeypatch.setattr(router, "is_daemon_alive", lambda: False)
+
+    def _bad_start(*a, **k):
+        raise OSError("no venv")
+
+    monkeypatch.setattr(router, "start_daemon", _bad_start)
+    received = {}
+
+    def _fake_cmd(req, wd, *, portal_id=None):
+        received["req"] = req
+        return "ok"
+
+    monkeypatch.setattr("hubspot_agent.cli.hubspot_command", _fake_cmd)
+    assert router.route(["tool", "hubspot_get_object", "--input", "-", "--portal", "123"]) == 0
+    assert '"object_id"' in received["req"]
+    assert "42" in received["req"]
+
+
+# ---------------------------------------------------------------------------
 # route — non-tool + serve stop
 # ---------------------------------------------------------------------------
 
