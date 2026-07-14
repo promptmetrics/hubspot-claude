@@ -115,6 +115,8 @@ def parse_plan(text: str) -> LoopPlan | None:
                     expected_artifact_keys=raw.get("expected_artifact_keys", []),
                     prerequisites=raw.get("prerequisites", []),
                     risk_level=risk_level,
+                    tool_name=raw.get("tool_name"),
+                    tool_input=raw.get("tool_input", {}),
                 )
             )
 
@@ -164,6 +166,13 @@ def validate_plan(plan: LoopPlan, capability_matrix: dict[str, bool] | None = No
         if agent_key == "workflows" and capability_matrix.get("workflows") is False:
             errors.append(f"Step {step.step_number} requires workflows but portal lacks workflow support.")
 
+        # Verbatim tool-path validation (PR 2 / bug 2).  A step may carry a
+        # ``tool_name`` + ``tool_input`` so the loop executes the exact payload
+        # instead of free-text agent dispatch (which fuzzy-matched records[0]
+        # and could write the wrong record).  Reject the malformed cases that
+        # would either miss the target or hit the write gate with no payload.
+        errors.extend(_validate_step_tool(step))
+
         # Dependency check
         for prereq in step.prerequisites:
             try:
@@ -175,6 +184,88 @@ def validate_plan(plan: LoopPlan, capability_matrix: dict[str, bool] | None = No
                 errors.append(
                     f"Step {step.step_number} depends on step {prereq_num}, which is not present or not yet ordered."
                 )
+
+    return errors
+
+
+# Single-record object tools that MUST name their target by id.  Mirrors the
+# CRUD surface the bug-2 fuzzy-match exploited; batch/bulk tools carry a
+# ``records``/``inputs`` list instead, and non-object update tools use their
+# own id keys (sent verbatim by the tool path, so no fuzzy match there).
+_TARGET_ID_KEY: dict[str, str] = {
+    "hubspot_update_object": "object_id",
+    "hubspot_delete_object": "object_id",
+    "hubspot_merge_objects": "primary_object_id",
+}
+
+
+def _step_tool_is_write(tool_name: str, tool_input: dict[str, Any]) -> bool:
+    """Classify a step's tool as a write, mirroring ``handlers._is_write_tool``.
+
+    A tool is a write if its required scopes carry a ``.write``/``.delete``
+    suffix, its name is in ``WRITE_TOOLS``, or it is ``hubspot_raw_api`` with a
+    mutating method.  Kept here (not imported from handlers) so ``planning``
+    stays a leaf module with no circular-dependency risk.
+    """
+    from hubspot_agent.scope_registry import (
+        RAW_API_WRITE_METHODS,
+        WRITE_TOOLS,
+        get_required_scopes,
+    )
+
+    if tool_name == "hubspot_raw_api":
+        method = str((tool_input or {}).get("method", "")).upper()
+        return method in RAW_API_WRITE_METHODS
+    if tool_name in WRITE_TOOLS:
+        return True
+    target = (tool_input or {}).get("object_type")
+    scopes = get_required_scopes([tool_name], target)
+    return any(s.endswith(".write") or s.endswith(".delete") for s in scopes)
+
+
+def _validate_step_tool(step: PlanStep) -> list[str]:
+    """Validation errors for a step's optional ``tool_name``/``tool_input``.
+
+    Empty list for a legacy text-only step (``tool_name`` unset).  Rejects:
+    unknown ``tool_name``; ``tool_input`` without ``tool_name``; a write tool
+    with empty ``tool_input``; and a single-record update/delete/merge tool
+    with no target ``object_id`` (literal or ``{{placeholder}}``).
+    """
+    errors: list[str] = []
+    tool_name = step.tool_name
+    tool_input = step.tool_input or {}
+
+    if tool_name is None:
+        if tool_input:
+            errors.append(
+                f"Step {step.step_number} has tool_input but no tool_name; "
+                "set tool_name or drop tool_input."
+            )
+        return errors
+
+    from hubspot_agent.tools import get_tool
+
+    if get_tool(tool_name) is None:
+        errors.append(
+            f"Step {step.step_number} names an unknown tool '{tool_name}'. "
+            "Run `hubspot tools list` for valid tool names."
+        )
+        return errors
+
+    if _step_tool_is_write(tool_name, tool_input) and not tool_input:
+        errors.append(
+            f"Step {step.step_number} write tool '{tool_name}' has empty tool_input; "
+            "provide the full payload (object_id, properties, …)."
+        )
+
+    id_key = _TARGET_ID_KEY.get(tool_name)
+    if id_key is not None:
+        target_id = tool_input.get(id_key)
+        if target_id in (None, "", []):
+            errors.append(
+                f"Step {step.step_number} tool '{tool_name}' is missing '{id_key}' "
+                "(a literal id or a {{artifact_key}} placeholder)."
+            )
 
     return errors
 

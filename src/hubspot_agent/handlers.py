@@ -244,6 +244,8 @@ async def handle_tool(client, cache, portal_config: PortalConfig, params: dict[s
         request_text=f"tool {tool_name}",
         proposed_payload=tool_input,
         batch_mode=BatchApprovalMode(params.get("batch_mode", "single")),
+        trace_id=params.get("trace_id"),
+        loop_step_number=params.get("loop_step_number"),
     )
     return _ok(
         {

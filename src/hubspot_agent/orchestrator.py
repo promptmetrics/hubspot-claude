@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -26,7 +27,6 @@ from hubspot_agent.sequential_dispatch import (
     _build_step_request,
     _capture_artifacts,
     _resolve_artifacts,
-    execute_plan,
     is_write_step,
 )
 from hubspot_agent.snapshot import load_undo_snapshot, snapshot_dir_for_portal
@@ -224,6 +224,18 @@ _CREATE_WORDS = {"create", "add", "new", "insert", "build", "make"}
 _UPDATE_WORDS = {"update", "change", "edit", "modify", "set", "rename", "patch"}
 _DELETE_WORDS = {"delete", "remove", "destroy", "drop", "clear", "purge"}
 
+
+def _has_boundary_word(text: str, words: set[str]) -> bool:
+    """True if any word appears as a whole word in ``text``.
+
+    Substring matching (``w in text``) mis-classified tokens like ``"renewal"``
+    → create (contains ``"new"``) and ``"created"`` → create (contains
+    ``"create"``).  ``\\b``-anchored matching makes ``new`` not match
+    ``renewal``/``renew`` and ``create`` not match ``created``, so a write lands
+    on the intended record instead of a fuzzy ``records[0]`` (bug 2).
+    """
+    return any(re.search(rf"\b{re.escape(w)}\b", text) for w in words)
+
 _OBJ_MAP = {
     "contact": "contacts", "contacts": "contacts",
     "company": "companies", "companies": "companies",
@@ -245,14 +257,20 @@ _STOP_WORDS = {
 def _parse_agent_intent(agent_name: str, request_text: str) -> TaskIntent:
     text = request_text.lower()
 
-    if any(w in text for w in _SEARCH_WORDS):
+    # Priority: search → delete → update → create.  Reads first (a read must
+    # never masquerade as a write), then destructive verbs before non-destructive
+    # so a phrase carrying both (e.g. "delete the renewal") fails safe into the
+    # destructive count gate instead of being reclassified as a create via
+    # "new".  Word-boundary matching (see ``_has_boundary_word``) prevents
+    # substring false-positives like "renewal"→create or "created"→create.
+    if _has_boundary_word(text, _SEARCH_WORDS):
         intent_type = "search"
-    elif any(w in text for w in _CREATE_WORDS):
-        intent_type = "create"
-    elif any(w in text for w in _UPDATE_WORDS):
-        intent_type = "update"
-    elif any(w in text for w in _DELETE_WORDS):
+    elif _has_boundary_word(text, _DELETE_WORDS):
         intent_type = "delete"
+    elif _has_boundary_word(text, _UPDATE_WORDS):
+        intent_type = "update"
+    elif _has_boundary_word(text, _CREATE_WORDS):
+        intent_type = "create"
     else:
         intent_type = "unknown"
 
@@ -724,6 +742,111 @@ def _artifact_from_snapshot(portal_id: str, action_id: str, step) -> StepArtifac
     )
 
 
+_PLACEHOLDER_RE = re.compile(r"^\s*\{\{\s*(\w+)\s*\}\}\s*$")
+
+
+def _resolve_tool_placeholders(tool_input: Any, resolved: dict[str, Any]) -> Any:
+    """Substitute ``{{key}}`` placeholders in ``tool_input`` from artifact outputs.
+
+    Whole-value substitution only (``object_id: "{{contact_id}}"``): a string
+    that is exactly ``{{key}}`` is replaced by ``resolved[key]``.  Dicts and
+    lists are recursed.  Raises ``KeyError(key)`` for a placeholder whose key is
+    not in ``resolved`` so the caller fails the step before any write persists.
+    """
+    if isinstance(tool_input, dict):
+        return {k: _resolve_tool_placeholders(v, resolved) for k, v in tool_input.items()}
+    if isinstance(tool_input, list):
+        return [_resolve_tool_placeholders(v, resolved) for v in tool_input]
+    if isinstance(tool_input, str):
+        match = _PLACEHOLDER_RE.match(tool_input)
+        if match:
+            key = match.group(1)
+            if key not in resolved:
+                raise KeyError(key)
+            return resolved[key]
+    return tool_input
+
+
+def _capture_tool_artifact(data: dict[str, Any], step) -> StepArtifact:
+    """Build a StepArtifact from an inline-executed read tool's response.
+
+    ``data`` is ``handle_tool``'s ``{"tool": ..., "result": ...}``.  The raw
+    result is captured under ``"result"``; if it carries a record id and the
+    step declared ``expected_artifact_keys``, the first id is surfaced under
+    that key so downstream ``{{key}}`` placeholders can resolve it.  Reads never
+    create records, so ``created_ids`` stays empty (the create-escalate guard in
+    ``loop_verify`` keys off ``created_ids`` and must not fire for a read).
+    """
+    result = data.get("result")
+    outputs: dict[str, Any] = {"result": result}
+    first_id: str | None = None
+    if isinstance(result, list):
+        for rec in result:
+            if isinstance(rec, dict) and rec.get("id"):
+                first_id = str(rec["id"])
+                break
+    elif isinstance(result, dict) and result.get("id"):
+        first_id = str(result["id"])
+    if first_id and step.expected_artifact_keys:
+        for key in step.expected_artifact_keys:
+            outputs[key] = first_id
+            break
+    return StepArtifact(
+        step_number=step.step_number,
+        agent=step.agent,
+        outputs=outputs,
+        created_ids=[],
+    )
+
+
+async def _run_loop_tool_step(
+    portal_config, state: loop_state.LoopState, step, tool_input: dict[str, Any]
+) -> dict[str, Any]:
+    """Execute one verbatim-tool loop step via ``handle_tool``.
+
+    Returns one of:
+    - ``{"kind": "preview", "action_id", "preview"}`` — write tool paused at
+      approval; the pending record carries ``tool_name`` and the verbatim
+      ``tool_input`` so ``execute_pending_write``'s tool branch replays it
+      exactly (no fuzzy ``records[0]`` re-search).
+    - ``{"kind": "read", "artifact"}`` — read tool executed inline.
+    - ``{"kind": "failed", "error"}`` — a handler/preview failure.
+    """
+    from hubspot_agent.handlers import HandlerError, build_fresh_client_cache, handle_tool
+
+    client, cache = await build_fresh_client_cache(portal_config)
+    try:
+        params = {
+            "tool_name": step.tool_name,
+            "input": tool_input,
+            "trace_id": state.trace_id,
+            "loop_step_number": step.step_number,
+            "batch_mode": "single",
+        }
+        try:
+            resp = await handle_tool(client, cache, portal_config, params)
+        except HandlerError as exc:
+            return {"kind": "failed", "error": exc.error.get("message", "tool call failed")}
+        data = resp.get("data", {})
+        if data.get("status") == "preview":
+            preview = AgentResult(
+                agent_name=step.agent,
+                status="preview",
+                data={
+                    "action_id": data.get("action_id"),
+                    "risk_level": data.get("risk_level", "medium"),
+                    "impact_count": data.get("impact_count", 1),
+                    "preview": f"Tool {step.tool_name} — preview of the verbatim payload.",
+                    "target_object": tool_input.get("object_type"),
+                },
+            )
+            return {"kind": "preview", "action_id": data["action_id"], "preview": preview}
+        artifact = _capture_tool_artifact(data, step)
+        return {"kind": "read", "artifact": artifact}
+    finally:
+        await client.close()
+
+
 async def _drive_loop(portal_config, state: loop_state.LoopState, working_dir: str) -> str:
     """Advance the loop from ``current_step`` until a write pause or completion.
 
@@ -743,6 +866,65 @@ async def _drive_loop(portal_config, state: loop_state.LoopState, working_dir: s
             "agent": step.agent,
             "action": step.action,
         })
+
+        # Verbatim tool path (PR 2 / bug 2): a step with ``tool_name`` executes
+        # the exact ``tool_input`` through ``handle_tool`` instead of free-text
+        # agent dispatch, so a write lands on the named record — never a fuzzy
+        # ``records[0]``.  Placeholder resolution failures and handler/preview
+        # errors fail the step without persisting a pending write.
+        if step.tool_name is not None:
+            try:
+                resolved_input = _resolve_tool_placeholders(step.tool_input, resolved)
+            except KeyError as missing:
+                state.status = "failed"
+                state.last_error = (
+                    f"Unresolvable placeholder {{{{{missing}}}}} in step "
+                    f"{step.step_number} tool_input (no artifact supplies it)."
+                )
+                loop_state.save(state)
+                loop_log.log_event(portal_id, state.trace_id, "step_failed", {
+                    "step_number": step.step_number,
+                    "error": state.last_error,
+                })
+                return _format_loop_result(
+                    portal_config,
+                    state,
+                    f"Execution stopped at step {step.step_number}: {state.last_error}",
+                )
+
+            outcome = await _run_loop_tool_step(portal_config, state, step, resolved_input)
+            if outcome["kind"] == "failed":
+                state.status = "failed"
+                state.last_error = outcome["error"]
+                loop_state.save(state)
+                loop_log.log_event(portal_id, state.trace_id, "step_failed", {
+                    "step_number": step.step_number,
+                    "error": outcome["error"],
+                })
+                return _format_loop_result(
+                    portal_config,
+                    state,
+                    f"Execution stopped at step {step.step_number}: {outcome['error']}",
+                )
+            if outcome["kind"] == "preview":
+                state.pending_action_id = outcome["action_id"]
+                state.status = "awaiting_approval"
+                loop_state.save(state)
+                loop_log.log_event(portal_id, state.trace_id, "awaiting_approval", {
+                    "step_number": step.step_number,
+                    "action_id": state.pending_action_id,
+                })
+                return _format_pause_message(portal_config, state, outcome["preview"])
+            # Read tool executed inline → capture artifact, advance, continue.
+            artifact = outcome["artifact"]
+            state.artifacts.append(artifact)
+            state.current_step += 1
+            loop_state.save(state)
+            loop_log.log_event(portal_id, state.trace_id, "step_completed", {
+                "step_number": step.step_number,
+                "outputs": artifact.outputs,
+            })
+            continue
 
         if _requires_approval(step):
             preview = await dispatch_agent(
