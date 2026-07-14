@@ -191,7 +191,12 @@ async def execute_single_step(
     # Lazy import to avoid a circular dependency with orchestrator.py.
     from hubspot_agent.orchestrator import dispatch_agent
 
-    approve_callback = approve_callback or (lambda _: True)
+    # Fail closed: a write with no approval callback is DENIED, not auto-approved.
+    # The core contract is human-in-the-loop approval for every write; a caller
+    # that wants a loop to perform writes must pass an explicit approve_callback.
+    # (Previously this defaulted to ``lambda _: True``, so loop writes executed
+    # with no approval, no count gate, and no audit entry.)
+    approve_callback = approve_callback or (lambda _: False)
 
     resolved = _resolve_artifacts(step, resolved_artifacts)
     step_request = _build_step_request(step, request_text, resolved)

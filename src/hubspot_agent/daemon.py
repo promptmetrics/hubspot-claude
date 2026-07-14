@@ -196,10 +196,31 @@ class HubSpotDaemon:
         req_id = req.get("id")
         method = req.get("method")
         params = req.get("params") or {}
+        if not isinstance(params, dict):
+            return {
+                "id": req_id,
+                "error": {"kind": "validation", "message": "params must be a JSON object", "retryable": False},
+            }
         if method not in HANDLERS:
             return {
                 "id": req_id,
                 "error": {"kind": "not_found", "message": f"Unknown method: {method}", "retryable": False},
+            }
+        # This daemon is warmed for exactly one portal.  If the caller targets a
+        # different portal, refuse rather than silently serving the wrong one —
+        # the router kills and restarts a daemon bound to the requested portal.
+        req_portal = params.get("portal_id")
+        if req_portal is not None and str(req_portal) != str(self.portal_config.portal_id):
+            return {
+                "id": req_id,
+                "error": {
+                    "kind": "portal_mismatch",
+                    "message": (
+                        f"daemon serves portal {self.portal_config.portal_id}, "
+                        f"not {req_portal}"
+                    ),
+                    "retryable": False,
+                },
             }
         try:
             result = await HANDLERS[method](self.client, self.cache, self.portal_config, params)

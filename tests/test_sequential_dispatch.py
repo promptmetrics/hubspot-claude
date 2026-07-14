@@ -52,7 +52,10 @@ async def test_execute_plan_passes_artifacts_between_steps():
         return AgentResult(agent_name=agent_name, status="error", error_message="unknown agent")
 
     with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
-        artifacts = await execute_plan(plan, "create property and workflow", None, "trace-1")
+        artifacts = await execute_plan(
+            plan, "create property and workflow", None, "trace-1",
+            approve_callback=lambda _: True,
+        )
 
     assert len(artifacts) == 2
     assert artifacts[0].outputs["property_id"] == "prop-123"
@@ -127,7 +130,10 @@ async def test_execute_plan_captures_created_ids():
         )
 
     with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
-        artifacts = await execute_plan(plan, "create a contact", None, "trace-1")
+        artifacts = await execute_plan(
+            plan, "create a contact", None, "trace-1",
+            approve_callback=lambda _: True,
+        )
 
     assert artifacts[0].created_ids == ["contact-789"]
 

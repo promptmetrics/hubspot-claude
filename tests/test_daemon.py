@@ -199,6 +199,37 @@ async def test_daemon_unknown_method_error(env, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_daemon_rejects_mismatched_portal(env, tmp_path):
+    """A tool call targeting a different portal than the daemon serves must be
+    refused with a portal_mismatch error, not silently run against the wrong
+    portal (the socket is global, one daemon per plugin data dir)."""
+    sock = _short_sock("pmm")
+    daemon = HubSpotDaemon(_portal(), sock_path=sock, idle_timeout=30)  # serves "123"
+    _fake_warm(daemon)
+    task = asyncio.create_task(daemon.serve())
+    try:
+        await _wait_for_socket(sock)
+        reader, writer = await asyncio.open_unix_connection(str(sock))
+        writer.write(
+            (json.dumps({
+                "method": "tool",
+                "params": {"tool_name": "hubspot_get_object", "input": {}, "portal_id": "999"},
+                "id": 7,
+            }) + "\n").encode("utf-8")
+        )
+        await writer.drain()
+        resp = json.loads(await reader.readline())
+        assert resp["id"] == 7
+        assert resp["error"]["kind"] == "portal_mismatch"
+        assert "123" in resp["error"]["message"]
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        daemon._stop.set()
+        await asyncio.wait_for(task, timeout=5)
+
+
+@pytest.mark.asyncio
 async def test_daemon_malformed_json_error(env, tmp_path):
     sock = _short_sock("bad")
     daemon = HubSpotDaemon(_portal(), sock_path=sock, idle_timeout=30)

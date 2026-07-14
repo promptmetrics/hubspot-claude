@@ -129,7 +129,10 @@ async def test_execute_plan_saves_snapshot_for_write_step(portal_dir):
         return AgentResult(agent_name="objects", status="success", data={"message": "updated"})
 
     with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
-        await execute_plan(plan, "update contact", portal_config, "trace-1")
+        await execute_plan(
+            plan, "update contact", portal_config, "trace-1",
+            approve_callback=lambda _: True,
+        )
 
     snapshot_file = portal_dir / ".claude" / "hubspot" / "123" / "undo_snapshots" / "act-1.json"
     assert snapshot_file.exists()
