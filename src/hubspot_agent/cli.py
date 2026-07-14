@@ -35,11 +35,13 @@ from hubspot_agent.orchestrator import (
     dispatch_agent,
     dispatch_agents_parallel,
     initialize_session,
+    loop_verify,
     parse_batch_mode,
     route_request,
     run_loop,
     run_simple,
 )
+from hubspot_agent.planning import parse_plan
 from hubspot_agent import loop_log, loop_state
 from hubspot_agent.persistence import (
     clear as _clear_pending_preview,
@@ -143,17 +145,22 @@ def hubspot_command(request: str, working_dir: str = ".", *, portal_id: str | No
 
     if request.lower().startswith("loop "):
         subcommand = request[5:].strip()
-        if subcommand.lower() == "status":
+        low = subcommand.lower()
+        if low == "status":
             return _handle_loop_status(working_dir, portal_id)
-        if subcommand.lower() == "log":
+        if low == "log":
             return _handle_loop_log(working_dir, portal_id=portal_id)
-        if subcommand.lower() == "checkpoint":
+        if low == "checkpoint":
             return _handle_loop_checkpoint(working_dir, portal_id)
-        if subcommand.lower() == "continue":
+        if low == "continue":
             return _handle_continue(working_dir, portal_id)
-        if subcommand.lower() == "abandon":
+        if low == "abandon":
             return _handle_abandon(working_dir, portal_id)
-        return "Usage: /hubspot loop {status | log | checkpoint | continue | abandon}"
+        if low == "start" or low.startswith("start "):
+            return _handle_loop_start(subcommand[5:].strip(), working_dir, portal_id)
+        if low == "verify" or low.startswith("verify "):
+            return _handle_loop_verify(subcommand[6:].strip(), working_dir, portal_id)
+        return "Usage: /hubspot loop {start --plan <json> | continue | verify --result <json> | status | log | checkpoint | abandon}"
 
     if request.lower() == "route" or request.lower().startswith("route "):
         return _handle_route(request[6:].strip(), working_dir, portal_id)
@@ -841,6 +848,88 @@ def _handle_abandon(working_dir: str, portal_id: str | None = None) -> str:
     return f"✅ Abandoned active loop for portal {portal_id}."
 
 
+def _extract_flag_value(args: str, flag: str) -> str:
+    """Pull a JSON payload from ``--<flag> <json>``, ``--<flag>=<json>``, or ``-`` (stdin).
+
+    Returns ``""`` for anything else (including bare text with no recognized
+    flag), so the caller shows a usage hint rather than feeding non-payload
+    text into a JSON parser and reporting a confusing "could not parse" error.
+    """
+    s = args.strip()
+    if s == "-":
+        return sys.stdin.read().strip()
+    for marker in (f"--{flag} ", f"--{flag}="):
+        if s.startswith(marker):
+            rest = s[len(marker):].strip()
+            return sys.stdin.read().strip() if rest == "-" else rest
+    return ""
+
+
+_ACTIVE_LOOP_STATUSES = {"running", "awaiting_approval", "awaiting_verification"}
+
+
+def _handle_loop_start(args: str, working_dir: str, portal_id: str | None = None) -> str:
+    """``hubspot loop start --plan '<LoopPlan JSON>'`` — begin a Claude-planned durable loop.
+
+    Claude performs triage and supplies the plan; Python validates it, persists a
+    fresh LoopState, and drives deterministically until the first write pause or
+    completion.  Refuses to clobber an already-active loop.
+    """
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return "No default portal found."
+    portal_config = load_portal_config(portal_id)
+    if not portal_config:
+        return f"Portal {portal_id} has no token configured."
+
+    raw = _extract_flag_value(args, "plan")
+    if not raw:
+        return "Usage: /hubspot loop start --plan '<LoopPlan JSON>'"
+    plan = parse_plan(raw)
+    if plan is None:
+        return (
+            "❌ Could not parse the LoopPlan JSON. Provide a plan with a `goal` and a "
+            "`steps` array (see `docs/`)."
+        )
+
+    existing = loop_state.load(portal_id)
+    if (
+        existing is not None
+        and existing.status in _ACTIVE_LOOP_STATUSES
+        and not loop_state.is_stale(existing)
+    ):
+        return (
+            f"⚠️ A loop is already active (status: {existing.status}). "
+            f"Run `hubspot loop continue` to resume it or `hubspot loop abandon` to discard it "
+            f"before starting a new one."
+        )
+
+    trace_id = new_trace_id()
+    emit_trace(portal_id, "loop_start", trace_id, {"goal": plan.goal, "steps": len(plan.steps)})
+    return _run_async(run_loop, plan.goal, portal_config, working_dir, trace_id, plan)
+
+
+def _handle_loop_verify(args: str, working_dir: str, portal_id: str | None = None) -> str:
+    """``hubspot loop verify --result '<VerificationResult JSON>'`` — report a write's verdict.
+
+    Claude re-reads the affected records after a write and supplies the verdict;
+    the LoopController decides proceed / retry / escalate and the loop drives on.
+    """
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return "No default portal found."
+    portal_config = load_portal_config(portal_id)
+    if not portal_config:
+        return f"Portal {portal_id} has no token configured."
+
+    raw = _extract_flag_value(args, "result")
+    if not raw:
+        return "Usage: /hubspot loop verify --result '<VerificationResult JSON>'"
+    return _run_async(loop_verify, raw, portal_config, working_dir)
+
+
 def _handle_loop_status(working_dir: str, portal_id: str | None = None) -> str:
     if portal_id is None:
         portal_id = detect_default_portal(working_dir)
@@ -858,6 +947,13 @@ def _handle_loop_status(working_dir: str, portal_id: str | None = None) -> str:
         f"- Step: {state.current_step + 1} of {len(state.plan.steps)}",
         f"- Iterations: {state.iterations}",
     ]
+    if state.status == "awaiting_approval" and state.pending_action_id:
+        lines.append(
+            f"- Awaiting approval: run `hubspot approve {state.pending_action_id}` "
+            f"then `hubspot loop continue`"
+        )
+    if state.status == "awaiting_verification":
+        lines.append("- Awaiting verification: run `hubspot loop verify --result '<json>'`")
     if state.last_error:
         lines.append(f"- Last error: {state.last_error}")
     return "\n".join(lines)

@@ -1,9 +1,11 @@
-import pytest
 from unittest.mock import patch
 
+import pytest
+
 from hubspot_agent.config import PortalConfig
-from hubspot_agent.models import AgentResult
-from hubspot_agent.orchestrator import run_loop, run_simple
+from hubspot_agent.models import AgentResult, LoopPlan, PlanStep, RiskLevel
+from hubspot_agent import loop_state
+from hubspot_agent.orchestrator import loop_verify, run_loop, run_simple
 
 
 def _portal_config(tier: str = "Professional") -> PortalConfig:
@@ -11,96 +13,320 @@ def _portal_config(tier: str = "Professional") -> PortalConfig:
 
 
 @pytest.fixture(autouse=True)
-def _clear_loop_state(monkeypatch, tmp_path):
-    monkeypatch.setattr("hubspot_agent.loop_state.CONFIG_DIR", tmp_path / ".claude" / "hubspot")
+def _isolate_loop_dirs(monkeypatch, tmp_path):
+    root = tmp_path / ".claude" / "hubspot"
+    monkeypatch.setattr("hubspot_agent.loop_state.CONFIG_DIR", root)
+    monkeypatch.setattr("hubspot_agent.loop_log.CONFIG_DIR", root)
     yield
 
 
-@pytest.mark.asyncio
-async def test_run_loop_returns_clarifying_question_for_non_json():
-    config = _portal_config()
-    with patch("hubspot_agent.orchestrator.spawn_agent", return_value="What object type do you want?"):
-        result = await run_loop("do something", config, ".", "trace-1")
-    assert "need a bit more clarity" in result
-    assert "What object type" in result
+def _write_plan(goal: str = "Create a property") -> LoopPlan:
+    return LoopPlan(
+        goal=goal,
+        success_criteria=["property exists"],
+        steps=[
+            PlanStep(
+                step_number=1,
+                agent="properties",
+                action="create property renewal_date",
+                expected_artifact_keys=["property_id"],
+                risk_level=RiskLevel.MEDIUM,
+            )
+        ],
+        overall_risk=RiskLevel.MEDIUM,
+    )
 
 
-@pytest.mark.asyncio
-async def test_run_loop_validates_plan_and_executes():
-    config = _portal_config()
-    plan_json = """
-    {
-      "goal": "Create a property",
-      "success_criteria": ["property exists"],
-      "steps": [
-        {"step_number": 1, "agent": "properties", "action": "create property renewal_date",
-         "expected_artifact_keys": ["property_id"], "risk_level": "medium"}
-      ],
-      "overall_risk": "medium"
-    }
-    """
+def _fake_dispatch(action_id: str = "act-1", created_id: str = "prop-123"):
+    """dispatch_agent stub: preview → action_id; execute → success artifact."""
 
-    async def fake_dispatch(agent_name, user_request, portal_config=None, mode="preview", **kwargs):
+    async def dispatch(agent_name, request_text, portal_config=None, mode="preview", **kwargs):
+        if mode == "preview":
+            return AgentResult(
+                agent_name=agent_name,
+                status="preview",
+                data={
+                    "action_id": action_id,
+                    "preview": f"preview of {agent_name}",
+                    "risk_level": "medium",
+                    "impact_count": 1,
+                    "intent_type": "create",
+                    "target_object": "contacts",
+                    "proposed_payload": {},
+                },
+            )
         return AgentResult(
             agent_name=agent_name,
-            status="preview" if mode == "preview" else "success",
-            data={"artifacts": {"property_id": "prop-123"}},
+            status="success",
+            data={"artifacts": {"property_id": created_id}},
         )
 
-    with patch("hubspot_agent.orchestrator.spawn_agent", return_value=plan_json):
-        with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
-            result = await run_loop(
-                "create property renewal_date", config, ".", "trace-2",
-                approve_callback=lambda _: True,
-            )
+    return dispatch
 
-    assert "Goal:" in result
-    assert "prop-123" in result
-    assert "properties" in result
+
+# ---------------------------------------------------------------------------
+# Planning / start
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_run_loop_detects_missing_workflow_capability():
-    config = _portal_config(tier="Free")
-    plan_json = """
-    {
-      "goal": "Create workflow",
-      "steps": [
-        {"step_number": 1, "agent": "workflows", "action": "create workflow", "risk_level": "medium"}
-      ],
-      "overall_risk": "medium"
-    }
-    """
+async def test_run_loop_without_plan_or_state_asks_for_a_plan():
+    result = await run_loop("do something", _portal_config(), ".", "trace-1")
+    assert "needs a plan" in result
+    assert "loop start --plan" in result
 
-    with patch("hubspot_agent.orchestrator.spawn_agent", return_value=plan_json):
-        result = await run_loop("create workflow", config, ".", "trace-3")
 
+@pytest.mark.asyncio
+async def test_run_loop_pauses_at_first_write():
+    with patch("hubspot_agent.orchestrator.dispatch_agent", _fake_dispatch()):
+        result = await run_loop(
+            "create property", _portal_config(), ".", "trace-2", plan=_write_plan()
+        )
+
+    assert "paused" in result.lower()
+    assert "act-1" in result
+    assert "hubspot approve act-1" in result
+
+    state = loop_state.load("123")
+    assert state is not None
+    assert state.status == "awaiting_approval"
+    assert state.pending_action_id == "act-1"
+    assert state.current_step == 0  # not advanced until verified
+
+
+@pytest.mark.asyncio
+async def test_run_loop_runs_read_step_then_pauses_at_write():
+    plan = LoopPlan(
+        goal="Find then create",
+        steps=[
+            PlanStep(step_number=1, agent="objects", action="find contacts", risk_level=RiskLevel.LOW),
+            PlanStep(step_number=2, agent="properties", action="create property x", risk_level=RiskLevel.MEDIUM),
+        ],
+        overall_risk=RiskLevel.MEDIUM,
+    )
+    calls: list[tuple[str, str]] = []
+
+    async def dispatch(agent_name, request_text, portal_config=None, mode="preview", **kwargs):
+        calls.append((agent_name, mode))
+        if mode == "preview":
+            return AgentResult(agent_name=agent_name, status="preview",
+                               data={"action_id": "act-9", "risk_level": "medium", "impact_count": 1,
+                                     "intent_type": "create", "preview": "p"})
+        return AgentResult(agent_name=agent_name, status="success", data={"artifacts": {}})
+
+    with patch("hubspot_agent.orchestrator.dispatch_agent", dispatch):
+        result = await run_loop("find then create", _portal_config(), ".", "trace-rw", plan=plan)
+
+    # Read step executed, then paused at the write step.
+    assert ("objects", "execute") in calls
+    assert ("properties", "preview") in calls
+    assert "paused" in result.lower()
+    state = loop_state.load("123")
+    assert state.current_step == 1  # read step advanced
+
+
+@pytest.mark.asyncio
+async def test_run_loop_pauses_on_risky_step_without_write_verb():
+    # "purge" is not in is_write_step's verb set, but the plan marks it
+    # destructive — it must still pause for approval, not execute as a read.
+    plan = LoopPlan(
+        goal="Purge stale deals",
+        steps=[PlanStep(step_number=1, agent="objects", action="purge stale deals",
+                        risk_level=RiskLevel.DESTRUCTIVE)],
+        overall_risk=RiskLevel.DESTRUCTIVE,
+    )
+    with patch("hubspot_agent.orchestrator.dispatch_agent", _fake_dispatch(action_id="act-purge")):
+        result = await run_loop("purge stale deals", _portal_config(), ".", "trace-risk", plan=plan)
+
+    assert "paused" in result.lower()
+    state = loop_state.load("123")
+    assert state.status == "awaiting_approval"
+    assert state.pending_action_id == "act-purge"
+
+
+@pytest.mark.asyncio
+async def test_run_loop_rejects_uncapable_plan():
+    plan = LoopPlan(
+        goal="Create workflow",
+        steps=[PlanStep(step_number=1, agent="workflows", action="create workflow", risk_level=RiskLevel.MEDIUM)],
+        overall_risk=RiskLevel.MEDIUM,
+    )
+    result = await run_loop("create workflow", _portal_config(tier="Free"), ".", "trace-cap", plan=plan)
     assert "cannot be executed" in result
     assert "workflow" in result.lower()
 
 
 @pytest.mark.asyncio
-async def test_run_loop_handles_execution_error():
-    config = _portal_config()
-    plan_json = """
-    {
-      "goal": "Create a property",
-      "steps": [
-        {"step_number": 1, "agent": "properties", "action": "create property", "risk_level": "medium"}
-      ],
-      "overall_risk": "medium"
-    }
-    """
-
-    async def fake_dispatch(agent_name, user_request, portal_config=None, mode="preview", **kwargs):
+async def test_run_loop_preview_error_stops():
+    async def dispatch(agent_name, request_text, portal_config=None, mode="preview", **kwargs):
         return AgentResult(agent_name=agent_name, status="error", error_message="api down")
 
-    with patch("hubspot_agent.orchestrator.spawn_agent", return_value=plan_json):
-        with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
-            result = await run_loop("create property", config, ".", "trace-4")
+    with patch("hubspot_agent.orchestrator.dispatch_agent", dispatch):
+        result = await run_loop("create property", _portal_config(), ".", "trace-4", plan=_write_plan())
 
     assert "Execution stopped" in result
     assert "api down" in result
+    assert loop_state.load("123").status == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Resume disambiguation (awaiting_approval)
+# ---------------------------------------------------------------------------
+
+
+def _save_awaiting_state(action_id: str = "act-1") -> None:
+    state = loop_state.LoopState(
+        portal_id="123",
+        request_text="create property",
+        trace_id="trace-resume",
+        plan=_write_plan(),
+        current_step=0,
+        status="awaiting_approval",
+        pending_action_id=action_id,
+    )
+    loop_state.save(state)
+
+
+@pytest.mark.asyncio
+async def test_resume_still_awaiting_reprompts():
+    _save_awaiting_state()
+    with patch("hubspot_agent.orchestrator._load_pending_preview", return_value={"action_id": "act-1"}):
+        result = await run_loop("create property", _portal_config(), ".", "trace-r1")
+    assert "still awaiting approval" in result
+    assert "hubspot approve act-1" in result
+    assert loop_state.load("123").status == "awaiting_approval"
+
+
+@pytest.mark.asyncio
+async def test_resume_after_approve_moves_to_verification():
+    _save_awaiting_state()
+    with patch("hubspot_agent.orchestrator._load_pending_preview", return_value=None), \
+         patch("hubspot_agent.audit.get_recent_audits", return_value=[{"action": "approve:act-1"}]), \
+         patch(
+             "hubspot_agent.orchestrator.load_undo_snapshot",
+             return_value={"metadata": {"created_ids": ["prop-123"], "target_object": "contacts"}},
+         ):
+        result = await run_loop("create property", _portal_config(), ".", "trace-r2")
+
+    assert "loop verify" in result
+    state = loop_state.load("123")
+    assert state.status == "awaiting_verification"
+    # Artifact captured from the undo snapshot, threaded under the declared key.
+    assert state.artifacts[0].created_ids == ["prop-123"]
+    assert state.artifacts[0].outputs.get("property_id") == "prop-123"
+
+
+@pytest.mark.asyncio
+async def test_resume_rejected_stops_loop():
+    _save_awaiting_state()
+    with patch("hubspot_agent.orchestrator._load_pending_preview", return_value=None), \
+         patch("hubspot_agent.audit.get_recent_audits", return_value=[]):
+        result = await run_loop("create property", _portal_config(), ".", "trace-r3")
+
+    assert "rejected or cancelled" in result
+    assert loop_state.load("123").status == "stop"
+
+
+# ---------------------------------------------------------------------------
+# loop_verify
+# ---------------------------------------------------------------------------
+
+
+def _save_awaiting_verification_state(created_ids=("prop-123",)) -> None:
+    from hubspot_agent.models import StepArtifact
+
+    created = list(created_ids)
+    action = "create property" if created else "update property"
+    plan = LoopPlan(
+        goal="Change a property",
+        steps=[PlanStep(step_number=1, agent="properties", action=action,
+                        expected_artifact_keys=["property_id"], risk_level=RiskLevel.MEDIUM)],
+        overall_risk=RiskLevel.MEDIUM,
+        max_iterations=3,
+    )
+    outputs = {"property_id": created[0]} if created else {}
+    state = loop_state.LoopState(
+        portal_id="123",
+        request_text="change property",
+        trace_id="trace-verify",
+        plan=plan,
+        current_step=0,
+        status="awaiting_verification",
+        artifacts=[StepArtifact(step_number=1, agent="properties", outputs=outputs, created_ids=created)],
+    )
+    loop_state.save(state)
+
+
+@pytest.mark.asyncio
+async def test_loop_verify_proceed_completes_single_step():
+    _save_awaiting_verification_state()
+    result = await loop_verify(
+        '{"status": "verified", "checked_count": 1, "verified_count": 1}',
+        _portal_config(), ".",
+    )
+    assert "completed" in result.lower()
+    assert loop_state.load("123") is None  # cleared on completion
+
+
+@pytest.mark.asyncio
+async def test_loop_verify_mismatch_retries_and_repauses():
+    # An update (no created_ids) can be safely re-driven on a mismatch retry.
+    _save_awaiting_verification_state(created_ids=[])
+    with patch("hubspot_agent.orchestrator.dispatch_agent", _fake_dispatch(action_id="act-retry")):
+        result = await loop_verify(
+            '{"status": "mismatch", "mismatches": [{"field": "name"}]}',
+            _portal_config(), ".",
+        )
+    assert "paused" in result.lower()
+    state = loop_state.load("123")
+    assert state.status == "awaiting_approval"
+    assert state.pending_action_id == "act-retry"
+    assert state.iterations == 1  # controller recorded the retry
+
+
+@pytest.mark.asyncio
+async def test_loop_verify_retry_after_create_escalates_not_duplicates():
+    # A create already committed; a mismatch "retry" would duplicate the record,
+    # so the loop escalates for human review instead of re-driving.
+    _save_awaiting_verification_state(created_ids=["prop-123"])
+    result = await loop_verify(
+        '{"status": "mismatch", "mismatches": [{"field": "name"}]}',
+        _portal_config(), ".",
+    )
+    assert "halted" in result.lower()
+    assert "duplicate" in result.lower()
+    state = loop_state.load("123")
+    assert state.status == "escalate"
+
+
+@pytest.mark.asyncio
+async def test_loop_verify_error_escalates():
+    _save_awaiting_verification_state()
+    result = await loop_verify(
+        '{"status": "error", "message": "verification blew up"}',
+        _portal_config(), ".",
+    )
+    assert "halted" in result.lower()
+    assert loop_state.load("123").status == "escalate"
+
+
+@pytest.mark.asyncio
+async def test_loop_verify_without_awaiting_state_is_noop():
+    result = await loop_verify('{"status": "verified"}', _portal_config(), ".")
+    assert "No active loop" in result
+
+
+@pytest.mark.asyncio
+async def test_loop_verify_unparseable_result():
+    _save_awaiting_verification_state()
+    result = await loop_verify("not json at all", _portal_config(), ".")
+    assert "Could not parse" in result
+    assert loop_state.load("123").status == "awaiting_verification"  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# Backwards-compat flat dispatch
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -111,195 +337,18 @@ async def test_run_simple_backwards_compatible():
     assert all(r.status == "preview" for r in results)
 
 
-@pytest.mark.asyncio
-async def test_run_loop_acceptance_property_and_workflow():
-    """Group 1 acceptance: property creation feeds workflow creation with verification."""
-    config = _portal_config(tier="Professional")
-    plan_json = """
-    {
-      "goal": "Create a custom contact property renewal_date and build a workflow that enrolls contacts 30 days before renewal",
-      "success_criteria": ["property exists", "workflow references property"],
-      "steps": [
-        {
-          "step_number": 1,
-          "agent": "properties",
-          "action": "create property renewal_date",
-          "description": "Create custom contact property renewal_date",
-          "expected_artifact_keys": ["property_id"],
-          "risk_level": "medium"
-        },
-        {
-          "step_number": 2,
-          "agent": "workflows",
-          "action": "create workflow enrollment rule",
-          "description": "Build workflow that enrolls contacts 30 days before renewal_date",
-          "prerequisites": ["1"],
-          "expected_artifact_keys": ["workflow_id"],
-          "risk_level": "medium"
-        }
-      ],
-      "overall_risk": "medium",
-      "max_iterations": 3
-    }
-    """
-
-    calls: list[tuple[str, str]] = []
-
-    async def fake_dispatch(agent_name, user_request, portal_config=None, mode="preview", **kwargs):
-        calls.append((agent_name, mode))
-        if agent_name == "properties":
-            return AgentResult(
-                agent_name="properties",
-                status="preview" if mode == "preview" else "success",
-                data={"artifacts": {"property_id": "prop-renewal-123"}},
-            )
-        if agent_name == "workflows":
-            assert "prop-renewal-123" in user_request
-            return AgentResult(
-                agent_name="workflows",
-                status="preview" if mode == "preview" else "success",
-                data={"artifacts": {"workflow_id": "wf-renewal-456"}},
-            )
-        return AgentResult(agent_name=agent_name, status="error", error_message="unknown")
-
-    with patch("hubspot_agent.orchestrator.spawn_agent", return_value=plan_json):
-        with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
-            result = await run_loop(
-                "create a custom contact property called renewal_date and build a workflow "
-                "that enrolls contacts 30 days before renewal",
-                config,
-                ".",
-                "acceptance-1",
-                approve_callback=lambda _: True,
-            )
-
-    assert "prop-renewal-123" in result
-    assert "wf-renewal-456" in result
-    assert any(c == ("properties", "preview") for c in calls)
-    assert any(c == ("properties", "execute") for c in calls)
-    assert any(c == ("workflows", "preview") for c in calls)
-    assert any(c == ("workflows", "execute") for c in calls)
+# ---------------------------------------------------------------------------
+# execute-mode fallback: a handler-less agent must not fabricate success
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_run_loop_resumes_from_saved_state():
-    """A second call with the same request resumes and completes remaining steps."""
-    config = _portal_config()
-    plan_json = """
-    {
-      "goal": "Create two properties",
-      "steps": [
-        {"step_number": 1, "agent": "properties", "action": "create property a", "expected_artifact_keys": ["property_id"], "risk_level": "medium"},
-        {"step_number": 2, "agent": "properties", "action": "create property b", "expected_artifact_keys": ["property_id"], "risk_level": "medium"}
-      ],
-      "overall_risk": "medium"
-    }
-    """
+async def test_execute_mode_errors_for_handler_less_agent():
+    from hubspot_agent.orchestrator import dispatch_agent
 
-    calls: list[tuple[str, str]] = []
-
-    async def fake_dispatch(agent_name, user_request, portal_config=None, mode="preview", **kwargs):
-        calls.append((agent_name, mode))
-        return AgentResult(
-            agent_name=agent_name,
-            status="preview" if mode == "preview" else "success",
-            data={"artifacts": {"property_id": f"prop-{len(calls)}"}},
-        )
-
-    with patch("hubspot_agent.orchestrator.spawn_agent", return_value=plan_json):
-        with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
-            result1 = await run_loop(
-                "create two properties", config, ".", "trace-resume",
-                approve_callback=lambda _: True,
-            )
-
-    assert "Step 1 (properties)" in result1
-    assert "Step 2 (properties)" in result1
-
-    # Second call with same request should clear completed state and start fresh
-    with patch("hubspot_agent.orchestrator.spawn_agent", return_value=plan_json):
-        with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
-            result2 = await run_loop(
-                "create two properties", config, ".", "trace-resume-2",
-                approve_callback=lambda _: True,
-            )
-
-    assert "Step 1 (properties)" in result2
-    assert "Step 2 (properties)" in result2
-
-
-@pytest.mark.asyncio
-async def test_run_loop_retry_then_succeed():
-    """Verification fails once then succeeds; loop should retry and complete."""
-    config = _portal_config()
-    plan_json = """
-    {
-      "goal": "Create a property",
-      "steps": [
-        {"step_number": 1, "agent": "properties", "action": "create property", "expected_artifact_keys": ["property_id"], "risk_level": "medium"}
-      ],
-      "overall_risk": "medium",
-      "max_iterations": 3
-    }
-    """
-
-    async def fake_dispatch(agent_name, user_request, portal_config=None, mode="preview", **kwargs):
-        return AgentResult(
-            agent_name=agent_name,
-            status="preview" if mode == "preview" else "success",
-            data={"artifacts": {"property_id": "prop-123"}},
-        )
-
-    verify_responses = [
-        '{"status": "mismatch", "mismatches": [{"field": "name", "expected": "A", "actual": "B"}]}',
-        '{"status": "verified", "checked_count": 1, "verified_count": 1, "message": "ok"}',
-    ]
-
-    with patch("hubspot_agent.orchestrator.spawn_agent", return_value=plan_json):
-        with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
-            with patch(
-                "hubspot_agent.sequential_dispatch.spawn_agent",
-                side_effect=verify_responses,
-            ):
-                result = await run_loop(
-                    "create property", config, ".", "trace-retry",
-                    approve_callback=lambda _: True,
-                )
-
-    assert "completed" in result
-    assert "prop-123" in result
-
-
-@pytest.mark.asyncio
-async def test_run_loop_plateau_escalates():
-    """Two identical verification mismatches trigger escalate/stop."""
-    config = _portal_config()
-    plan_json = """
-    {
-      "goal": "Create a property",
-      "steps": [
-        {"step_number": 1, "agent": "properties", "action": "create property", "expected_artifact_keys": ["property_id"], "risk_level": "medium"}
-      ],
-      "overall_risk": "medium",
-      "max_iterations": 3
-    }
-    """
-
-    async def fake_dispatch(agent_name, user_request, portal_config=None, mode="preview", **kwargs):
-        return AgentResult(
-            agent_name=agent_name,
-            status="preview" if mode == "preview" else "success",
-            data={"artifacts": {"property_id": "prop-123"}},
-        )
-
-    verify_response = '{"status": "mismatch", "mismatches": [{"field": "name", "expected": "A", "actual": "B"}]}'
-
-    with patch("hubspot_agent.orchestrator.spawn_agent", return_value=plan_json):
-        with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
-            with patch(
-                "hubspot_agent.sequential_dispatch.spawn_agent",
-                return_value=verify_response,
-            ):
-                result = await run_loop("create property", config, ".", "trace-plateau")
-
-    assert "halted" in result or "stopped" in result.lower()
+    # 'analytics' is a read-only agent with no execute handler registered.
+    # Executing it must return an error, not a fabricated "success" (which would
+    # otherwise claim a write happened and mislead the approve/undo path).
+    result = await dispatch_agent("analytics", "run a report", _portal_config(), mode="execute")
+    assert result.status == "error"
+    assert "no execute handler" in (result.error_message or "")
