@@ -141,7 +141,6 @@ def save(state: LoopState) -> Path:
     finally:
         fcntl.flock(dir_fd, fcntl.LOCK_UN)
         os.close(dir_fd)
-    path.chmod(0o600)
     return path
 
 

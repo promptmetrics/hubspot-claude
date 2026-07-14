@@ -143,6 +143,7 @@ def rpc_call(method: str, params: dict[str, Any], *, timeout: float = RPC_TIMEOU
 def start_daemon(portal_id: str, *, idle_timeout: float = DAEMON_IDLE_TIMEOUT) -> subprocess.Popen:
     """Lazily start the warm-client daemon detached (FR-15)."""
     plugin_data_dir().mkdir(parents=True, exist_ok=True)
+    os.chmod(plugin_data_dir(), 0o700)
     log = open(install_log_path(), "a")
     return subprocess.Popen(
         [sys.executable, "-m", "hubspot_agent.daemon", portal_id, "--idle-timeout", str(idle_timeout)],

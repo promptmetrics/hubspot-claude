@@ -80,6 +80,51 @@ def test_reap_expired_removes_old(monkeypatch, tmp_path):
     assert persistence.load("123", "act-1") is None
 
 
+# ---------------------------------------------------------------------------
+# M4: action_id / portal_id path traversal must not escape the pending dir
+# ---------------------------------------------------------------------------
+
+
+def test_load_traversal_action_id_returns_none(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    persistence.store("123", "act-1", {"x": 1})
+    assert persistence.load("123", "../../123/pending_previews/act-1") is None
+
+
+def test_clear_traversal_action_id_noop(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    # Decoy at the traversal target: CONFIG_DIR/123/pending_previews/../../123.json
+    decoy = tmp_path / "123.json"
+    decoy.write_text("{}")
+    persistence.clear("123", "../../123")
+    assert decoy.exists()
+
+
+def test_store_rejects_bad_action_id(monkeypatch, tmp_path):
+    import pytest
+
+    _isolate(monkeypatch, tmp_path)
+    for bad in ("../x", "a/b", "a.b", ""):
+        with pytest.raises(ValueError, match="Invalid action_id"):
+            persistence.store("123", bad, {"x": 1})
+
+
+def test_confirm_traversal_action_id_returns_false(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    decoy = tmp_path / "123.json"
+    decoy.write_text('{"required_confirmation": 1}')
+    assert persistence.confirm("123", "../../123", 1) is False
+    assert decoy.read_text() == '{"required_confirmation": 1}'
+
+
+def test_pending_dir_rejects_bad_portal_id(monkeypatch, tmp_path):
+    import pytest
+
+    _isolate(monkeypatch, tmp_path)
+    with pytest.raises(ValueError, match="Invalid portal_id"):
+        persistence.store("../evil", "act-1", {"x": 1})
+
+
 def test_store_byte_identical_serialization(monkeypatch, tmp_path):
     # Content must match the prior json.dumps(data, indent=2, default=str) shape.
     _isolate(monkeypatch, tmp_path)

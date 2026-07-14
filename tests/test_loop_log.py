@@ -13,6 +13,16 @@ def _clean_log(tmp_path, monkeypatch):
     yield
 
 
+def test_log_file_created_0o600():
+    # M2: the loop log can carry payload fragments; it must be 0600 from birth.
+    import os
+    import stat
+
+    log_event("12345678", "trace-1", "step_executed", {"step": 1})
+    path = _log_path("12345678")
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
 def test_log_event_appends():
     log_event("12345678", "trace-1", "step_executed", {"step": 1})
     path = _log_path("12345678")

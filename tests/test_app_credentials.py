@@ -7,6 +7,18 @@ from hubspot_agent.app_credentials import (
 )
 
 
+def test_save_app_credentials_sets_0o600(tmp_path, monkeypatch):
+    # M2: client_secret must be 0600 from birth, never briefly world-readable.
+    import os
+    import stat
+    from pathlib import Path
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    save_app_credentials(client_id="cid-123", client_secret="csec-456")
+    p = tmp_path / ".claude" / "hubspot" / "app_credentials.json"
+    assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
+
+
 def test_save_and_load_app_credentials(tmp_path, monkeypatch):
     from pathlib import Path
     monkeypatch.setattr(Path, "home", lambda: tmp_path)

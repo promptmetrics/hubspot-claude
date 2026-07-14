@@ -5,6 +5,7 @@ from typing import Any
 from hubspot_agent.client import HubSpotClient
 from hubspot_agent.errors import HubSpotError, RateLimitError, ScopeError
 from hubspot_agent.tools import tool
+from hubspot_agent.tools.objects import _validate_object_type
 
 
 @tool(name="hubspot_find_duplicates", description="Find duplicate HubSpot contacts by email, phone, or domain.")
@@ -14,6 +15,7 @@ async def hubspot_find_duplicates(
     client: HubSpotClient,
     portal_id: str,
 ) -> dict[str, Any]:
+    _validate_object_type(object_type, portal_id)
     try:
         query = {
             "filterGroups": [
@@ -82,6 +84,7 @@ async def hubspot_bulk_update_objects(
     client: HubSpotClient,
     portal_id: str,
 ) -> dict[str, Any]:
+    _validate_object_type(object_type, portal_id)
     errors: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
     succeeded = 0
@@ -118,6 +121,7 @@ async def hubspot_preview_segment(
     client: HubSpotClient,
     portal_id: str,
 ) -> dict[str, Any]:
+    _validate_object_type(object_type, portal_id)
     try:
         resp = await client.post(
             f"/crm/v3/objects/{object_type}/search",

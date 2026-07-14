@@ -1,5 +1,16 @@
 import os
+import stat
 from pathlib import Path
+
+
+def test_save_portal_config_sets_0o600(tmp_path, monkeypatch):
+    # M2: the portal JSON carries token + refresh_token and must be 0600 from
+    # birth (atomic replace), never briefly world-readable.
+    from hubspot_agent.config import PortalConfig, save_portal_config
+
+    monkeypatch.setattr("hubspot_agent.config.CONFIG_DIR", tmp_path)
+    save_portal_config(PortalConfig(portal_id="123", token="t"))
+    assert stat.S_IMODE(os.stat(tmp_path / "123.json").st_mode) == 0o600
 
 
 def test_detect_portal_from_file(tmp_path):
