@@ -81,3 +81,41 @@ async def test_route_serve_stop_real_integration(tmp_path, monkeypatch):
 
     assert not sock.exists()
     assert not pid_file.exists()
+
+
+def test_cli_fallback_envelope_on_unexpected_exception(monkeypatch, capsys):
+    """Bug 8b: an unhandled exception in the in-process fallback path must render
+    as the daemon-shaped NFR-15 envelope (``{"error": {"kind": "server", ...}}``),
+    not a raw traceback."""
+    import json as _json
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr("hubspot_agent.cli.hubspot_command", _boom)
+    # Non-tool, non-serve path → _cli_fallback.
+    assert router.route(["agents", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "Traceback" not in out
+    payload = _json.loads(out)
+    assert payload["error"]["kind"] == "server"
+    assert "kaboom" in payload["error"]["message"]
+    assert payload["error"]["retryable"] is True
+
+
+def test_cli_fallback_tool_envelope_on_unexpected_exception(monkeypatch, capsys):
+    """Bug 8b (tool path): the in-process tool fallback emits the same
+    daemon-shaped envelope when ``hubspot_command`` raises."""
+    import json as _json
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("tool-kaboom")
+
+    monkeypatch.setattr("hubspot_agent.cli.hubspot_command", _boom)
+    # No portal → daemon path skipped → _cli_fallback_tool.
+    monkeypatch.setattr("hubspot_agent.config.detect_default_portal", lambda wd: None)
+    assert router.route(["tool", "hubspot_search_objects", "--input", "{}"]) == 0
+    out = capsys.readouterr().out
+    assert "Traceback" not in out
+    payload = _json.loads(out)
+    assert payload["error"] == {"kind": "server", "message": "tool-kaboom", "retryable": True}

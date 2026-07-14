@@ -13,6 +13,7 @@ from hubspot_agent.redaction import redact_dict_for_disk
 
 EVENT_TYPES = frozenset({
     "request_received",
+    "loop_start",
     "webhook_received",
     "route_decision",
     "tool_call",

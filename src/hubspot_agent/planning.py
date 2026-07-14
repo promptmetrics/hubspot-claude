@@ -4,7 +4,32 @@ import json
 import re
 from typing import Any
 
+from pydantic import ValidationError
+
 from hubspot_agent.models import LoopPlan, PlanStep, RiskLevel, VerificationResult
+
+# First field error from the most recent parse_plan call, if it failed on a
+# pydantic ValidationError (well-formed JSON, bad shape).  Reset at the top of
+# every call so it never leaks across invocations.  Read via
+# :func:`last_parse_error` to enrich the "Could not parse" message with the
+# offending field rather than a bare traceback.
+_last_parse_error: str | None = None
+
+
+def last_parse_error() -> str | None:
+    """First field error from the most recent :func:`parse_plan` call, if any."""
+    return _last_parse_error
+
+
+def _first_validation_error(exc: ValidationError) -> str:
+    """Render the first pydantic field error as ``"<loc>: <msg>"``."""
+    errors = exc.errors()
+    if not errors:
+        return str(exc)
+    first = errors[0]
+    loc = ".".join(str(p) for p in first.get("loc", ()))
+    msg = first.get("msg", "invalid")
+    return f"{loc}: {msg}" if loc else msg
 
 
 def _extract_json(text: str) -> str | None:
@@ -47,7 +72,17 @@ def _extract_json(text: str) -> str | None:
 
 
 def parse_plan(text: str) -> LoopPlan | None:
-    """Parse a LoopPlan JSON string (possibly wrapped in Markdown) into a LoopPlan."""
+    """Parse a LoopPlan JSON string (possibly wrapped in Markdown) into a LoopPlan.
+
+    Returns ``None`` for unparseable JSON *or* a pydantic ``ValidationError`` (e.g.
+    ``prerequisites: [1]`` — pydantic v2 won't coerce an int to ``list[str]``).
+    On a ``ValidationError`` the first field error is stashed for
+    :func:`last_parse_error` so callers can surface *which* field was bad
+    instead of a raw traceback.
+    """
+    global _last_parse_error
+    _last_parse_error = None
+
     json_text = _extract_json(text)
     if not json_text:
         return None
@@ -59,43 +94,47 @@ def parse_plan(text: str) -> LoopPlan | None:
     if not isinstance(data, dict):
         return None
 
-    # Normalize steps
-    raw_steps = data.get("steps", [])
-    steps: list[PlanStep] = []
-    for raw in raw_steps:
-        if not isinstance(raw, dict):
-            continue
-        risk = raw.get("risk_level")
-        risk_level = RiskLevel(risk.lower()) if isinstance(risk, str) else None
-        steps.append(
-            PlanStep(
-                step_number=raw.get("step_number", 0),
-                agent=raw.get("agent", ""),
-                action=raw.get("action", ""),
-                description=raw.get("description"),
-                hubspot_endpoint=raw.get("hubspot_endpoint"),
-                payload_summary=raw.get("payload_summary", {}),
-                validation_rules=raw.get("validation_rules", []),
-                expected_artifact_keys=raw.get("expected_artifact_keys", []),
-                prerequisites=raw.get("prerequisites", []),
-                risk_level=risk_level,
-            )
-        )
-
-    overall_risk = data.get("overall_risk", "low")
     try:
-        overall_risk_level = RiskLevel(overall_risk.lower())
-    except ValueError:
-        overall_risk_level = RiskLevel.LOW
+        # Normalize steps
+        raw_steps = data.get("steps", [])
+        steps: list[PlanStep] = []
+        for raw in raw_steps:
+            if not isinstance(raw, dict):
+                continue
+            risk = raw.get("risk_level")
+            risk_level = RiskLevel(risk.lower()) if isinstance(risk, str) else None
+            steps.append(
+                PlanStep(
+                    step_number=raw.get("step_number", 0),
+                    agent=raw.get("agent", ""),
+                    action=raw.get("action", ""),
+                    description=raw.get("description"),
+                    hubspot_endpoint=raw.get("hubspot_endpoint"),
+                    payload_summary=raw.get("payload_summary", {}),
+                    validation_rules=raw.get("validation_rules", []),
+                    expected_artifact_keys=raw.get("expected_artifact_keys", []),
+                    prerequisites=raw.get("prerequisites", []),
+                    risk_level=risk_level,
+                )
+            )
 
-    return LoopPlan(
-        goal=data.get("goal", ""),
-        success_criteria=data.get("success_criteria", []),
-        steps=steps,
-        overall_risk=overall_risk_level,
-        max_iterations=data.get("max_iterations", 3),
-        artifact_schema=data.get("artifact_schema", {}),
-    )
+        overall_risk = data.get("overall_risk", "low")
+        try:
+            overall_risk_level = RiskLevel(overall_risk.lower())
+        except ValueError:
+            overall_risk_level = RiskLevel.LOW
+
+        return LoopPlan(
+            goal=data.get("goal", ""),
+            success_criteria=data.get("success_criteria", []),
+            steps=steps,
+            overall_risk=overall_risk_level,
+            max_iterations=data.get("max_iterations", 3),
+            artifact_schema=data.get("artifact_schema", {}),
+        )
+    except ValidationError as exc:
+        _last_parse_error = _first_validation_error(exc)
+        return None
 
 
 def validate_plan(plan: LoopPlan, capability_matrix: dict[str, bool] | None = None) -> list[str]:

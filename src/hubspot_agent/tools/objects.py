@@ -145,13 +145,17 @@ _BATCH_SIZE = 100
 
 def _partition_records(
     records: list[dict[str, Any]], unique_key: str
-) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], int]:
     seen: dict[str, dict[str, Any]] = {}
     creates: list[dict[str, Any]] = []
     updates: list[dict[str, Any]] = []
+    skipped_duplicates = 0
     for record in records:
         key = str(record.get(unique_key, "")).lower().strip()
         if key and key in seen:
+            # Bug 8d: a repeated unique_key is dropped silently — count it so the
+            # result's succeeded + failed + skipped_duplicates reconciles to total.
+            skipped_duplicates += 1
             continue
         if key:
             seen[key] = record
@@ -163,7 +167,7 @@ def _partition_records(
             updates.append({"id": str(obj_id), "properties": props})
         else:
             creates.append({"properties": props})
-    return seen, creates, updates
+    return seen, creates, updates, skipped_duplicates
 
 
 def _chunk(inputs: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
@@ -180,7 +184,7 @@ async def hubspot_batch_upsert_objects(
     action_id: str | None = None,
 ) -> dict[str, Any]:
     _validate_object_type(object_type, portal_id)
-    _, creates, updates = _partition_records(records, unique_key)
+    _, creates, updates, skipped_duplicates = _partition_records(records, unique_key)
 
     import uuid
     aid = action_id or str(uuid.uuid4())[:8]
@@ -255,6 +259,7 @@ async def hubspot_batch_upsert_objects(
     return {
         "succeeded": created_count + updated_count,
         "failed": len(errors),
+        "skipped_duplicates": skipped_duplicates,
         "total": len(records),
         "results": results,
         "errors": errors,

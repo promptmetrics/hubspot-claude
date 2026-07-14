@@ -81,6 +81,17 @@ The plugin ships a single entrypoint at `${CLAUDE_PLUGIN_ROOT}/bin/hubspot` (a P
 
 `--portal` and `--working-dir` are top-level flags and must precede any JSON `--input` value.
 
+### Date / datetime filters (epoch-milliseconds)
+
+HubSpot stores date and datetime property values (`createdate`, `closedate`,
+`hs_lastmodifieddate`, `lastmodifieddate`, etc.) as **epoch-milliseconds**.
+When a search filter targets a date/datetime property, the comparison `value`
+must be epoch-milliseconds — not an ISO-8601 string and not seconds-epoch. An
+ISO string or seconds value mis-compares and silently returns wrong or empty
+results. The agent charters carry this caveat; if you build filters by hand
+(via `hubspot tool hubspot_search_objects --input '{...}'`), convert the date
+to epoch-ms (milliseconds since 1970-01-01 UTC) before sending.
+
 ## Skills (specialist agents)
 
 The 44 specialist sub-agents live in `src/hubspot_agent/agents/` and are surfaced by the registry. Discover them at runtime rather than hardcoding:
