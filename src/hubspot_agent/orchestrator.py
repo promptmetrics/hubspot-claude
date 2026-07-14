@@ -415,10 +415,16 @@ async def dispatch_agent(
                     "action_id": action_id,
                     "preview": preview_text,
                     "risk_level": preview.risk_level.value,
-                    "impact_type": intent.intent_type,
+                    # ``intent_type`` (not ``impact_type``): the durable-loop
+                    # executor reads this key to decide undoability and to record
+                    # created IDs.  ``proposed_payload`` carries the persisted
+                    # write body so the loop's execute pass sends the intended
+                    # payload instead of an empty dict.
+                    "intent_type": intent.intent_type,
                     "target_object": intent.target_object,
                     "impact_count": preview.impact_count,
                     "original_values": preview.original_values,
+                    "proposed_payload": aw.preview_data.get("proposed_payload", {}),
                     "full_prompt": prompt.system_prompt,
                 },
                 informing_sources=normalized_sources,
@@ -603,8 +609,12 @@ async def run_loop(
     if existing_state is not None:
         if (
             loop_state.is_stale(existing_state)
-            or existing_state.request_text != request_text
-            or existing_state.status in {"completed", "failed", "escalated", "stop"}
+            # ``escalate``/``stop`` are the terminal statuses written by the
+            # controller (see below: ``state.status = controller_action.action``).
+            # The value is ``escalate``, not ``escalated`` — the old spelling
+            # never matched, so an escalated loop resumed and re-ran the write
+            # that triggered the human-review halt.
+            or existing_state.status in {"completed", "failed", "escalate", "stop"}
         ):
             loop_state.clear(portal_id)
             existing_state = None

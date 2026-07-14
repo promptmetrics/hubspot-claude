@@ -49,7 +49,10 @@ async def test_run_loop_validates_plan_and_executes():
 
     with patch("hubspot_agent.orchestrator.spawn_agent", return_value=plan_json):
         with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
-            result = await run_loop("create property renewal_date", config, ".", "trace-2")
+            result = await run_loop(
+                "create property renewal_date", config, ".", "trace-2",
+                approve_callback=lambda _: True,
+            )
 
     assert "Goal:" in result
     assert "prop-123" in result
@@ -167,6 +170,7 @@ async def test_run_loop_acceptance_property_and_workflow():
                 config,
                 ".",
                 "acceptance-1",
+                approve_callback=lambda _: True,
             )
 
     assert "prop-renewal-123" in result
@@ -204,7 +208,10 @@ async def test_run_loop_resumes_from_saved_state():
 
     with patch("hubspot_agent.orchestrator.spawn_agent", return_value=plan_json):
         with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
-            result1 = await run_loop("create two properties", config, ".", "trace-resume")
+            result1 = await run_loop(
+                "create two properties", config, ".", "trace-resume",
+                approve_callback=lambda _: True,
+            )
 
     assert "Step 1 (properties)" in result1
     assert "Step 2 (properties)" in result1
@@ -212,7 +219,10 @@ async def test_run_loop_resumes_from_saved_state():
     # Second call with same request should clear completed state and start fresh
     with patch("hubspot_agent.orchestrator.spawn_agent", return_value=plan_json):
         with patch("hubspot_agent.orchestrator.dispatch_agent", fake_dispatch):
-            result2 = await run_loop("create two properties", config, ".", "trace-resume-2")
+            result2 = await run_loop(
+                "create two properties", config, ".", "trace-resume-2",
+                approve_callback=lambda _: True,
+            )
 
     assert "Step 1 (properties)" in result2
     assert "Step 2 (properties)" in result2
@@ -251,7 +261,10 @@ async def test_run_loop_retry_then_succeed():
                 "hubspot_agent.sequential_dispatch.spawn_agent",
                 side_effect=verify_responses,
             ):
-                result = await run_loop("create property", config, ".", "trace-retry")
+                result = await run_loop(
+                    "create property", config, ".", "trace-retry",
+                    approve_callback=lambda _: True,
+                )
 
     assert "completed" in result
     assert "prop-123" in result

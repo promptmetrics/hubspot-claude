@@ -217,6 +217,20 @@ def _format_tool_response(resp: dict[str, Any]) -> str:
     return json.dumps(data, indent=2, default=str)  # write preview → match cli._tool_write
 
 
+def _is_portal_mismatch(resp: dict[str, Any]) -> bool:
+    """True if the daemon rejected the call because it serves another portal."""
+    err = resp.get("error")
+    return isinstance(err, dict) and err.get("kind") == "portal_mismatch"
+
+
+def _rpc_tool(params: dict[str, Any]) -> dict[str, Any] | None:
+    """One ``tool`` RPC; None on any transport/parse failure."""
+    try:
+        return rpc_call("tool", params)
+    except (OSError, TimeoutError, json.JSONDecodeError):
+        return None
+
+
 def _daemon_tool_path(tokens: list[str], portal_id: str) -> str | None:
     """Try the warm-client daemon for a tool call.  Return formatted output or
     None when the daemon path fails (caller falls back to the in-process CLI)."""
@@ -224,9 +238,19 @@ def _daemon_tool_path(tokens: list[str], portal_id: str) -> str | None:
         tool_name, tool_input = _parse_tool_argv(tokens)
     except ValueError as exc:
         return f"Usage: hubspot tool <name> [--input <json>|-]\n  error: {exc}"
-    params = {"tool_name": tool_name, "input": tool_input, "batch_mode": "single"}
+    # The socket is global (one per plugin data dir), so a live daemon may serve a
+    # different portal than requested.  Send the target portal so the daemon can
+    # reject a mismatch; on rejection we restart it bound to the right portal
+    # below.  Without this a `--portal B` call silently hits a daemon warmed for
+    # portal A (reads A's data, stores the write preview under A).
+    params = {
+        "tool_name": tool_name,
+        "input": tool_input,
+        "batch_mode": "single",
+        "portal_id": portal_id,
+    }
 
-    # Attempt 1: reuse a live daemon, else lazy-start one.
+    # Attempt 1: reuse a live daemon, else lazy-start one for this portal.
     if not is_daemon_alive():
         try:
             start_daemon(portal_id)
@@ -234,12 +258,12 @@ def _daemon_tool_path(tokens: list[str], portal_id: str) -> str | None:
             return None
         if not _wait_for_socket():
             return None
-    try:
-        return _format_tool_response(rpc_call("tool", params))
-    except (OSError, TimeoutError, json.JSONDecodeError):
-        pass
+    resp = _rpc_tool(params)
+    if resp is not None and not _is_portal_mismatch(resp):
+        return _format_tool_response(resp)
 
-    # Attempt 2: crash recovery — kill + restart + retry once (FR-15).
+    # Attempt 2: the live daemon serves a different portal, or the RPC failed —
+    # kill it, restart one bound to THIS portal, and retry once (FR-15).
     _kill_daemon()
     try:
         start_daemon(portal_id)
@@ -247,10 +271,10 @@ def _daemon_tool_path(tokens: list[str], portal_id: str) -> str | None:
         return None
     if not _wait_for_socket():
         return None
-    try:
-        return _format_tool_response(rpc_call("tool", params))
-    except (OSError, TimeoutError, json.JSONDecodeError):
+    resp = _rpc_tool(params)
+    if resp is None:
         return None
+    return _format_tool_response(resp)
 
 
 def _cli_fallback(remaining: list[str], working_dir: str, portal_id: str | None) -> str:

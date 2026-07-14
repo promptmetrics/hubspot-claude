@@ -1038,9 +1038,9 @@ async def _tool_write(tool_name, portal_id, portal_config, tool_input, required_
     from hubspot_agent.cache import ensure_custom_schema_cached
 
     await ensure_custom_schema_cached(portal_config, tool_input.get("object_type") if isinstance(tool_input, dict) else None)
-    risk = _tool_risk_level(required_scopes)
+    risk = _tool_risk_level(required_scopes, tool_name, tool_input)
     intent = TaskIntent(
-        intent_type=_tool_intent_type(tool_name),
+        intent_type=_tool_intent_type(tool_name, tool_input),
         target_object=tool_input.get("object_type") if isinstance(tool_input, dict) else None,
         description=f"tool {tool_name}",
         risk_level=risk,
@@ -1115,7 +1115,7 @@ def _handle_tool(args: str, working_dir: str, portal_id: str | None) -> str:
         if missing:
             return _tool_scope_error(tool_name, missing)
 
-    if _is_write_tool(required, tool_name):
+    if _is_write_tool(required, tool_name, tool_input):
         return _run_async(_tool_write, tool_name, portal_id, portal_config, tool_input, required)
     return _run_async(_tool_read, tool_name, portal_id, portal_config, tool_input)
 

@@ -294,6 +294,108 @@ def test_tool_write_scope_blocked(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# H1 regression: mutating tools whose registry scope set is empty or read-only
+# must still route through the HITL apply_write gate (not invoke_tool direct).
+# scope_registry maps these to set()/read scopes (their CRM scopes aren't
+# requested at authorize time, or they use single read+write scopes like
+# ``forms``/``reports``), so classification relies on WRITE_TOOLS membership.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "tool_name, tool_input",
+    [
+        ("hubspot_create_refund", {"payment_id": "p-1", "amount": 5.0, "reason": "x"}),
+        ("hubspot_import_data", {"import_name": "n", "import_file": "f.csv", "object_type": "contacts"}),
+        ("hubspot_export_data", {"export_name": "n", "object_type": "contacts", "properties": ["email"]}),
+        ("hubspot_create_form", {"name": "n", "form_type": "regular", "fields": []}),
+        ("hubspot_create_report", {"name": "n", "data_source": "deals", "metrics": ["count"]}),
+        ("hubspot_create_dashboard", {"name": "n", "report_ids": ["r-1"]}),
+        ("hubspot_schedule_email", {"name": "n", "resource_id": "r-1", "resource_type": "report", "recipients": ["a@example.com"], "frequency": "weekly"}),
+    ],
+)
+def test_empty_scope_write_tools_route_through_apply_write(tmp_path, monkeypatch, tool_name, tool_input):
+    cli, _ = _bootstrap_portal(tmp_path, monkeypatch)
+
+    captured: dict = {}
+
+    async def fake_apply_write(*, client, portal_config, preview_builder, **kwargs):
+        captured.update(kwargs)
+        return _fake_apply_write_result(kwargs.get("tool_name", tool_name))
+
+    # If the tool wrongly took the read path, invoke_tool would run instead;
+    # make that fail loudly so a regression can't pass silently.
+    async def boom_invoke(*args, **kwargs):
+        raise AssertionError(f"{tool_name} bypassed HITL and hit invoke_tool")
+
+    monkeypatch.setattr(cli, "_apply_write", fake_apply_write)
+    monkeypatch.setattr(cli, "invoke_tool", boom_invoke)
+
+    out = hubspot_command(
+        f"tool {tool_name} --input {json.dumps(tool_input)}",
+        working_dir=str(tmp_path),
+    )
+    payload = json.loads(out)
+    assert payload["status"] == "preview"
+    assert captured["tool_name"] == tool_name
+    assert captured["agent_name"] is None
+
+
+def test_raw_api_get_is_read_path(tmp_path, monkeypatch):
+    """raw_api GET is a read: it must go through invoke_tool, not apply_write."""
+    cli, _ = _bootstrap_portal(tmp_path, monkeypatch)
+
+    seen: dict = {}
+
+    async def mock_invoke(tool_name, portal_id, **kwargs):
+        seen["tool"] = tool_name
+        return {"results": []}
+
+    async def boom_apply_write(**kwargs):
+        raise AssertionError("raw_api GET wrongly routed through apply_write")
+
+    monkeypatch.setattr(cli, "invoke_tool", mock_invoke)
+    monkeypatch.setattr(cli, "_apply_write", boom_apply_write)
+
+    out = hubspot_command(
+        'tool hubspot_raw_api --input {"method":"GET","path":"/crm/v3/objects/contacts"}',
+        working_dir=str(tmp_path),
+    )
+    assert seen["tool"] == "hubspot_raw_api"
+    assert json.loads(out) == {"results": []}
+
+
+@pytest.mark.parametrize("method", ["POST", "PATCH", "DELETE"])
+def test_raw_api_mutating_methods_route_through_apply_write(tmp_path, monkeypatch, method):
+    """raw_api POST/PATCH/DELETE are writes: they must hit the HITL gate, and
+    DELETE must be classified destructive so the count gate fires."""
+    cli, _ = _bootstrap_portal(tmp_path, monkeypatch)
+
+    captured: dict = {}
+
+    async def fake_apply_write(*, client, portal_config, preview_builder, **kwargs):
+        captured.update(kwargs)
+        return _fake_apply_write_result("hubspot_raw_api")
+
+    async def boom_invoke(*args, **kwargs):
+        raise AssertionError(f"raw_api {method} bypassed HITL and hit invoke_tool")
+
+    monkeypatch.setattr(cli, "_apply_write", fake_apply_write)
+    monkeypatch.setattr(cli, "invoke_tool", boom_invoke)
+
+    out = hubspot_command(
+        f'tool hubspot_raw_api --input {{"method":"{method}","path":"/crm/v3/objects/contacts/1"}}',
+        working_dir=str(tmp_path),
+    )
+    payload = json.loads(out)
+    assert payload["status"] == "preview"
+    assert captured["tool_name"] == "hubspot_raw_api"
+    if method == "DELETE":
+        assert captured["intent"].intent_type == "delete"
+        assert captured["intent"].risk_level == RiskLevel.DESTRUCTIVE
+
+
+# ---------------------------------------------------------------------------
 # Execute path: approve a tool-initiated preview
 # ---------------------------------------------------------------------------
 
