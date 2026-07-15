@@ -6,6 +6,7 @@ from hubspot_agent.client import HubSpotClient
 from hubspot_agent.errors import HubSpotError, RateLimitError, ScopeError
 from hubspot_agent.tools import tool
 from hubspot_agent.tools.objects import _validate_object_type
+from hubspot_agent.validation import validate_properties
 
 
 _BATCH_SIZE = 100
@@ -128,7 +129,90 @@ async def hubspot_merge_objects(
         return {"error": str(exc), "tool": "hubspot_merge_objects"}
 
 
-@tool(name="hubspot_bulk_update_objects", description="Bulk update HubSpot objects.")
+def validate_bulk_update_records(records: list[Any]) -> list[dict[str, Any]]:
+    """Shape-check batch-update records; return one error dict per bad record.
+
+    HubSpot's ``/batch/update`` applies only each input's ``properties``
+    sub-object and answers 200 (echoing the OLD values) for an input without
+    one — so a flat record like ``{"id": ..., "closedate": ...}`` executes as
+    a silent no-op counted as success.  The shape must therefore be refused
+    before any HTTP call rather than forwarded verbatim.
+    """
+    if not isinstance(records, list) or not records:
+        return [{"index": None, "reason": "records must be a non-empty list"}]
+
+    errors: list[dict[str, Any]] = []
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            errors.append({"index": index, "reason": "record must be an object with 'id' and 'properties'"})
+            continue
+        if not record.get("id") and not record.get("hs_object_id"):
+            errors.append({"index": index, "reason": "record is missing a non-empty 'id'"})
+            continue
+        properties = record.get("properties")
+        if not isinstance(properties, dict) or not properties:
+            errors.append({
+                "index": index,
+                "reason": (
+                    "record has no non-empty 'properties' object — flat record shape; "
+                    "wrap property values in 'properties' ({\"id\": ..., \"properties\": {...}})"
+                ),
+            })
+            continue
+        extra = set(record) - {"id", "hs_object_id", "idProperty", "properties"}
+        if extra:
+            errors.append({
+                "index": index,
+                "reason": (
+                    f"unexpected top-level keys {sorted(extra)} — property values belong inside 'properties'"
+                ),
+            })
+    return errors
+
+
+def _tolerant_equal(requested: Any, echoed: Any) -> bool:
+    return str(requested).strip() == str(echoed).strip()
+
+
+def _verify_echoed_results(
+    records: list[dict[str, Any]], results: list[dict[str, Any]]
+) -> dict[str, int]:
+    """Advisory check of HubSpot's echo against the requested values.
+
+    ``/batch/update`` echoes each record as it looks after the write, so an
+    echo still carrying the old values means the update silently didn't apply.
+    A record is *verified* only when at least one requested key is present in
+    its echo and every present key matches (tolerant string compare — HubSpot
+    normalizes dates/numbers on echo, so absent keys are skipped rather than
+    counted against).  Advisory only: never alters ``succeeded``/``failed``.
+    """
+    echoed_by_id = {
+        str(r.get("id")): r.get("properties") or {} for r in results if isinstance(r, dict)
+    }
+    verified = 0
+    unverified = 0
+    for record in records:
+        requested = record.get("properties") or {}
+        echo = echoed_by_id.get(str(record.get("id") or record.get("hs_object_id")))
+        comparable = 0 if echo is None else sum(1 for k in requested if k in echo)
+        if echo is not None and comparable and all(
+            _tolerant_equal(v, echo[k]) for k, v in requested.items() if k in echo
+        ):
+            verified += 1
+        else:
+            unverified += 1
+    return {"verified": verified, "unverified": unverified}
+
+
+@tool(
+    name="hubspot_bulk_update_objects",
+    description=(
+        "Bulk update HubSpot objects. Each record MUST be shaped "
+        '{"id": "<record id>", "properties": {"<property>": <value>, ...}} — '
+        "flat records (property keys at the top level) or records with an "
+        "empty 'properties' object are rejected before any API call."
+    ),
+)
 async def hubspot_bulk_update_objects(
     object_type: str,
     records: list[dict[str, Any]],
@@ -136,6 +220,25 @@ async def hubspot_bulk_update_objects(
     portal_id: str,
 ) -> dict[str, Any]:
     _validate_object_type(object_type, portal_id)
+    shape_errors = validate_bulk_update_records(records)
+    if shape_errors:
+        return {
+            "error": "validation_failed",
+            "tool": "hubspot_bulk_update_objects",
+            "validation_errors": shape_errors,
+        }
+    for index, record in enumerate(records):
+        validation = validate_properties(object_type, record["properties"], portal_id)
+        if not validation["valid"]:
+            return {
+                "error": "validation_failed",
+                "tool": "hubspot_bulk_update_objects",
+                "validation_errors": [
+                    {"index": index, **err} for err in validation["errors"]
+                ],
+                "refreshed": validation.get("refreshed", False),
+            }
+
     errors: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
     succeeded = 0
@@ -162,6 +265,7 @@ async def hubspot_bulk_update_objects(
         "total": len(records),
         "results": results,
         "errors": errors,
+        "verification": _verify_echoed_results(records, results),
     }
 
 

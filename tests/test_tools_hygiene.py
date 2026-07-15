@@ -202,6 +202,153 @@ async def test_find_duplicates_paginates_across_pages(respx_mock):
     await c.close()
 
 
+# ---------------------------------------------------------------------------
+# Bug A (0.2.4): bulk update silently no-opped on mis-shaped records.  HubSpot's
+# /batch/update applies only each input's ``properties`` sub-object; a flat
+# record ({"id": ..., "closedate": ...}) or empty ``properties`` produces an
+# empty update that returns 200 echoing the OLD values, which the tool counted
+# as "succeeded".  The tool must reject the shape before any HTTP call and
+# report advisory verification of the echoed values.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_rejects_flat_records(respx_mock):
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    route = respx_mock.post("https://api.hubapi.com/crm/v3/objects/deals/batch/update").mock(
+        return_value=httpx.Response(200, json={"results": [], "errors": []})
+    )
+    result = await hubspot_bulk_update_objects(
+        object_type="deals",
+        records=[
+            {"id": "1", "properties": {"closedate": "2026-09-30"}},
+            {"id": "2", "closedate": "2026-09-30"},
+        ],
+        client=c,
+        portal_id="123",
+    )
+    assert result["error"] == "validation_failed"
+    assert result["tool"] == "hubspot_bulk_update_objects"
+    reasons = {e["index"]: e["reason"] for e in result["validation_errors"]}
+    assert 1 in reasons and "properties" in reasons[1]
+    assert 0 not in reasons
+    assert len(route.calls) == 0  # rejected before any HTTP call
+    await c.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_record",
+    [
+        {"id": "1"},  # properties missing
+        {"id": "1", "properties": {}},  # properties empty
+        {"id": "1", "properties": "closedate=2026-09-30"},  # properties not a dict
+        {"properties": {"closedate": "2026-09-30"}},  # id missing
+        "not-a-dict",
+    ],
+)
+async def test_bulk_update_rejects_empty_or_malformed_records(respx_mock, bad_record):
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    route = respx_mock.post("https://api.hubapi.com/crm/v3/objects/deals/batch/update").mock(
+        return_value=httpx.Response(200, json={"results": [], "errors": []})
+    )
+    result = await hubspot_bulk_update_objects(
+        object_type="deals", records=[bad_record], client=c, portal_id="123"
+    )
+    assert result["error"] == "validation_failed"
+    assert result["validation_errors"][0]["index"] == 0
+    assert len(route.calls) == 0
+    await c.close()
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_rejects_empty_records_list(respx_mock):
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    result = await hubspot_bulk_update_objects(object_type="deals", records=[], client=c, portal_id="123")
+    assert result["error"] == "validation_failed"
+    assert len(respx_mock.calls) == 0
+    await c.close()
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_sends_properties_in_outbound_body(respx_mock):
+    """The regression test that would have caught Bug A: assert the actual
+    HTTP body, not just the tool's success envelope."""
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    route = respx_mock.post("https://api.hubapi.com/crm/v3/objects/deals/batch/update").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"id": "1", "properties": {"closedate": "2026-09-30"}},
+                    {"id": "2", "properties": {"closedate": "2026-09-30"}},
+                ],
+                "errors": [],
+            },
+        )
+    )
+    records = [
+        {"id": "1", "properties": {"closedate": "2026-09-30"}},
+        {"id": "2", "properties": {"closedate": "2026-09-30"}},
+    ]
+    result = await hubspot_bulk_update_objects(object_type="deals", records=records, client=c, portal_id="123")
+    assert result["succeeded"] == 2
+    import json as _json
+    body = _json.loads(route.calls[0].request.content)
+    assert body["inputs"] == records
+    for inp in body["inputs"]:
+        assert inp["properties"], "batch/update input must carry non-empty properties"
+    await c.close()
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_reports_unverified_on_echoed_old_values(respx_mock):
+    """A 200 echoing the OLD values must show up as unverified — never as a
+    silent success.  ``succeeded`` stays count-based (advisory verification
+    does not flip it)."""
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    respx_mock.post("https://api.hubapi.com/crm/v3/objects/deals/batch/update").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [{"id": "1", "properties": {"closedate": "2025-12-10"}}],  # old value echoed
+                "errors": [],
+            },
+        )
+    )
+    result = await hubspot_bulk_update_objects(
+        object_type="deals",
+        records=[{"id": "1", "properties": {"closedate": "2026-09-30"}}],
+        client=c,
+        portal_id="123",
+    )
+    assert result["succeeded"] == 1  # unchanged semantics
+    assert result["verification"] == {"verified": 0, "unverified": 1}
+    await c.close()
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_reports_verified_on_echoed_new_values(respx_mock):
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    respx_mock.post("https://api.hubapi.com/crm/v3/objects/deals/batch/update").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [{"id": "1", "properties": {"closedate": "2026-09-30", "hs_lastmodifieddate": "x"}}],
+                "errors": [],
+            },
+        )
+    )
+    result = await hubspot_bulk_update_objects(
+        object_type="deals",
+        records=[{"id": "1", "properties": {"closedate": "2026-09-30"}}],
+        client=c,
+        portal_id="123",
+    )
+    assert result["verification"] == {"verified": 1, "unverified": 0}
+    await c.close()
+
+
 @pytest.mark.asyncio
 async def test_find_duplicates_reports_truncated_at_scan_cap(respx_mock, monkeypatch):
     from hubspot_agent.tools import hygiene as hygiene_mod

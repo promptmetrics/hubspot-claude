@@ -240,6 +240,27 @@ async def handle_tool(client, cache, portal_config: PortalConfig, params: dict[s
         raise HandlerError("validation", "'input' must be a JSON object.")
     target_object = tool_input.get("object_type") if isinstance(tool_input, dict) else None
 
+    if tool_name == "hubspot_bulk_update_objects":
+        # Bug A (0.2.4): a mis-shaped record (flat keys, empty ``properties``)
+        # makes HubSpot's /batch/update a silent no-op that still returns 200,
+        # so it must be refused HERE — before a pending preview is persisted —
+        # or a human is asked to approve a write that can never apply.
+        from hubspot_agent.tools.hygiene import validate_bulk_update_records
+
+        shape_errors = validate_bulk_update_records(tool_input.get("records"))
+        if shape_errors:
+            details = "; ".join(
+                f"record[{e['index']}]: {e['reason']}" for e in shape_errors
+            )
+            raise HandlerError(
+                "validation",
+                f"hubspot_bulk_update_objects records failed shape validation: {details}",
+                guidance=(
+                    'Each record must be {"id": "<record id>", "properties": {...}} '
+                    "with a non-empty properties object; wrap flat property keys in 'properties'."
+                ),
+            )
+
     required_scopes = get_required_scopes([tool_name], target_object)
     _check_tool_scope(tool_name, portal_config, target_object)
 

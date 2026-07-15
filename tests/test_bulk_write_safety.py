@@ -19,7 +19,7 @@ import pytest
 
 from hubspot_agent.cli import hubspot_command
 from hubspot_agent.config import PortalConfig, save_portal_config
-from hubspot_agent.handlers import execute_pending_write, handle_tool
+from hubspot_agent.handlers import HandlerError, execute_pending_write, handle_tool
 
 
 class _FakeClient:
@@ -109,6 +109,31 @@ async def test_bulk_update_bare_approve_refused_then_exact_count_executes(portal
     assert snapshot["original_values"] == originals
     assert snapshot["metadata"]["intent_type"] == "update"
     assert snapshot["metadata"]["undoable"] is True
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_flat_records_rejected_at_preview(portal_dir):
+    """Bug A (0.2.4): a mis-shaped bulk payload must fail at preview time —
+    a human should never be asked to approve a doomed write, and no pending
+    action may be persisted for it."""
+    flat_input = {
+        "object_type": "contacts",
+        "records": [
+            {"id": "c-1", "firstname": "New1"},  # flat: property not wrapped
+            {"id": "c-2", "firstname": "New2"},
+        ],
+    }
+    portal_config = PortalConfig(portal_id="123", token="test-token")
+    with pytest.raises(HandlerError) as exc:
+        await handle_tool(
+            _FakeClient(), None, portal_config,
+            {"tool_name": "hubspot_bulk_update_objects", "input": flat_input},
+        )
+    assert exc.value.error["kind"] == "validation"
+    assert "properties" in str(exc.value)
+
+    pending_dir = portal_dir / "123" / "pending_previews"
+    assert not pending_dir.exists() or not any(pending_dir.iterdir())
 
 
 def test_bulk_update_undo_restores_all_records(portal_dir):
