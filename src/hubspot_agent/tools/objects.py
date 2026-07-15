@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from hubspot_agent.checkpoint import CheckpointManager
 from hubspot_agent.client import HubSpotClient
@@ -31,11 +31,15 @@ async def hubspot_get_object(
     object_type: str,
     client: HubSpotClient,
     portal_id: str,
+    properties: list[str] | None = None,
 ) -> dict[str, Any]:
     _validate_object_type(object_type, portal_id)
+    path = f"/crm/v3/objects/{object_type}/{quote(object_id, safe='')}"
+    if properties:
+        path += "?" + urlencode({"properties": ",".join(properties)})
     try:
         resp = await client.get(
-            f"/crm/v3/objects/{object_type}/{quote(object_id, safe='')}",
+            path,
             portal_id=portal_id,
             expected_scopes=[f"crm.objects.{object_type}.read"],
         )

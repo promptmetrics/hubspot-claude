@@ -25,6 +25,23 @@ async def test_hubspot_get_object(respx_mock):
 
 
 @pytest.mark.asyncio
+async def test_hubspot_get_object_scopes_requested_properties(respx_mock):
+    # Bug B (0.2.4): snapshot pre-fetches must scope the GET to the properties
+    # being changed so undo snapshots don't carry read-only system fields.
+    c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
+    route = respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(
+        return_value=httpx.Response(200, json={"id": "1", "properties": {"email": "a@b.com"}})
+    )
+    result = await hubspot_get_object(
+        object_id="1", object_type="contacts", client=c, portal_id="123",
+        properties=["email", "firstname"],
+    )
+    assert result["id"] == "1"
+    assert route.calls[0].request.url.params["properties"] == "email,firstname"
+    await c.close()
+
+
+@pytest.mark.asyncio
 async def test_hubspot_search_objects(respx_mock):
     c = HubSpotClient(PortalConfig(portal_id="123", token="t"))
     respx_mock.post("https://api.hubapi.com/crm/v3/objects/contacts/search").mock(

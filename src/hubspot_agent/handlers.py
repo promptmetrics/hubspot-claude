@@ -142,6 +142,17 @@ async def _build_tool_preview(
     if tool_name in ("hubspot_update_object", "hubspot_delete_object"):
         object_id = tool_input.get("object_id")
         object_type = tool_input.get("object_type")
+        # Bug B (0.2.4): scope an UPDATE's snapshot fetch to the properties
+        # being changed — an unscoped GET returns HubSpot's default property
+        # set including read-only system fields (hs_lastmodifieddate, ...),
+        # which a later undo replays and HubSpot 400s on.  Deletes keep the
+        # full fetch: their snapshot is a reconciliation artifact and wants
+        # everything.
+        changed_props: list[str] | None = None
+        if tool_name == "hubspot_update_object":
+            props = tool_input.get("properties")
+            if isinstance(props, dict) and props:
+                changed_props = list(props.keys())
         if object_id and object_type:
             try:
                 result = await invoke_tool(
@@ -150,6 +161,7 @@ async def _build_tool_preview(
                     object_id=str(object_id),
                     object_type=str(object_type),
                     client=client,
+                    properties=changed_props,
                 )
                 if isinstance(result, dict) and not result.get("error") and "id" in result:
                     original_values = {str(result["id"]): result.get("properties", {})}
@@ -189,6 +201,11 @@ async def _build_tool_preview(
             object_id = rec.get("id")
             if not object_id or not object_type:
                 continue
+            # Scope each record's snapshot fetch to the properties being
+            # changed (same rationale as the single-update branch above); the
+            # handle_tool shape gate guarantees a non-empty ``properties``.
+            rec_props = rec.get("properties")
+            changed = list(rec_props.keys()) if isinstance(rec_props, dict) and rec_props else None
             try:
                 result = await invoke_tool(
                     "hubspot_get_object",
@@ -196,6 +213,7 @@ async def _build_tool_preview(
                     object_id=str(object_id),
                     object_type=str(object_type),
                     client=client,
+                    properties=changed,
                 )
                 if isinstance(result, dict) and not result.get("error") and "id" in result:
                     original_values[str(result["id"])] = result.get("properties", {})
