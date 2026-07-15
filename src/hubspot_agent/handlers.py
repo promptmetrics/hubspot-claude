@@ -139,6 +139,12 @@ async def _build_tool_preview(
 
     risk = _tool_risk_level(required_scopes, tool_name, tool_input)
     original_values: dict[str, Any] = {}
+    # Count snapshot GETs attempted (vs. succeeded) so an UPDATE that captured
+    # no originals — every per-record GET raised at preview time — can surface a
+    # warning NOW, not at undo time.  Without this, the preview silently persists
+    # a hollow snapshot and the operator only learns undo is unavailable after
+    # approving (see snapshot.save_undo_snapshot_for_action's fail-closed flag).
+    fetches_attempted = 0
     if tool_name in ("hubspot_update_object", "hubspot_delete_object"):
         object_id = tool_input.get("object_id")
         object_type = tool_input.get("object_type")
@@ -155,6 +161,7 @@ async def _build_tool_preview(
                 changed_props = list(props.keys())
         if object_id and object_type:
             try:
+                fetches_attempted += 1
                 result = await invoke_tool(
                     "hubspot_get_object",
                     portal_id,
@@ -207,6 +214,7 @@ async def _build_tool_preview(
             rec_props = rec.get("properties")
             changed = list(rec_props.keys()) if isinstance(rec_props, dict) and rec_props else None
             try:
+                fetches_attempted += 1
                 result = await invoke_tool(
                     "hubspot_get_object",
                     portal_id,
@@ -220,8 +228,27 @@ async def _build_tool_preview(
             except Exception:
                 continue
 
+    preview: dict[str, Any] = {
+        "tool": tool_name,
+        "input": tool_input,
+        "message": f"Preview of {tool_name}",
+    }
+    # An UPDATE that attempted snapshot fetches but captured nothing cannot be
+    # undone — tell the operator at preview time so approval is informed.  CREATE
+    # (and DELETE, whose snapshot is a reconciliation artifact) stay quiet: their
+    # undo paths don't replay original_values.
+    if (
+        tool_name in ("hubspot_update_object", "hubspot_bulk_update_objects")
+        and fetches_attempted
+        and not original_values
+    ):
+        preview["warning"] = (
+            "Unable to capture pre-change values for undo: every snapshot read failed. "
+            "This action can be approved and executed, but it will NOT be undoable."
+        )
+
     return PreviewResult(
-        preview={"tool": tool_name, "input": tool_input, "message": f"Preview of {tool_name}"},
+        preview=preview,
         impact_count=_tool_impact_count(tool_name, tool_input),
         risk_level=risk,
         original_values=original_values,

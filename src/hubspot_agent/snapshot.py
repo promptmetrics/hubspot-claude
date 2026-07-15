@@ -38,7 +38,16 @@ def save_undo_snapshot_for_action(
     # "merge" is deliberately absent: HubSpot has no unmerge API, so a merge
     # snapshot (both records' pre-merge properties) exists for manual
     # reconciliation only and must never offer an automated undo.
-    undoable = intent_type in ("create", "update")
+    # An UPDATE undo replays original_values; if the pre-fetch captured none
+    # (every per-record GET failed at preview time — see
+    # _build_tool_preview), the snapshot must NOT claim undoability, or undo
+    # later reports "No original values recorded" after the operator already
+    # approved believing undo was available. CREATE undos by deleting the
+    # created record (created_ids, captured at execute), so it stays undoable
+    # regardless of original_values.
+    undoable = intent_type == "create" or (
+        intent_type == "update" and bool(original_values)
+    )
     metadata: dict[str, Any] = {
         "intent_type": intent_type,
         "target_object": target_object,

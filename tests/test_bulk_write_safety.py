@@ -143,6 +143,50 @@ async def test_preview_snapshot_fetch_scoped_to_changed_properties(portal_dir):
 
 
 @pytest.mark.asyncio
+async def test_bulk_update_snapshot_fetch_failure_warns_and_marks_non_undoable(portal_dir):
+    """Latent hardening (0.2.4): if every per-record snapshot GET fails at
+    preview time, the preview must (a) surface a warning that undo will be
+    unavailable and (b) mark the saved snapshot non-undoable — not persist a
+    hollow ``undoable=True`` snapshot whose empty ``original_values`` the
+    operator only discovers at undo time.  See ``handlers._build_tool_preview``
+    (the ``except Exception: continue`` swallow) + ``snapshot.save_undo_snapshot_for_action``.
+    """
+
+    async def fake_invoke(tool_name, portal_id, **kwargs):
+        if tool_name == "hubspot_get_object":
+            raise RuntimeError("snapshot GET failed")
+        if tool_name == "hubspot_bulk_update_objects":
+            return {"succeeded": 2, "failed": 0, "total": 2, "results": [], "errors": []}
+        return {}
+
+    portal_config = PortalConfig(portal_id="123", token="test-token")
+    with patch("hubspot_agent.handlers.invoke_tool", side_effect=fake_invoke):
+        result = await handle_tool(
+            _FakeClient(), None, portal_config,
+            {"tool_name": "hubspot_bulk_update_objects", "input": _bulk_update_input()},
+        )
+        data = result["data"]
+        assert data["status"] == "preview"
+        # No originals captured — every per-record GET raised.
+        assert data["original_values"] == {}
+        # The warning surfaces at PREVIEW time, not undo time.
+        assert "warning" in data["preview"]
+        assert "undo" in data["preview"]["warning"].lower()
+
+        action_id = data["action_id"]
+        exec_result = await execute_pending_write(portal_config, action_id, confirm_count=2)
+        assert exec_result.status == "success"
+
+    snapshot_file = portal_dir / "123" / "undo_snapshots" / f"{action_id}.json"
+    assert snapshot_file.exists()
+    snapshot = json.loads(snapshot_file.read_text())
+    assert snapshot["original_values"] == {}
+    assert snapshot["metadata"]["intent_type"] == "update"
+    # Fail-closed: an update with no captured originals must not claim undoability.
+    assert snapshot["metadata"]["undoable"] is False
+
+
+@pytest.mark.asyncio
 async def test_bulk_update_flat_records_rejected_at_preview(portal_dir):
     """Bug A (0.2.4): a mis-shaped bulk payload must fail at preview time —
     a human should never be asked to approve a doomed write, and no pending
