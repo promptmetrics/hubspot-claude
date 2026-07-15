@@ -112,6 +112,37 @@ async def test_bulk_update_bare_approve_refused_then_exact_count_executes(portal
 
 
 @pytest.mark.asyncio
+async def test_preview_snapshot_fetch_scoped_to_changed_properties(portal_dir):
+    """Bug B (0.2.4): the pre-write snapshot GET must request only the
+    properties being changed, so ``original_values`` (replayed by undo) never
+    carries read-only system fields.  Covers the single-update and bulk
+    branches of ``_build_tool_preview``."""
+    fetch_props: list[list[str] | None] = []
+
+    async def fake_invoke(tool_name, portal_id, **kwargs):
+        if tool_name == "hubspot_get_object":
+            fetch_props.append(kwargs.get("properties"))
+            return {"id": str(kwargs["object_id"]), "properties": {"firstname": "Old"}}
+        return {}
+
+    portal_config = PortalConfig(portal_id="123", token="test-token")
+    with patch("hubspot_agent.handlers.invoke_tool", side_effect=fake_invoke):
+        await handle_tool(
+            _FakeClient(), None, portal_config,
+            {"tool_name": "hubspot_bulk_update_objects", "input": _bulk_update_input()},
+        )
+        await handle_tool(
+            _FakeClient(), None, portal_config,
+            {
+                "tool_name": "hubspot_update_object",
+                "input": {"object_type": "contacts", "object_id": "c-1", "properties": {"firstname": "New"}},
+            },
+        )
+
+    assert fetch_props == [["firstname"], ["firstname"], ["firstname"]]
+
+
+@pytest.mark.asyncio
 async def test_bulk_update_flat_records_rejected_at_preview(portal_dir):
     """Bug A (0.2.4): a mis-shaped bulk payload must fail at preview time —
     a human should never be asked to approve a doomed write, and no pending

@@ -27,6 +27,7 @@ from hubspot_agent.models import RiskLevel, TaskIntent
 from hubspot_agent.safety import apply_write as _apply_write
 from hubspot_agent.scope_registry import get_required_scopes
 from hubspot_agent.setup import REQUIRED_SCOPES
+from hubspot_agent.validation import filter_writable_properties
 import asyncio
 
 from hubspot_agent.models import BatchApprovalMode
@@ -733,30 +734,82 @@ async def _undo_action(snapshot: dict[str, Any], portal_id: str, portal_config) 
             original_values = snapshot.get("original_values", {})
             if not original_values:
                 return False, "❌ No original values recorded; cannot undo update."
+            # Bug B (0.2.4): the restore previously replayed the ENTIRE
+            # snapshot dict (incl. read-only fields HubSpot 400s on) and
+            # discarded the tool's error envelope, so a failed restore was
+            # reported as "Restored".  Attempt every record (maximize
+            # restoration), check each envelope, and fail closed: any failure
+            # returns False so the caller keeps the snapshot.
+            restored = 0
+            failures: list[str] = []
+            stripped_any: set[str] = set()
             for object_id, properties in original_values.items():
-                await invoke_tool(
+                writable, stripped = filter_writable_properties(
+                    str(object_type), properties, portal_id
+                )
+                stripped_any.update(stripped)
+                if not writable:
+                    # Nothing writable to restore (e.g. a snapshot of only
+                    # system fields) — a per-record no-op, not a failure.
+                    restored += 1
+                    continue
+                result = await invoke_tool(
                     "hubspot_update_object",
                     portal_id,
                     object_id=str(object_id),
                     object_type=str(object_type),
-                    properties=properties,
+                    properties=writable,
                     client=client,
                 )
-            return True, f"✅ Restored {len(original_values)} {object_type or 'record(s)'} to their original values."
+                if isinstance(result, dict) and result.get("error"):
+                    failures.append(f"{object_id}: {result['error']}")
+                else:
+                    restored += 1
+            note = (
+                f" (skipped read-only: {', '.join(sorted(stripped_any))})" if stripped_any else ""
+            )
+            if failures:
+                detail = "; ".join(failures)
+                return False, (
+                    f"❌ Restored {restored} of {len(original_values)} "
+                    f"{object_type or 'record(s)'}; {len(failures)} failed — {detail}{note}"
+                )
+            return True, (
+                f"✅ Restored {restored} {object_type or 'record(s)'} to their original values.{note}"
+            )
 
         if intent_type == "create":
             created_ids = metadata.get("created_ids", [])
             if not created_ids:
                 return False, "❌ No created IDs recorded; cannot undo create."
+            deleted = 0
+            failures = []
             for object_id in created_ids:
-                await invoke_tool(
+                result = await invoke_tool(
                     "hubspot_delete_object",
                     portal_id,
                     object_id=str(object_id),
                     object_type=str(object_type),
                     client=client,
                 )
-            return True, f"✅ Deleted {len(created_ids)} created {object_type or 'record(s)'} to undo the create."
+                if isinstance(result, dict) and result.get("error"):
+                    error_text = str(result["error"])
+                    # An already-deleted record means the undo goal is met for
+                    # it — tolerate 404s so a retry after partial failure
+                    # converges instead of failing forever.
+                    if "404" in error_text or "not found" in error_text.lower():
+                        deleted += 1
+                    else:
+                        failures.append(f"{object_id}: {error_text}")
+                else:
+                    deleted += 1
+            if failures:
+                detail = "; ".join(failures)
+                return False, (
+                    f"❌ Deleted {deleted} of {len(created_ids)} created "
+                    f"{object_type or 'record(s)'}; {len(failures)} failed — {detail}"
+                )
+            return True, f"✅ Deleted {deleted} created {object_type or 'record(s)'} to undo the create."
 
         return False, "❌ Unknown action type; cannot undo."
     finally:
