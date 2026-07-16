@@ -69,7 +69,12 @@ def test_scope_validation_blocks_and_allows_delete():
 def test_delete_list_full_hitl_flow(portal_dir, mock_client):
     """End-to-end acceptance: destructive bulk update with count gate and undo."""
     action_id = "del-list-1"
-    request_text = "delete all contacts in the Test list"
+    # "delete all contacts" routes cleanly to objects. (Per R2, CRUD verbs no
+    # longer pick the domain, so "delete all contacts in the Test list" —
+    # where "list" is also a lists noun — routes multi-agent. This test
+    # validates the HITL count-gate flow, not list-scoped deletion, so it uses
+    # unambiguous phrasing.)
+    request_text = "delete all contacts"
 
     original_values = {
         f"c{i}": {"email": f"c{i}@example.com", "firstname": f"Contact {i}"}
@@ -128,44 +133,51 @@ def test_delete_list_full_hitl_flow(portal_dir, mock_client):
 
     with patch("hubspot_agent.cli.dispatch_agents_parallel", side_effect=mock_dispatch_parallel):
         with patch("hubspot_agent.cli.dispatch_agent", side_effect=mock_dispatch_agent):
-            with patch("hubspot_agent.cli.invoke_tool") as mock_invoke_tool:
-                # Step 1: preview shows destructive impact of 5 records.
-                result1 = hubspot_command(request_text, working_dir=str(portal_dir))
-                assert "Portal: 123" in result1
-                assert "destructive" in result1.lower()
-                assert "5" in result1
-                assert action_id in result1
-                assert _load_pending_preview("123", action_id) is not None
+            # The approve→execute path (handlers.execute_pending_write) imports
+            # dispatch_agent from hubspot_agent.orchestrator, so patching the cli
+            # binding alone is not enough — patch the orchestrator binding too so
+            # execute uses the mock instead of the real objects agent (which would
+            # hit the mock_client and "find no records to delete"). This decouples
+            # the HITL count-gate flow from the real agent's delete implementation.
+            with patch("hubspot_agent.orchestrator.dispatch_agent", side_effect=mock_dispatch_agent):
+                with patch("hubspot_agent.cli.invoke_tool") as mock_invoke_tool:
+                    # Step 1: preview shows destructive impact of 5 records.
+                    result1 = hubspot_command(request_text, working_dir=str(portal_dir))
+                    assert "Portal: 123" in result1
+                    assert "destructive" in result1.lower()
+                    assert "5" in result1
+                    assert action_id in result1
+                    assert _load_pending_preview("123", action_id) is not None
 
-                # Step 2: simple approval is rejected for destructive operations.
-                result2 = hubspot_command("y", working_dir=str(portal_dir))
-                assert "destructive" in result2.lower()
-                assert "5" in result2
-                assert action_id in result2
+                    # Step 2: simple approval is rejected for destructive operations.
+                    result2 = hubspot_command("y", working_dir=str(portal_dir))
+                    assert "destructive" in result2.lower()
+                    assert "5" in result2
+                    assert action_id in result2
 
-                # Step 3: exact impact count is accepted and executes.
-                result3 = hubspot_command("5", working_dir=str(portal_dir))
-                assert "Approved and executed" in result3
-                assert _load_pending_preview("123", action_id) is None
+                    # Step 3: exact impact count is accepted and executes.
+                    result3 = hubspot_command("5", working_dir=str(portal_dir))
+                    assert "Approved and executed" in result3
+                    assert _load_pending_preview("123", action_id) is None
 
-                # Step 4: undo snapshot is saved with original values.
-                snapshot_file = portal_dir / "123" / "undo_snapshots" / f"{action_id}.json"
-                assert snapshot_file.exists()
-                snapshot = json.loads(snapshot_file.read_text())
-                assert snapshot["original_values"] == original_values
-                assert snapshot["metadata"]["intent_type"] == "update"
-                assert snapshot["metadata"]["target_object"] == "contacts"
-                assert snapshot["metadata"]["undoable"] is True
+                    # Step 4: undo snapshot is saved with original values.
+                    snapshot_file = portal_dir / "123" / "undo_snapshots" / f"{action_id}.json"
+                    assert snapshot_file.exists()
+                    snapshot = json.loads(snapshot_file.read_text())
+                    assert snapshot["original_values"] == original_values
+                    assert snapshot["metadata"]["intent_type"] == "update"
+                    assert snapshot["metadata"]["target_object"] == "contacts"
+                    assert snapshot["metadata"]["undoable"] is True
 
-                # Step 5: undo restores the 5 contacts from the snapshot.
-                result4 = hubspot_command(f"undo {action_id}", working_dir=str(portal_dir))
-                assert "Restored 5" in result4
-                calls = mock_invoke_tool.call_args_list
-                assert len(calls) == 5
-                restored_ids = {call.kwargs["object_id"] for call in calls}
-                assert restored_ids == set(original_values.keys())
-                for call in calls:
-                    assert call.kwargs["object_type"] == "contacts"
+                    # Step 5: undo restores the 5 contacts from the snapshot.
+                    result4 = hubspot_command(f"undo {action_id}", working_dir=str(portal_dir))
+                    assert "Restored 5" in result4
+                    calls = mock_invoke_tool.call_args_list
+                    assert len(calls) == 5
+                    restored_ids = {call.kwargs["object_id"] for call in calls}
+                    assert restored_ids == set(original_values.keys())
+                    for call in calls:
+                        assert call.kwargs["object_type"] == "contacts"
 
-                # Undo snapshot is consumed after use.
-                assert not snapshot_file.exists()
+                    # Undo snapshot is consumed after use.
+                    assert not snapshot_file.exists()

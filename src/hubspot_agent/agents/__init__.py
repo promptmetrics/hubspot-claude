@@ -153,6 +153,62 @@ _AGENT_CATEGORIES: dict[str, tuple[str, str]] = {
 }
 
 
+# Routing terms for the keyword fast-path router (`orchestrator.route_request`).
+# One entry per registry key. Terms are DOMAIN NOUNS / synonyms a user says to
+# mean this agent — never generic CRUD verbs (find/search/get/create/update/
+# delete/merge/list/show/...), which are intent signals scored separately in
+# `route_request`. `triage`/`verify` are orchestration-internal and intentionally
+# unroutable (empty terms). Keeping this centralized (Option A) mirrors
+# `_AGENT_CATEGORIES` and makes cross-agent term collisions visible in one place.
+# A registry-coverage test asserts every key here matches `_AGENT_REGISTRY`.
+_AGENT_ROUTE_TERMS: dict[str, list[str]] = {
+    "objects": ["contact", "contacts", "company", "companies", "deal", "deals", "ticket", "tickets", "record", "records"],
+    "properties": ["property", "properties", "custom property", "field", "field type", "property schema", "property group"],
+    "workflows": ["workflow", "workflows", "automation", "blueprint", "blueprints"],
+    "lists": ["list", "lists", "static list", "dynamic list", "active list", "membership"],
+    "pipelines": ["pipeline", "pipelines", "stage", "stages", "deal stage", "ticket pipeline"],
+    "users": ["user", "users", "role", "roles", "team", "teams", "permission", "permissions"],
+    "hygiene": ["duplicate", "duplicates", "deduplicate", "clean up", "stale", "data quality"],
+    "analytics": ["analytics", "report", "reports", "dashboard", "dashboards", "metric", "metrics", "funnel", "conversion"],
+    "associations": ["association", "associations", "association schema", "relationship", "relationships"],
+    "engagements": ["engagement", "engagements", "note", "notes", "task", "tasks", "email", "emails", "meeting", "meetings", "call", "calls", "activity"],
+    "custom_objects": ["custom object", "custom objects", "custom record", "custom records", "custom schema"],
+    "service": ["knowledge base", "kb article", "feedback survey", "service automation", "customer service"],
+    "raw_api": ["raw api", "endpoint", "http request", "api call", "direct api", "curl", "hubspot api"],
+    "forms": ["form", "forms", "form field", "form submission", "form builder"],
+    "data": ["sync", "data import", "data export", "import status", "data sync"],
+    "commerce": ["payment", "payments", "refund", "refunds", "transaction", "checkout"],
+    "carts": ["cart", "carts", "basket", "shopping cart"],
+    "orders": ["order", "orders", "purchase order"],
+    "quotes": ["quote", "quotes", "quote template"],
+    "subscriptions": ["subscription", "subscriptions", "recurring billing", "billing cycle"],
+    "invoices": ["invoice", "invoices", "accounts receivable"],
+    "deal_splits": ["deal split", "deal splits", "revenue split", "revenue splits"],
+    "discounts": ["discount", "discounts", "discount code"],
+    "fees": ["fee", "fees"],
+    "taxes": ["tax", "taxes", "tax rate"],
+    "goals": ["goal", "goals", "goal target", "goal targets", "quota"],
+    "appointments": ["appointment", "appointments"],
+    "courses": ["course", "courses", "training course"],
+    "listings": ["listing", "listings"],
+    "services": ["service product", "productized service", "service line item"],
+    "communications": ["communication", "communications", "whatsapp", "linkedin", "sms"],
+    "leads": ["lead", "leads", "lead scoring"],
+    "projects": ["project", "projects"],
+    "object_library": ["object library", "object schema", "object catalog", "available object"],
+    "sequences": ["sequence", "sequences", "enrollment"],
+    "scheduler": ["meeting link", "meeting links", "availability", "booking page", "scheduler"],
+    "account_info": ["account info", "account information", "portal info", "api usage", "account metadata"],
+    "audit_logs": ["audit log", "audit logs", "audit event", "audit trail"],
+    "security_history": ["security history", "security event", "security events", "login history", "password change"],
+    "email_events": ["email event", "email events", "campaign", "campaigns", "email open", "email click"],
+    "forecasts": ["forecast", "forecasts", "projection", "projections", "pipeline forecast"],
+    "timeline_events": ["timeline event", "timeline events", "timeline event template", "timeline event token"],
+    "triage": [],
+    "verify": [],
+}
+
+
 def get_agent_category(agent_name: str) -> str:
     return _AGENT_CATEGORIES.get(agent_name, ("Unknown", "❓"))[0]
 
@@ -190,4 +246,5 @@ __all__ = [
     "get_agent_emoji",
     "group_agents_by_category",
     "_AGENT_CATEGORIES",
+    "_AGENT_ROUTE_TERMS",
 ]

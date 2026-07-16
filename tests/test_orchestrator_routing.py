@@ -60,12 +60,28 @@ def test_route_cross_object_related_to():
 
 
 def test_route_cross_object_at_companies():
+    # "at" is NOT an association verb — innocuous phrasing must not force
+    # associations. Only objects routes (both nouns are object types, but no
+    # explicit association verb means no associations agent).
     result = route_request("contacts at companies")
-    assert "associations" in result
-    assert "objects" in result
+    assert result == ["objects"]
+    assert "associations" not in result
 
 
 def test_route_cross_object_for_company():
+    # "for" is NOT an association verb — same rationale as above.
     result = route_request("deals for company")
-    assert "associations" in result
-    assert "objects" in result
+    assert result == ["objects"]
+    assert "associations" not in result
+
+
+def test_route_association_verb_word_boundary_not_substring():
+    # Association verbs are matched on word boundaries, so a word that merely
+    # contains a verb as a substring ("correlate" contains "relate",
+    # "interrelate" contains "relate") must NOT force associations. Otherwise an
+    # analytics/correlation request over two object nouns misroutes to
+    # associations instead of the intended domain.
+    assert "associations" not in route_request("correlate contact activity with deal closures")
+    assert "associations" not in route_request("interrelate contacts and deals")
+    # Sanity: a real association verb still fires.
+    assert "associations" in route_request("associate a deal with a company")
