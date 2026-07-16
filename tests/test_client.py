@@ -31,11 +31,82 @@ async def test_client_post_success(respx_mock):
 async def test_client_rate_limit(respx_mock):
     from hubspot_agent.errors import RateLimitError
     client = HubSpotClient(PortalConfig(portal_id="123", token="test-token"))
-    respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(
-        return_value=httpx.Response(429, headers={"Retry-After": "5"})
+    route = respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(
+        return_value=httpx.Response(429, headers={"Retry-After": "0"})
     )
     with pytest.raises(RateLimitError):
         await client.get("/crm/v3/objects/contacts/1", portal_id="123")
+    # GET 429 retries up to 3 total attempts before raising (budget exhausted);
+    # Retry-After:0 keeps the test fast while still exercising the real sleep.
+    assert len(route.calls) == 3
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_429_get_retries_then_succeeds(respx_mock):
+    client = HubSpotClient(PortalConfig(portal_id="123", token="test-token"))
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "0"})
+        return httpx.Response(200, json={"id": "1"})
+
+    route = respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(
+        side_effect=handler
+    )
+    resp = await client.get("/crm/v3/objects/contacts/1", portal_id="123")
+    assert resp.body["id"] == "1"
+    assert len(route.calls) == 2
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_429_post_still_raises(respx_mock):
+    from hubspot_agent.errors import RateLimitError
+    client = HubSpotClient(PortalConfig(portal_id="123", token="test-token"))
+    route = respx_mock.post("https://api.hubapi.com/crm/v3/objects/contacts").mock(
+        return_value=httpx.Response(429, headers={"Retry-After": "0"})
+    )
+    with pytest.raises(RateLimitError):
+        await client.post(
+            "/crm/v3/objects/contacts",
+            portal_id="123",
+            body={"properties": {"email": "x@y.com"}},
+        )
+    # Writes never retry on 429 — the loop's pause/approve path is the safe
+    # surface for non-idempotent side effects.
+    assert len(route.calls) == 1
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_429_retry_sleep_is_capped(respx_mock, monkeypatch):
+    import asyncio
+    from hubspot_agent.errors import RateLimitError
+    client = HubSpotClient(PortalConfig(portal_id="123", token="test-token"))
+    route = respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(
+        return_value=httpx.Response(429, headers={"Retry-After": "9999"})
+    )
+    # An unreasonable Retry-After must not hang the coroutine: each retry sleep
+    # is capped at _MAX_RETRY_AFTER_SECONDS. Capture the slept values without
+    # actually waiting (real sleep(0) yields once).
+    slept = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    with pytest.raises(RateLimitError) as exc_info:
+        await client.get("/crm/v3/objects/contacts/1", portal_id="123")
+    # 3 attempts -> 2 sleeps, each capped at 60 (never the raw 9999).
+    assert slept == [60, 60]
+    assert len(route.calls) == 3
+    # The raised error still carries the server's raw value for the caller.
+    assert exc_info.value.retry_after == 9999
     await client.close()
 
 

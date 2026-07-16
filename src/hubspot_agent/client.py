@@ -30,6 +30,12 @@ class HubSpotClient:
     _BATCH_CONCURRENT = 4
     _WINDOW_SECONDS = 10
     _REFRESH_BUFFER_SECONDS = 300
+    # Upper bound on the per-attempt 429 retry sleep. The server's Retry-After
+    # is honored up to this cap; an unreasonable value (e.g. a misconfigured
+    # proxy injecting ``Retry-After: 3600``) must not hang the coroutine/loop
+    # silently. The raised RateLimitError still carries the raw server value so
+    # the loop's pause/approve surface can act on the real backoff.
+    _MAX_RETRY_AFTER_SECONDS = 60
 
     def __init__(self, portal: PortalConfig):
         self.portal = portal
@@ -86,8 +92,8 @@ class HubSpotClient:
         data: dict[str, Any] | None = None,
         files: dict[str, Any] | None = None,
     ) -> APIResponse:
-        await self._enforce_rate_limit()
-        await self._get_fresh_token()
+        method_upper = method.upper()
+        is_read = method_upper in ("GET", "HEAD")
         kwargs: dict[str, Any] = {}
         if body is not None:
             kwargs["json"] = body
@@ -95,16 +101,33 @@ class HubSpotClient:
             kwargs["data"] = data
         if files is not None:
             kwargs["files"] = files
-        resp = await self._client.request(method, path, **kwargs)
-        if resp.status_code == 401:
-            await self._get_fresh_token(force=True)
-            # Only retry safe (read-only) methods automatically to avoid duplicate
-            # side effects if the original request was processed before the 401.
-            if method.upper() in ("GET", "HEAD"):
-                resp = await self._client.request(method, path, **kwargs)
-        if resp.status_code == 429:
-            retry_after = int(resp.headers.get("Retry-After", 10))
-            raise RateLimitError("Rate limit exceeded", retry_after=retry_after)
+
+        # Reads retry on 429 (bounded) and on 401 (after token refresh); writes
+        # raise immediately on 429 so the loop's pause/approve path stays the
+        # safe surface for non-idempotent side effects. On a 429 we sleep
+        # Retry-After and clear the local sliding window so the next call paces
+        # off the server's signal instead of re-sleeping against a stale, full
+        # local window.
+        max_attempts = 3 if is_read else 1
+        for attempt in range(max_attempts):
+            await self._enforce_rate_limit()
+            await self._get_fresh_token()
+            resp = await self._client.request(method, path, **kwargs)
+            if resp.status_code == 401:
+                await self._get_fresh_token(force=True)
+                # Only retry safe (read-only) methods automatically to avoid
+                # duplicate side effects if the original was processed before
+                # the 401.
+                if is_read:
+                    resp = await self._client.request(method, path, **kwargs)
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 10))
+                if is_read and attempt < max_attempts - 1:
+                    self._request_times = []
+                    await asyncio.sleep(min(retry_after, self._MAX_RETRY_AFTER_SECONDS))
+                    continue
+                raise RateLimitError("Rate limit exceeded", retry_after=retry_after)
+            break
         if resp.status_code == 403:
             if expected_scopes:
                 raise ScopeError(

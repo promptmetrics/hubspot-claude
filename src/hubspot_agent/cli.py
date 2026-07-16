@@ -1130,7 +1130,7 @@ def _handle_route(request_text: str, working_dir: str, portal_id: str | None) ->
         rationale = f"keyword routing selected agent: {agents[0]}"
     else:
         rationale = (
-            f"keyword routing selected {len(agents)} agents in dependency order: "
+            f"keyword routing selected {len(agents)} agents as sorted candidates: "
             f"{', '.join(agents)}"
         )
     return json.dumps({"agents": agents, "rationale": rationale}, indent=2)

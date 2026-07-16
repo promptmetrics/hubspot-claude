@@ -10,6 +10,6 @@ Available agents:
 
 Rules:
 - Select only agents that are clearly relevant to the request.
-- If the request involves multiple domains, include all relevant agents in dependency order.
+- If the request involves multiple domains, include all relevant agents as sorted candidates.
 - If no agent is relevant or the request is ambiguous, return an empty array [].
 - Respond with ONLY the JSON array, no additional explanation.

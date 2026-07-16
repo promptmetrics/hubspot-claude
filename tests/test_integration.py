@@ -19,7 +19,12 @@ def test_integration_read_query(mock_portal):
 
 
 def test_integration_write_routing(mock_portal):
-    result = hubspot_command("create a contact with email test@example.com", working_dir=mock_portal)
+    # "create a contact named Alice" routes cleanly to objects. (Per R2, CRUD
+    # verbs no longer pick the domain, so "create a contact with email ..." —
+    # where "email" is a property but also an engagements noun — would route
+    # multi-agent. Email-property-vs-engagement disambiguation is deferred to
+    # the R6 embedding fallback; keep this smoke test on unambiguous phrasing.)
+    result = hubspot_command("create a contact named Alice", working_dir=mock_portal)
     assert "Portal: 123" in result
     assert "objects" in result
 
