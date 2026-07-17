@@ -17,6 +17,7 @@ The agent and tool catalogs live in code. As of this release the registry holds 
 - **Undo + audit** — every approved create/update/delete records an undo snapshot and an audit entry (FR-17/FR-18).
 - **Multi-portal** — isolated state per portal; auto-detection via a `.hubspot-portal` file in the working directory.
 - **Workflow blueprints + learning loop** — 19 JSON blueprint templates ship with the plugin; extract an existing portal workflow into a reviewable blueprint, parameterize it, promote it, and create new workflows from it. All workflow writes now gate behind preview + approval. See [docs/BLUEPRINTS.md](docs/BLUEPRINTS.md).
+- **Quiet mode** — `/hubspot` reports final results only (no step narration) by default; for session-wide terseness opt into the `hubspot-terse` output style via `/config` → output styles. Write previews and approval stops are never suppressed.
 
 ## Prerequisites
 

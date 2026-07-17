@@ -79,3 +79,16 @@ def test_build_agent_prompt_research_block_before_reflection_block():
     research_idx = prompt.system_prompt.index("Research guidance")
     reflection_idx = prompt.system_prompt.index("Write verification")
     assert research_idx < reflection_idx
+
+
+def test_build_agent_prompt_contains_terse_output_block():
+    tools = []
+    prompt = build_agent_prompt(
+        agent_name="Test Agent",
+        domain_description="Testing domain.",
+        available_tools=tools,
+    )
+    assert "terse and final-result-oriented" in prompt.system_prompt
+    terse_idx = prompt.system_prompt.index("terse and final-result-oriented")
+    self_correction_idx = prompt.system_prompt.index("Self-correction rules")
+    assert terse_idx < self_correction_idx
