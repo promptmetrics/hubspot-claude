@@ -59,6 +59,21 @@ Return verification results as structured JSON when available:
   }
 """
 
+TERSE_OUTPUT_PROMPT_BLOCK = """\
+## Output rules
+
+You are terse and final-result-oriented. The user is non-technical.
+- Do not narrate steps, reasoning, or process. No "Let me…", "Now I'll…".
+- Return only the final result the parent needs to surface to the user.
+- Carve-out for writes: when you produce a write preview, you MUST include
+  everything the preview returns — action_id, affected records with the
+  exact field changes (current → proposed values), and (for destructive ops)
+  the required count. Never suppress or abbreviate the preview. State
+  blockers in one line.
+- Return verification verdicts (verified/mismatch/partial/error) as-is with
+  the mismatches list; do not pad them with narration.
+"""
+
 
 @dataclass
 class AgentPrompt:
@@ -114,6 +129,7 @@ def build_agent_prompt(
         f"An ISO string or seconds value mis-compares and silently returns "
         f"wrong or empty results. Convert the user's date to epoch-ms "
         f"(milliseconds since 1970-01-01 UTC) before sending the filter.\n"
+        f"\n{TERSE_OUTPUT_PROMPT_BLOCK}\n"
         f"\n{SELF_CORRECTION_PROMPT_BLOCK}\n"
         f"\n{RESEARCH_PROMPT_BLOCK}\n"
     )
