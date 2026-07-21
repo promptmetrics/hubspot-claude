@@ -20,7 +20,8 @@ CLAUDE.md
 TASKS.md
 docs/
 plans/
-scripts/
+scripts/*
+!scripts/check-artifact-allowlist.sh
 specs/
 brz/
 ranya-demo/
