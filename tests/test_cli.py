@@ -81,6 +81,7 @@ def test_hubspot_portal_list_with_portals(tmp_path, monkeypatch):
     from pathlib import Path
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr("hubspot_agent.config.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr("hubspot_agent.cli.CONFIG_DIR", tmp_path)
 
     from hubspot_agent.config import save_portal_config, PortalConfig
     save_portal_config(PortalConfig(portal_id="123", token="t1", auth_type="oauth", expires_at=1700000000.0))
