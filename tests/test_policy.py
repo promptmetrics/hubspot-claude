@@ -58,6 +58,30 @@ def test_per_portal_overrides_global(cfg):
     assert load_approval_policy("999").auto_apply_max_records == 25
 
 
+def test_pattern_confirm_threshold_default(cfg):
+    # Shipped default is 100 (= the shipped auto_apply_max_records; spec §7).
+    p = load_approval_policy("123")
+    assert p.pattern_confirm_threshold == 100
+
+
+def test_pattern_confirm_threshold_override(cfg):
+    (cfg / "123").mkdir()
+    (cfg / "123" / "approval_policy.json").write_text(
+        json.dumps({"pattern_confirm_threshold": 25})
+    )
+    assert load_approval_policy("123").pattern_confirm_threshold == 25
+
+
+def test_pattern_confirm_threshold_malformed_falls_back_to_records_ceiling(cfg):
+    (cfg / "approval_policy.json").write_text(
+        json.dumps({"auto_apply_max_records": 40, "pattern_confirm_threshold": "oops"})
+    )
+    p = load_approval_policy("123")
+    # A malformed threshold falls back to the effective records ceiling, never
+    # fail-open to unlimited.
+    assert p.pattern_confirm_threshold == 40
+
+
 def test_malformed_file_falls_back(cfg):
     (cfg / "approval_policy.json").write_text("{ this is not json")
     p = load_approval_policy("123")

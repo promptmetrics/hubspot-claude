@@ -268,7 +268,9 @@ def _post_send_write_warning(tool_name: str) -> str:
     )
 
 
-def _daemon_tool_path(tool_name: str, tool_input: dict[str, Any], portal_id: str) -> str | None:
+def _daemon_tool_path(
+    tool_name: str, tool_input: dict[str, Any], portal_id: str, batch_mode: str = "single"
+) -> str | None:
     """Try the warm-client daemon for a tool call.  Return formatted output or
     None when the daemon path fails (caller falls back to the in-process CLI)."""
     # The socket is global (one per plugin data dir), so a live daemon may serve a
@@ -279,7 +281,7 @@ def _daemon_tool_path(tool_name: str, tool_input: dict[str, Any], portal_id: str
     params = {
         "tool_name": tool_name,
         "input": tool_input,
-        "batch_mode": "single",
+        "batch_mode": batch_mode,
         "portal_id": portal_id,
     }
 
@@ -338,7 +340,11 @@ def _cli_fallback(remaining: list[str], working_dir: str, portal_id: str | None)
 
 
 def _cli_fallback_tool(
-    tool_name: str, tool_input: dict[str, Any], working_dir: str, portal_id: str | None
+    tool_name: str,
+    tool_input: dict[str, Any],
+    working_dir: str,
+    portal_id: str | None,
+    batch_mode: str = "single",
 ) -> str:
     """In-process fallback for a tool call, re-serializing the ALREADY-parsed
     input so ``--input -`` stdin is consumed exactly once (router-side); the
@@ -348,6 +354,8 @@ def _cli_fallback_tool(
     args = f"tool {tool_name}"
     if tool_input:
         args += f" --input {json.dumps(tool_input)}"
+    if batch_mode == "pattern":
+        args += " --pattern"
     try:
         return hubspot_command(args, working_dir, portal_id=portal_id)
     except Exception as exc:
@@ -375,14 +383,17 @@ def route(argv: list[str]) -> int:
         except ValueError as exc:
             print(f"Usage: hubspot tool <name> [--input <json>|-]\n  error: {exc}")
             return 0
+        # ``--pattern`` selects divergence-safe pattern approval for an eligible
+        # bulk/object update (handle_tool runs the eligibility gate).
+        batch_mode = "pattern" if "--pattern" in remaining[1:] else "single"
         pid = portal_id or detect_default_portal(working_dir)
         if pid:
-            out = _daemon_tool_path(tool_name, tool_input, pid)
+            out = _daemon_tool_path(tool_name, tool_input, pid, batch_mode)
             if out is not None:
                 print(out)
                 return 0
         # No portal, or daemon path failed → in-process CLI fallback.
-        print(_cli_fallback_tool(tool_name, tool_input, working_dir, portal_id))
+        print(_cli_fallback_tool(tool_name, tool_input, working_dir, portal_id, batch_mode))
         return 0
 
     if head == "serve":
