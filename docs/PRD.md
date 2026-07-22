@@ -1,12 +1,12 @@
 # PRD: HubSpot-Claude Plugin
 
-**Owner:** Izzy Aly · **Last updated:** 2026-07-21 · **Status:** In progress (v0.2.7 shipped; Phases 1–2 in flight)
+**Owner:** Izzy Aly · **Last updated:** 2026-07-22 · **Status:** Active (v0.2.12; R1–R14 shipped; Phase 4+ candidates in design)
 
 > Source of truth for this project. Keep it current: update **§6 Status** and the
 > **§4 Decisions log** whenever code changes scope, behavior, or a recorded choice.
 > **Counts are derived, not hardcoded** — agent/tool/blueprint counts come from the
 > registries (`hubspot agents list` / `hubspot tools list`). Figures here (44 agents,
-> 79 tools, 19 blueprints) are accurate as of v0.2.7 and will drift; re-derive before quoting.
+> 79 tools, 19 blueprints) are accurate as of v0.2.12 and will drift; re-derive before quoting.
 > **Supersedes** `docs/superpowers/specs/05-prd.md`, retained as a historical artifact of the
 > v0.1.0 / 2026-05-10 "As-Built" state. Where the two disagree, this PRD is authoritative for
 > current capability; `05-prd.md` remains the source for *history* and *originally-open* questions.
@@ -108,7 +108,7 @@ Current truth of built-vs-promised. Reconcile against code at the end of each se
 | R7 Multi-portal isolation + auto-detect | Done | `~/.claude/hubspot/<portal>/`; `--portal` honored by all HITL handlers (0.2.1). |
 | R8 Warm-client daemon | Done | Unix-socket JSON-RPC; schema cache. |
 | R9 Quiet/terse mode + HITL carve-out | Done | Shipped 0.2.7 (`23a1616`); previews never suppressed. |
-| R10 CI Evaluation Gate | In progress | `.github/workflows/ci.yml` committed on `ci/pr-evaluation-gate` (`f94595a`) + test-isolation fix (`a3180a5`); PR #19 open; **branch protection not yet enabled**. Would go red if Phase 2 lands before its regressed tests are fixed. |
+| R10 CI Evaluation Gate | Done | `test-and-validate` (pytest + `plugin validate` + artifact allowlist, Python 3.12) is a required status check on every PR + push to main; **branch protection enabled** (PR #19 merged). |
 | R11 Bounded Autonomy tiers | Done | Shipped **v0.2.8** (PR #20 merged); §5 partial-capture hardening in **v0.2.9**. `policy.py` `classify_write`/`load_approval_policy`; wired in `safety.py`/`handlers.py`/`cli.py`; `never_auto_tools` workflow gate; union-merged safety lists; recoverable AUTO failures; partial-capture→CONFIRM. Full suite green on Python 3.12 (1145 passed). |
 | R12 Loop cost governance (proxy) | Done (v0.2.10) | Proxy budget shipped: plan-configurable `max_steps`/`max_api_calls` + surfaced `error_budget`/`verification_plateau`, enforced per-step in `_drive_loop`; inert `$0.50`/`HUBSPOT_LOOP_COST` hook retired. Real dollar cap still deferred (needs parent usage injection). |
 | R13 Back-pressure / retry-backoff | Done (v0.2.11) | Per-step retry+backoff for transient read/preview errors (honors `Retry-After`, cap 60s, budget 3) + proactive pacing off `X-HubSpot-RateLimit-*` (rate state parsed in `client.py`, persisted in `LoopState`, paced between steps); writes never auto-retried. Full suite 1168 passed on 3.12. |
@@ -149,9 +149,8 @@ so I can stop hand-clicking through HubSpot and stop worrying about a bad bulk w
 
 ### Solution detail & technical approach
 
-**Feasibility: HIGH** — the product is built, shipping, and tested. Full suite is **1129 passed
-/ 1 skipped** with Phase 2 in the tree (9 failing on the uncommitted Phase 2 behavior change);
-1121 passed at 0.2.6 on committed history.
+**Feasibility: HIGH** — the product is built, shipping, and tested. Full suite is **1182 passed**
+on Python 3.12 at v0.2.12 (R1–R14 shipped).
 
 **Architecture notes**
 - **Orchestrator-Workers + Action-Selector.** Claude parent routes NL → deterministic keyword router → stateless sub-agents → CLI. No custom orchestration framework; native `Agent` tool.
@@ -222,15 +221,18 @@ sub-agents see only their ~6-tool subset). The four real gaps map directly to R1
 | # | Phase | Requirements | Status |
 |---|-------|--------------|--------|
 | 0 | Action-Selector ADR (deterministic routing as a security property) | R1 | Complete (ADR-0003) |
-| 1 | CI Evaluation Gate | R10 | In progress (PR #19; branch protection pending) |
-| 2 | Bounded Autonomy (risk-tiered approval) | R11 | In progress (code-complete; 9 tests regressed; uncommitted) |
-| 3 | Loop Hardening (cost governance + back-pressure) | R12, R13 | Not started |
+| 1 | CI Evaluation Gate | R10 | Complete (PR #19 merged; branch protection enabled) |
+| 2 | Bounded Autonomy (risk-tiered approval) | R11 | Complete (v0.2.8 / §5 hardening v0.2.9) |
+| 3 | Loop Hardening (cost governance + back-pressure) | R12, R13 | Complete (v0.2.10 / v0.2.11) |
+| 4 | Pattern approval (divergence-safe batch writes) | R14 | Complete (v0.2.12) |
 
-Phases are strictly sequential by design: **gate first (Phase 1), then the risky HITL redesign it
-protects (Phase 2), then production-only loop hardening (Phase 3).** Phase 0 is complete and
-independent. No phases run in parallel.
+Phases 0–3 shipped strictly sequentially by design: **gate first (Phase 1), then the risky HITL
+redesign it protects (Phase 2), then production-only loop hardening (Phase 3).** Phase 0 is
+independent. Pattern approval (Phase 4, R14, v0.2.12) built on Phase 2's risk-tiering. Further
+candidates (scheduled tasks, worktree jobs) remain in design — see
+`docs/superpowers/specs/2026-07-22-phase-4-candidates-design.md`.
 
 ---
 
-*Status: In progress — reflects v0.2.7 as-built + Phase 1–2 work in the tree; needs live validation
+*Status: Active — reflects v0.2.12 as-built (R1–R14 shipped); needs live validation
 of market/hypothesis metrics (no telemetry pipeline exists yet).*
