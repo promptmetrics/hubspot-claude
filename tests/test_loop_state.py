@@ -128,6 +128,35 @@ def test_proxy_budget_counters_default_zero_on_legacy_state():
     assert restored.api_call_count == 0
 
 
+def test_rate_state_roundtrip():
+    # Phase 3 PR-B: rate_remaining/rate_reset_at persist through to_dict/from_dict
+    # so pacing survives a loop resume.
+    state = _make_state()
+    state.rate_remaining = 5
+    state.rate_reset_at = 1_700_000_000.5
+    data = state.to_dict()
+    assert data["rate_remaining"] == 5
+    assert data["rate_reset_at"] == 1_700_000_000.5
+    restored = LoopState.from_dict(data)
+    assert restored.rate_remaining == 5
+    assert restored.rate_reset_at == 1_700_000_000.5
+
+
+def test_rate_state_defaults_none_on_legacy_state():
+    # A pre-PR-B state file (no rate_remaining/rate_reset_at keys) still loads.
+    data = _make_state().to_dict()
+    data.pop("rate_remaining")
+    data.pop("rate_reset_at")
+    restored = LoopState.from_dict(data)
+    assert restored.rate_remaining is None
+    assert restored.rate_reset_at is None
+
+
+def test_rate_state_defaults_none_on_new_state():
+    assert _make_state().rate_remaining is None
+    assert _make_state().rate_reset_at is None
+
+
 @pytest.mark.parametrize("status", ["awaiting_approval", "awaiting_verification"])
 def test_human_wait_states_never_stale(status):
     # A loop parked on a human decision must survive the 2h reaper — clearing it

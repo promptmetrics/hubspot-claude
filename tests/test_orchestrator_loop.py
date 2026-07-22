@@ -17,6 +17,9 @@ def _isolate_loop_dirs(monkeypatch, tmp_path):
     root = tmp_path / ".claude" / "hubspot"
     monkeypatch.setattr("hubspot_agent.loop_state.CONFIG_DIR", root)
     monkeypatch.setattr("hubspot_agent.loop_log.CONFIG_DIR", root)
+    # PR-B: keep the module-level last-seen rate snapshot hermetic per test so a
+    # prior test's client response can't leak into pacing decisions here.
+    monkeypatch.setattr("hubspot_agent.client._LAST_RATE_STATE", {})
     yield
 
 
@@ -228,6 +231,197 @@ async def test_run_loop_stops_mid_run_at_api_call_budget():
     state = loop_state.load("123")
     assert state.status == "stopped"
     assert state.api_call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Back-pressure (Phase 3 PR-B): per-step retry + proactive pacing
+# ---------------------------------------------------------------------------
+
+
+def _one_read_plan() -> LoopPlan:
+    return LoopPlan(
+        goal="one read",
+        steps=[PlanStep(step_number=1, agent="objects", action="find contacts",
+                        risk_level=RiskLevel.LOW)],
+        overall_risk=RiskLevel.LOW,
+    )
+
+
+def _two_read_plan() -> LoopPlan:
+    return LoopPlan(
+        goal="two reads",
+        steps=[
+            PlanStep(step_number=1, agent="objects", action="find contacts", risk_level=RiskLevel.LOW),
+            PlanStep(step_number=2, agent="objects", action="find companies", risk_level=RiskLevel.LOW),
+        ],
+        overall_risk=RiskLevel.LOW,
+    )
+
+
+@pytest.fixture
+def _no_wait(monkeypatch):
+    """Replace the loop's injectable sleep with a spy that records, never waits."""
+    slept: list[float] = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr("hubspot_agent.orchestrator._sleep", fake_sleep)
+    return slept
+
+
+@pytest.mark.asyncio
+async def test_read_step_retries_transient_then_succeeds(_no_wait):
+    from hubspot_agent.errors import RateLimitError
+
+    calls = {"n": 0}
+
+    async def dispatch(agent_name, request_text, portal_config=None, mode="preview", **kwargs):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RateLimitError("rate limited", retry_after=1)
+        return AgentResult(agent_name=agent_name, status="success", data={"artifacts": {}})
+
+    with patch("hubspot_agent.orchestrator.dispatch_agent", dispatch):
+        result = await run_loop("one read", _portal_config(), ".", "trace-retry", plan=_one_read_plan())
+
+    assert calls["n"] == 3  # failed twice, succeeded on the third attempt
+    assert "completed" in result.lower()
+    assert loop_state.load("123") is None  # single read completed → cleared
+    assert _no_wait == [1, 1]  # Retry-After (1s) honored on both backoffs
+
+    from hubspot_agent import loop_log
+    events = loop_log.get_recent("123", trace_id="trace-retry")
+    assert sum(1 for e in events if e["event_type"] == "step_retry") == 2
+
+
+@pytest.mark.asyncio
+async def test_read_step_exponential_backoff_without_retry_after(_no_wait):
+    from hubspot_agent.errors import ErrorCategory, HubSpotError
+
+    calls = {"n": 0}
+
+    async def dispatch(agent_name, request_text, portal_config=None, mode="preview", **kwargs):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise HubSpotError("server blip", status_code=503, category=ErrorCategory.SERVER)
+        return AgentResult(agent_name=agent_name, status="success", data={"artifacts": {}})
+
+    with patch("hubspot_agent.orchestrator.dispatch_agent", dispatch):
+        await run_loop("one read", _portal_config(), ".", "trace-backoff", plan=_one_read_plan())
+
+    # No server Retry-After on a 5xx → exponential backoff: 2**0, 2**1.
+    assert _no_wait == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_read_step_fails_after_retry_budget(_no_wait):
+    from hubspot_agent.errors import RateLimitError
+
+    calls = {"n": 0}
+
+    async def dispatch(agent_name, request_text, portal_config=None, mode="preview", **kwargs):
+        calls["n"] += 1
+        raise RateLimitError("still down", retry_after=0)
+
+    with patch("hubspot_agent.orchestrator.dispatch_agent", dispatch):
+        result = await run_loop("one read", _portal_config(), ".", "trace-budget-x", plan=_one_read_plan())
+
+    assert calls["n"] == 3  # _READ_RETRY_BUDGET attempts, then fail-and-stop
+    assert "Execution stopped" in result
+    assert "still down" in result
+    assert loop_state.load("123").status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_read_step_terminal_error_not_retried(_no_wait):
+    from hubspot_agent.errors import ErrorCategory, HubSpotError
+
+    calls = {"n": 0}
+
+    async def dispatch(agent_name, request_text, portal_config=None, mode="preview", **kwargs):
+        calls["n"] += 1
+        raise HubSpotError("bad request", status_code=400, category=ErrorCategory.VALIDATION)
+
+    with patch("hubspot_agent.orchestrator.dispatch_agent", dispatch):
+        result = await run_loop("one read", _portal_config(), ".", "trace-terminal", plan=_one_read_plan())
+
+    assert calls["n"] == 1  # non-transient → no retries
+    assert _no_wait == []  # never slept
+    assert "Execution stopped" in result
+    assert loop_state.load("123").status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_write_step_preview_retried_but_write_never_executed(_no_wait):
+    # Safety invariant: the write mutation is out-of-band (hubspot approve). The
+    # loop retries only the PREVIEW build (a read) and then pauses — it never
+    # executes the write, so the write is never auto-retried.
+    from hubspot_agent.errors import RateLimitError
+
+    modes: list[str] = []
+    preview_calls = {"n": 0}
+
+    async def dispatch(agent_name, request_text, portal_config=None, mode="preview", **kwargs):
+        modes.append(mode)
+        if mode == "preview":
+            preview_calls["n"] += 1
+            if preview_calls["n"] < 2:
+                raise RateLimitError("blip", retry_after=0)
+            return AgentResult(
+                agent_name=agent_name, status="preview",
+                data={"action_id": "act-w", "risk_level": "medium", "impact_count": 1,
+                      "intent_type": "create", "preview": "p"},
+            )
+        raise AssertionError("write step must never execute in-loop — it must pause for approval")
+
+    with patch("hubspot_agent.orchestrator.dispatch_agent", dispatch):
+        result = await run_loop("create property", _portal_config(), ".", "trace-wr", plan=_write_plan())
+
+    assert modes == ["preview", "preview"]  # preview retried once, then paused
+    assert "paused" in result.lower()
+    state = loop_state.load("123")
+    assert state.status == "awaiting_approval"
+    assert state.pending_action_id == "act-w"
+
+
+@pytest.mark.asyncio
+async def test_pacing_sleeps_before_next_step_when_remaining_low(monkeypatch, _no_wait):
+    import time
+
+    async def dispatch(agent_name, request_text, portal_config=None, mode="preview", **kwargs):
+        return AgentResult(agent_name=agent_name, status="success", data={"artifacts": {}})
+
+    # After each step the client reports few requests left with a reset 30s out.
+    monkeypatch.setattr("hubspot_agent.orchestrator.get_last_rate_state",
+                        lambda portal_id: (2, time.time() + 30))
+
+    with patch("hubspot_agent.orchestrator.dispatch_agent", dispatch):
+        await run_loop("two reads", _portal_config(), ".", "trace-pace", plan=_two_read_plan())
+
+    # Step 1: no header seen yet → no pace. Step 2: low remaining → one pace.
+    assert len(_no_wait) == 1
+    assert 0 < _no_wait[0] <= 60
+
+    from hubspot_agent import loop_log
+    events = loop_log.get_recent("123", trace_id="trace-pace")
+    assert any(e["event_type"] == "paced" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_pacing_no_sleep_when_remaining_high(monkeypatch, _no_wait):
+    import time
+
+    async def dispatch(agent_name, request_text, portal_config=None, mode="preview", **kwargs):
+        return AgentResult(agent_name=agent_name, status="success", data={"artifacts": {}})
+
+    monkeypatch.setattr("hubspot_agent.orchestrator.get_last_rate_state",
+                        lambda portal_id: (500, time.time() + 30))
+
+    with patch("hubspot_agent.orchestrator.dispatch_agent", dispatch):
+        await run_loop("two reads", _portal_config(), ".", "trace-nopace", plan=_two_read_plan())
+
+    assert _no_wait == []  # ample quota → never paced
 
 
 # ---------------------------------------------------------------------------
