@@ -1154,27 +1154,34 @@ def _split_input_flag(args: str) -> tuple[str, str]:
     return args, ""
 
 
-def _parse_tool_args(args: str) -> tuple[str, dict[str, Any]]:
+def _parse_tool_args(args: str) -> tuple[str, dict[str, Any], str]:
     if not args:
         raise ValueError("tool name required")
     name, raw = _split_input_flag(args)
     name = name.strip()
+    # A ``--pattern`` flag may accompany the tool name (before ``--input``);
+    # strip it and record pattern batch mode for the write path.
+    batch_mode = "single"
+    tokens = name.split()
+    if "--pattern" in tokens:
+        batch_mode = "pattern"
+        name = " ".join(t for t in tokens if t != "--pattern")
     if not name:
         raise ValueError("tool name required")
     if not raw:
-        return name, {}
+        return name, {}, batch_mode
     if raw.strip() == "-":
         raw = sys.stdin.read()
     raw = raw.strip()
     if not raw:
-        return name, {}
+        return name, {}, batch_mode
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid --input JSON ({exc.msg})") from exc
     if not isinstance(payload, dict):
         raise ValueError("--input must be a JSON object")
-    return name, payload
+    return name, payload, batch_mode
 
 
 def _tool_scope_error(tool_name: str, missing: list[str]) -> str:
@@ -1197,9 +1204,10 @@ async def _tool_read(tool_name, portal_id, portal_config, tool_input):
         await client.close()
 
 
-async def _tool_write(tool_name, portal_id, portal_config, tool_input, required_scopes):
+async def _tool_write(tool_name, portal_id, portal_config, tool_input, required_scopes, batch_mode="single"):
     from hubspot_agent.client import HubSpotClient
     from hubspot_agent.cache import ensure_custom_schema_cached
+    from hubspot_agent.handlers import _pattern_eligibility
 
     await ensure_custom_schema_cached(portal_config, tool_input.get("object_type") if isinstance(tool_input, dict) else None)
     risk = _tool_risk_level(required_scopes, tool_name, tool_input)
@@ -1209,6 +1217,21 @@ async def _tool_write(tool_name, portal_id, portal_config, tool_input, required_
         description=f"tool {tool_name}",
         risk_level=risk,
     )
+    # Pattern approval eligibility (§4): mirror handle_tool — a --pattern request
+    # that isn't a reversible, non-sensitive object-update falls back to the
+    # normal per-op gate with a surfaced reason.
+    use_pattern = False
+    pattern_threshold: int | None = None
+    pattern_fallback: str | None = None
+    if batch_mode == "pattern":
+        eligible, reason = _pattern_eligibility(tool_name, tool_input, required_scopes, portal_id)
+        if eligible:
+            from hubspot_agent.policy import load_approval_policy
+
+            use_pattern = True
+            pattern_threshold = load_approval_policy(portal_id).pattern_confirm_threshold
+        else:
+            pattern_fallback = reason
     client = HubSpotClient(portal_config)
     try:
         aw = await _apply_write(
@@ -1222,6 +1245,10 @@ async def _tool_write(tool_name, portal_id, portal_config, tool_input, required_
             intent=intent,
             request_text=f"tool {tool_name}",
             proposed_payload=tool_input,
+            batch_mode=BatchApprovalMode.PATTERN if use_pattern else BatchApprovalMode.SINGLE,
+            pattern=use_pattern,
+            pattern_confirm_threshold=pattern_threshold,
+            filter_summary=str(tool_input.get("filter_summary", "")) if isinstance(tool_input, dict) else "",
         )
         from hubspot_agent.handlers import AUTO, FULL_GATE, _applied_envelope
 
@@ -1249,22 +1276,30 @@ async def _tool_write(tool_name, portal_id, portal_config, tool_input, required_
                     default=str,
                 )
             return json.dumps(_applied_envelope(tool_name, aw, result), indent=2, default=str)
-        return json.dumps(
-            {
-                "status": "preview",
-                "tool": tool_name,
-                "action_id": aw.action_id,
-                "preview": aw.preview.preview,
-                "risk_level": aw.preview.risk_level.value,
-                "impact_count": aw.preview.impact_count,
-                "original_values": aw.preview.original_values,
-                "required_confirmation": aw.preview.impact_count,
-                "approval_tier": tier,
-                "requires_count": tier == FULL_GATE,
-            },
-            indent=2,
-            default=str,
-        )
+        response = {
+            "status": "preview",
+            "tool": tool_name,
+            "action_id": aw.action_id,
+            "preview": aw.preview.preview,
+            "risk_level": aw.preview.risk_level.value,
+            "impact_count": aw.preview.impact_count,
+            "original_values": aw.preview.original_values,
+            "required_confirmation": aw.preview.impact_count,
+            "approval_tier": tier,
+            "requires_count": tier == FULL_GATE,
+        }
+        pat = aw.preview_data.get("pattern")
+        if pat:
+            response["pattern_eligible"] = True
+            response["required_confirmation"] = aw.preview_data.get("required_confirmation", 0)
+            response["pattern"] = {
+                "rule": pat.get("rule"),
+                "count": pat.get("count"),
+                "sample": (pat.get("matched") or [])[: aw.preview.pattern_sample_size],
+            }
+        if pattern_fallback is not None:
+            response["pattern_fallback"] = pattern_fallback
+        return json.dumps(response, indent=2, default=str)
     finally:
         await client.close()
 
@@ -1277,7 +1312,7 @@ def _handle_tool(args: str, working_dir: str, portal_id: str | None) -> str:
     fabrication, FR-5b); scope is resolved via ``scope_registry.get_required_scopes``.
     """
     try:
-        tool_name, tool_input = _parse_tool_args(args)
+        tool_name, tool_input, tool_batch_mode = _parse_tool_args(args)
     except ValueError as exc:
         return f"Usage: /hubspot tool <name> [--input <json>|-]\n  error: {exc}"
 
@@ -1308,7 +1343,9 @@ def _handle_tool(args: str, working_dir: str, portal_id: str | None) -> str:
             return _tool_scope_error(tool_name, missing)
 
     if _is_write_tool(required, tool_name, tool_input):
-        return _run_async(_tool_write, tool_name, portal_id, portal_config, tool_input, required)
+        return _run_async(
+            _tool_write, tool_name, portal_id, portal_config, tool_input, required, tool_batch_mode
+        )
     return _run_async(_tool_read, tool_name, portal_id, portal_config, tool_input)
 
 

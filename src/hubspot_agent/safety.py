@@ -108,6 +108,9 @@ async def apply_write(
     batch_mode: BatchApprovalMode = BatchApprovalMode.SINGLE,
     proposed_payload: dict[str, Any] | None = None,
     loop_step_number: int | None = None,
+    pattern: bool = False,
+    pattern_confirm_threshold: int | None = None,
+    filter_summary: str = "",
 ) -> ApplyWriteResult:
     """Run the shared write-safety path and persist a pending preview.
 
@@ -162,6 +165,53 @@ async def apply_write(
     preview_data["approval_tier"] = classify_write(
         preview_data, load_approval_policy(portal_config.portal_id)
     )
+    # Pattern approval (divergence-safe): the caller (handle_tool) has already run
+    # the eligibility gate (reversible, non-sensitive, object-update only) and set
+    # ``pattern=True``.  Materialize the approved RULE + the matched set with each
+    # record's captured pre-image (the preview builder's original_values — one
+    # capture path), so execute-time compare-and-set has a per-record baseline.
+    # Gated on ``pattern`` so every non-pattern caller/path is byte-identical.
+    if pattern and batch_mode == BatchApprovalMode.PATTERN:
+        records = persisted_payload.get("records") or []
+        object_type = (
+            persisted_payload.get("object_type")
+            or (intent.target_object if intent is not None else None)
+        )
+        matched: list[dict[str, Any]] = []
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            rid = str(rec.get("id"))
+            changes = rec.get("properties") if isinstance(rec.get("properties"), dict) else {}
+            matched.append(
+                {
+                    "id": rid,
+                    "pre_image": preview.original_values.get(rid, {}),
+                    "changes": changes,
+                }
+            )
+        count = len(matched)
+        # The rule statement's representative changes = the first record's payload;
+        # per-record ``changes`` are what the executor actually applies.
+        rule_changes = matched[0]["changes"] if matched else {}
+        preview_data["pattern_eligible"] = True
+        preview_data["pattern"] = {
+            "rule": {
+                "tool": tool_name,
+                "object_type": object_type,
+                "changes": rule_changes,
+                "filter_summary": filter_summary,
+            },
+            "matched": matched,
+            "count": count,
+        }
+        # Over-threshold backstop (§4/§7): a matched set larger than the configured
+        # threshold requires the typed count at approve — reuse the FULL_GATE count
+        # gate.  Otherwise a single count-free approve (CONFIRM).  Pattern writes are
+        # NEVER AUTO: the one human approval is always required.
+        over_threshold = pattern_confirm_threshold is not None and count > pattern_confirm_threshold
+        preview_data["required_confirmation"] = count if over_threshold else 0
+        preview_data["approval_tier"] = "FULL_GATE" if over_threshold else "CONFIRM"
     # Resolve the store binding lazily from the orchestrator module so that
     # tests which monkeypatch ``hubspot_agent.orchestrator._store_pending_preview``
     # still intercept the write (the call site moved here from dispatch_agent,

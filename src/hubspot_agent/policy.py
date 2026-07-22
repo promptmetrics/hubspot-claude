@@ -34,6 +34,10 @@ FULL_GATE = "FULL_GATE"
 # weaken the workflow gate or unmark a shipped sensitive field.
 _DEFAULT_POLICY: dict[str, Any] = {
     "auto_apply_max_records": 100,
+    # Pattern-approval backstop (divergence-safe pattern writes): a matched set
+    # larger than this requires the typed count at approve, reusing the FULL_GATE
+    # count ceremony.  Defaults to auto_apply_max_records when unset (see _coerce).
+    "pattern_confirm_threshold": 100,
     "sensitive_properties": ["amount", "dealstage", "hubspot_owner_id", "lifecyclestage"],
     "sensitive_property_action": "confirm",
     # Side-effectful writes that must ALWAYS keep the human gate even though they
@@ -53,6 +57,7 @@ _DEFAULT_POLICY: dict[str, Any] = {
 @dataclass(frozen=True)
 class ApprovalPolicy:
     auto_apply_max_records: int = 100
+    pattern_confirm_threshold: int = 100
     sensitive_properties: tuple[str, ...] = ()
     sensitive_property_action: str = "confirm"  # "confirm" | "full_gate"
     never_auto_tools: tuple[str, ...] = ()
@@ -72,6 +77,13 @@ def _coerce(raw: dict[str, Any]) -> ApprovalPolicy:
         max_records = int(merged.get("auto_apply_max_records", 100))
     except (TypeError, ValueError):
         max_records = 100
+    # Shipped default is 100 (= the shipped auto_apply_max_records; spec §7). A
+    # malformed override falls back to the effective records ceiling rather than
+    # fail-open to "unlimited".
+    try:
+        pattern_threshold = int(merged.get("pattern_confirm_threshold", max_records))
+    except (TypeError, ValueError):
+        pattern_threshold = max_records
     # Union the safety lists with the shipped defaults: an override extends,
     # never replaces, so config cannot drop a shipped protection.  dict.fromkeys
     # dedups while preserving order (shipped entries first).
@@ -83,6 +95,7 @@ def _coerce(raw: dict[str, Any]) -> ApprovalPolicy:
     never_auto = list(dict.fromkeys([*_DEFAULT_POLICY["never_auto_tools"], *(str(t) for t in never_auto)]))
     return ApprovalPolicy(
         auto_apply_max_records=max_records,
+        pattern_confirm_threshold=pattern_threshold,
         sensitive_properties=tuple(props),
         sensitive_property_action=action,
         never_auto_tools=tuple(never_auto),

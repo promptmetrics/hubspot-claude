@@ -29,6 +29,7 @@ from hubspot_agent.safety import apply_write
 from hubspot_agent.scope_registry import RAW_API_WRITE_METHODS, WRITE_TOOLS, get_required_scopes
 from hubspot_agent.snapshot import (
     delete_undo_snapshot,
+    save_undo_snapshot,
     save_undo_snapshot_for_action,
     snapshot_dir_for_portal,
     update_undo_snapshot,
@@ -98,6 +99,48 @@ def _tool_risk_level(
     if any(s.endswith(".delete") for s in required_scopes):
         return RiskLevel.DESTRUCTIVE
     return RiskLevel.MEDIUM
+
+
+# Pattern approval is reversible-property-update-only: the two object-update
+# tools qualify; creates/deletes/merges/workflow/side-effect tools never do.
+_PATTERN_ELIGIBLE_TOOLS = frozenset({"hubspot_update_object", "hubspot_bulk_update_objects"})
+
+
+def _pattern_eligibility(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    required_scopes: set[str],
+    portal_id: str,
+) -> tuple[bool, str]:
+    """Decide once, up front, whether a ``--pattern`` request may use pattern mode.
+
+    Pattern mode is allowed ONLY for reversible, non-sensitive property updates
+    (spec §4).  Returns ``(eligible, reason)``; on reject the caller falls back to
+    the normal per-op gate and surfaces ``reason``.  Rejects when the op is
+    destructive (delete/merge), the tool is not a reversible object-update, or the
+    proposed change touches any configured sensitive property.
+    """
+    from hubspot_agent.policy import _iter_property_keys, load_approval_policy
+
+    if _tool_risk_level(required_scopes, tool_name, tool_input) == RiskLevel.DESTRUCTIVE:
+        return False, "destructive operations (delete/merge) are always individually gated"
+    if tool_name not in _PATTERN_ELIGIBLE_TOOLS:
+        return False, f"{tool_name} is not a reversible property update"
+    policy = load_approval_policy(portal_id)
+    touched = _iter_property_keys(tool_input)
+    sensitive = sorted(touched & set(policy.sensitive_properties))
+    if sensitive:
+        return False, "the change touches sensitive field(s): " + ", ".join(sensitive)
+    return True, ""
+
+
+def _pattern_value_eq(a: Any, b: Any) -> bool:
+    """Compare a re-read value against a captured pre-image value for
+    compare-and-set.  HubSpot returns property values as strings; normalize both
+    (None stays None) so ``"5"`` == ``5`` but a real drift is caught."""
+    na = None if a is None else str(a)
+    nb = None if b is None else str(b)
+    return na == nb
 
 
 def _tool_intent_type(tool_name: str, tool_input: dict[str, Any] | None = None) -> str:
@@ -328,6 +371,25 @@ async def handle_tool(client, cache, portal_config: PortalConfig, params: dict[s
         description=f"tool {tool_name}",
         risk_level=risk,
     )
+    batch_mode = BatchApprovalMode(params.get("batch_mode", "single"))
+    # Pattern approval (§4): decide eligibility once, up front.  A --pattern
+    # request that isn't a reversible, non-sensitive object-update falls back to
+    # the normal per-op gate (batch_mode → single) with a surfaced reason.  Loop
+    # steps never use pattern (it's an interactive flow — the loop pauses at
+    # every write regardless).
+    use_pattern = False
+    pattern_threshold: int | None = None
+    pattern_fallback: str | None = None
+    if batch_mode == BatchApprovalMode.PATTERN and loop_step_number is None:
+        eligible, reason = _pattern_eligibility(tool_name, tool_input, required_scopes, portal_id)
+        if eligible:
+            from hubspot_agent.policy import load_approval_policy
+
+            use_pattern = True
+            pattern_threshold = load_approval_policy(portal_id).pattern_confirm_threshold
+        else:
+            batch_mode = BatchApprovalMode.SINGLE
+            pattern_fallback = reason
     aw = await apply_write(
         client=client,
         portal_config=portal_config,
@@ -337,9 +399,12 @@ async def handle_tool(client, cache, portal_config: PortalConfig, params: dict[s
         intent=intent,
         request_text=f"tool {tool_name}",
         proposed_payload=tool_input,
-        batch_mode=BatchApprovalMode(params.get("batch_mode", "single")),
+        batch_mode=batch_mode,
         trace_id=params.get("trace_id"),
         loop_step_number=loop_step_number,
+        pattern=use_pattern,
+        pattern_confirm_threshold=pattern_threshold,
+        filter_summary=str(tool_input.get("filter_summary", "")) if isinstance(tool_input, dict) else "",
     )
     tier = aw.preview_data.get("approval_tier")
     # Bounded Autonomy (Phase 2): a provably-safe interactive write auto-applies
@@ -362,21 +427,39 @@ async def handle_tool(client, cache, portal_config: PortalConfig, params: dict[s
                 retryable=exc.retryable,
                 guidance=exc.guidance,
             )
-        return _ok(_applied_envelope(tool_name, aw, result))
-    return _ok(
-        {
-            "status": "preview",
-            "tool": tool_name,
-            "action_id": aw.action_id,
-            "preview": aw.preview.preview,
-            "risk_level": aw.preview.risk_level.value,
-            "impact_count": aw.preview.impact_count,
-            "original_values": aw.preview.original_values,
-            "required_confirmation": aw.preview.impact_count,
-            "approval_tier": tier,
-            "requires_count": tier == FULL_GATE,
+        applied = _applied_envelope(tool_name, aw, result)
+        # A --pattern request that was rejected to the normal gate still surfaces
+        # WHY, even when the fallback write auto-applied (act-and-notify).
+        if pattern_fallback is not None:
+            applied["pattern_fallback"] = pattern_fallback
+        return _ok(applied)
+    response = {
+        "status": "preview",
+        "tool": tool_name,
+        "action_id": aw.action_id,
+        "preview": aw.preview.preview,
+        "risk_level": aw.preview.risk_level.value,
+        "impact_count": aw.preview.impact_count,
+        "original_values": aw.preview.original_values,
+        "required_confirmation": aw.preview.impact_count,
+        "approval_tier": tier,
+        "requires_count": tier == FULL_GATE,
+    }
+    # Pattern mode surfaces ONE rule + matched count + a before/after sample
+    # (first pattern_sample_size records), not N previews.  A fallback reason is
+    # surfaced when a --pattern request was rejected to the normal gate.
+    pat = aw.preview_data.get("pattern")
+    if pat:
+        response["pattern_eligible"] = True
+        response["required_confirmation"] = aw.preview_data.get("required_confirmation", 0)
+        response["pattern"] = {
+            "rule": pat.get("rule"),
+            "count": pat.get("count"),
+            "sample": (pat.get("matched") or [])[: aw.preview.pattern_sample_size],
         }
-    )
+    if pattern_fallback is not None:
+        response["pattern_fallback"] = pattern_fallback
+    return _ok(response)
 
 
 def _is_destructive(preview_data: dict[str, Any]) -> bool:
@@ -500,6 +583,16 @@ async def execute_pending_write(
                 retryable=False,
                 guidance=f"Re-run as `approve {action_id} {required}` — the count must equal the impact ({required}).",
             )
+
+    # Pattern approval: the approved rule scales here with per-record
+    # compare-and-set.  Branch AFTER the count gate (so the over-threshold typed
+    # count is enforced) and BEFORE the single-write snapshot below (the pattern
+    # executor owns its own per-applied-record snapshot + audit + clear).
+    if (
+        preview_data.get("batch_mode") == BatchApprovalMode.PATTERN.value
+        and preview_data.get("pattern")
+    ):
+        return await _execute_pattern_write(portal_config, action_id, preview_data, client=client)
 
     intent = preview_data.get("intent") or {}
     intent_type = intent.get("intent_type")
@@ -661,6 +754,154 @@ async def execute_pending_write(
         tool_name=preview_data.get("tool_name"),
         data=data,
         created_ids=created_ids,
+        audit_failed=audit_failed,
+    )
+
+
+async def _execute_pattern_write(
+    portal_config: PortalConfig,
+    action_id: str,
+    preview_data: dict[str, Any],
+    *,
+    client: HubSpotClient | None = None,
+) -> ExecuteResult:
+    """Scale an approved pattern rule with per-record compare-and-set (§3/§8).
+
+    For each matched record: re-GET its current target-field values and apply the
+    change ONLY IF they still equal the captured pre-image (optimistic
+    concurrency).  Drift → skip (never overwrite); a re-read/write hard error →
+    record and CONTINUE (a bad record never aborts the batch).  The applied set's
+    pre-images are written to ONE batch undo snapshot (per-record entries; a
+    single ``hubspot undo <id>`` restores exactly what changed) and each applied
+    record gets its own audit entry.  Returns a continue-through report enumerating
+    applied / skipped_drifted / failed so a partial is never hidden.
+    """
+    portal_id = portal_config.portal_id
+    pattern = preview_data.get("pattern") or {}
+    rule = pattern.get("rule") or {}
+    object_type = rule.get("object_type")
+    matched = pattern.get("matched") or []
+    tool_name = preview_data.get("tool_name") or "hubspot_bulk_update_objects"
+
+    applied: list[str] = []
+    applied_originals: dict[str, Any] = {}
+    skipped_drifted: list[str] = []
+    failed: list[dict[str, Any]] = []
+
+    owns_client = client is None
+    if owns_client:
+        client = HubSpotClient(portal_config)
+    try:
+        for entry in matched:
+            rid = str(entry.get("id") or "")
+            pre_image = entry.get("pre_image") or {}
+            changes = entry.get("changes") or {}
+            if not rid or not changes:
+                failed.append({"id": rid, "error": "empty change set"})
+                continue
+            # (1) Re-read the current values of exactly the target fields.
+            try:
+                current = await invoke_tool(
+                    "hubspot_get_object",
+                    portal_id,
+                    object_id=rid,
+                    object_type=str(object_type),
+                    client=client,
+                    properties=list(changes.keys()),
+                )
+            except Exception as exc:  # noqa: BLE001 — continue-through, never abort
+                failed.append({"id": rid, "error": f"re-read failed: {exc}"})
+                continue
+            if not isinstance(current, dict) or current.get("error"):
+                err = current.get("error") if isinstance(current, dict) else current
+                failed.append({"id": rid, "error": f"re-read failed: {err}"})
+                continue
+            cur_props = current.get("properties") if isinstance(current.get("properties"), dict) else {}
+            # (2) Compare-and-set: apply ONLY if every target field still equals
+            # the approved pre-image.  Any drift → skip, never overwrite.
+            if any(not _pattern_value_eq(cur_props.get(k), pre_image.get(k)) for k in changes):
+                skipped_drifted.append(rid)
+                continue
+            # (3) Apply this record's change.
+            try:
+                res = await invoke_tool(
+                    "hubspot_update_object",
+                    portal_id,
+                    object_id=rid,
+                    object_type=str(object_type),
+                    properties=changes,
+                    client=client,
+                )
+            except Exception as exc:  # noqa: BLE001 — continue-through, never abort
+                failed.append({"id": rid, "error": f"write failed: {exc}"})
+                continue
+            if isinstance(res, dict) and res.get("error"):
+                failed.append({"id": rid, "error": f"write failed: {res['error']}"})
+                continue
+            applied.append(rid)
+            applied_originals[rid] = pre_image
+    finally:
+        if owns_client:
+            try:
+                await client.close()
+            except Exception as close_exc:  # noqa: BLE001 — never mask a write result
+                print(f"hubspot_agent: client.close() failed: {close_exc}", file=sys.stderr)
+
+    snap_dir = snapshot_dir_for_portal(portal_id)
+    # (4) One batch undo snapshot holding a per-record entry for each APPLIED
+    # record only (drifted/failed excluded), so `hubspot undo <id>` restores
+    # exactly the set that changed via the shared update-undo path.
+    if applied_originals:
+        try:
+            save_undo_snapshot(
+                snap_dir,
+                action_id,
+                applied_originals,
+                metadata={"intent_type": "update", "target_object": object_type, "undoable": True},
+            )
+        except Exception as snap_exc:  # noqa: BLE001 — write already committed
+            print(f"hubspot_agent: pattern batch snapshot failed: {snap_exc}", file=sys.stderr)
+
+    await asyncio.to_thread(_clear_pending, portal_id, action_id)
+
+    # (5) Per-record audit entry for each applied record (FR-17; own audit entry).
+    audit_failed = False
+    for rid in applied:
+        try:
+            audit.log_write(
+                portal_id=portal_id,
+                action=f"approve:{action_id}:{rid}",
+                agent=tool_name,
+                result_summary={
+                    "request": preview_data.get("request_text", ""),
+                    "status": "success",
+                    "record_id": rid,
+                    "pattern": True,
+                },
+                informing_sources=preview_data.get("informing_sources"),
+            )
+        except Exception as audit_exc:  # noqa: BLE001 — FR-17 fallback
+            print(f"hubspot_agent: pattern audit.log_write failed for {rid}: {audit_exc}", file=sys.stderr)
+            audit_failed = True
+
+    report = {
+        "applied": applied,
+        "skipped_drifted": skipped_drifted,
+        "failed": failed,
+        "counts": {
+            "matched": len(matched),
+            "applied": len(applied),
+            "skipped_drifted": len(skipped_drifted),
+            "failed": len(failed),
+        },
+        "undo_command": f"hubspot undo {action_id}" if applied else None,
+    }
+    return ExecuteResult(
+        status="success",
+        agent_name=None,
+        tool_name=tool_name,
+        data={"tool": tool_name, "status": "success", "pattern_report": report},
+        created_ids=[],
         audit_failed=audit_failed,
     )
 

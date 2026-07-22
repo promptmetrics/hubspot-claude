@@ -8,6 +8,9 @@ are kept in sync. Full release notes for each tag live at
 
 ## [Unreleased]
 
+### Added
+- **Pattern approval (divergence-safe) — R14.** `--pattern` lets you approve one transformation *rule*, then scales it across the matched set with per-record **compare-and-set**: a record is updated only if its current value still equals the value you approved, so records that drifted are skipped, never overwritten. Reversible non-sensitive property updates only (destructive/merge and sensitive-field writes fall back to the normal gate); matched sets over `pattern_confirm_threshold` (default 100) require the typed count; the run reports applied / skipped-drifted / failed and every applied record is undoable. Revives a subsystem previously killed for divergence risk, now resolved by exact per-record verification.
+
 ### Changed
 - **Docs:** README status table corrected (CI evaluation gate is shipped and
   branch-protection-enforced) and the risk-tiered-approval boundary described

@@ -59,6 +59,7 @@ Requirement IDs (R1–R13) map to `docs/PRD.md`, the source of truth. Don't plan
 | ✅ Shipping | 🚧 In progress | 💭 Planned |
 |-------------|----------------|-----------|
 | HITL preview → approve → execute → undo → audit on every write (R2) | — | Real-dollar loop cost ceiling (needs parent-usage injection; today's budget is a proxy) |
+| Pattern approval — approve a rule once, per-record compare-and-set scale (R14) | | |
 | CI evaluation gate — `pytest` + `plugin validate` + artifact allowlist, enforced on every PR via branch protection (R10) | | Model tiering (no plugin-side seam today) |
 | Deterministic keyword routing to ~44 specialist agents (R1) | | |
 | Count gate re-checked at execute time (R3) | | |
