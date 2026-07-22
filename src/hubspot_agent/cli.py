@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
+import uuid
 import webbrowser
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -40,11 +43,12 @@ from hubspot_agent.orchestrator import (
     parse_batch_mode,
     route_request,
     run_loop,
+    run_scheduled_due,
     run_simple,
 )
 from hubspot_agent.planning import parse_plan
 from hubspot_agent import planning
-from hubspot_agent import loop_log, loop_state
+from hubspot_agent import cron, loop_log, loop_state, schedule_store
 from hubspot_agent.persistence import (
     clear as _clear_pending_preview,
     confirm as _confirm_pending_preview,
@@ -164,6 +168,24 @@ def hubspot_command(request: str, working_dir: str = ".", *, portal_id: str | No
         if low == "verify" or low.startswith("verify "):
             return _handle_loop_verify(subcommand[6:].strip(), working_dir, portal_id)
         return "Usage: /hubspot loop {start --plan <json> | continue | verify --result <json> | status | log | checkpoint | abandon}"
+
+    if request.lower().startswith("schedule "):
+        subcommand = request[9:].strip()
+        low = subcommand.lower()
+        if low == "list":
+            return _handle_schedule_list(working_dir, portal_id)
+        if low == "run-due":
+            return _handle_schedule_run_due(working_dir, portal_id)
+        if low == "install-timer":
+            return _handle_schedule_install_timer(working_dir, portal_id)
+        if low == "add" or low.startswith("add "):
+            return _handle_schedule_add(subcommand[3:].strip(), working_dir, portal_id)
+        if low == "remove" or low.startswith("remove "):
+            return _handle_schedule_remove(subcommand[6:].strip(), working_dir, portal_id)
+        return (
+            "Usage: /hubspot schedule {add --plan <json> --cron <expr> --name <name> "
+            "| list | remove <id> | run-due | install-timer}"
+        )
 
     if request.lower() == "route" or request.lower().startswith("route "):
         return _handle_route(request[6:].strip(), working_dir, portal_id)
@@ -523,6 +545,23 @@ def _handle_status(working_dir: str, portal_id: str | None = None) -> str:
         "",
         "**Pending approvals**",
         f"- {len(pending)} preview(s) awaiting approval",
+    ])
+    # Group scheduled-origin previews by the schedule that staged them so the
+    # operator sees "from schedule X" batches; ungrouped stay in the total above.
+    grouped: dict[tuple[str, str], int] = {}
+    for path in pending:
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        origin = data.get("origin")
+        if isinstance(origin, dict) and origin.get("schedule_name"):
+            key = (origin["schedule_name"], origin.get("run_at", ""))
+            grouped[key] = grouped.get(key, 0) + 1
+    for (name, run_at), count in grouped.items():
+        lines.append(f'- from schedule "{name}" ({run_at}): {count} preview(s)')
+
+    lines.extend([
         "",
         "**Last 24 Hours**",
         f"- Requests: {agg['total_requests']}",
@@ -1039,6 +1078,182 @@ def _handle_loop_verify(args: str, working_dir: str, portal_id: str | None = Non
     if not raw:
         return "Usage: /hubspot loop verify --result '<VerificationResult JSON>'"
     return _run_async(loop_verify, raw, portal_config, working_dir)
+
+
+# Known schedule-add flags, sliced out by name so order is free and a cron
+# expression's internal spaces (e.g. "0 9 * * 1") never confuse the parser.
+_SCHEDULE_FLAG_RE = re.compile(r"(?:^|\s)--(plan|cron|name)(?:=|\s)")
+
+
+def _parse_schedule_flags(args: str) -> dict[str, str]:
+    """Split ``--plan <json> --cron <expr> --name <name>`` into a dict by flag.
+
+    Each value runs from just after its flag marker to the start of the next
+    recognized flag (or end of string), then is stripped — so a value may
+    contain spaces.  Unrecognized text returns an empty mapping.
+    """
+    matches = list(_SCHEDULE_FLAG_RE.finditer(args))
+    out: dict[str, str] = {}
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(args)
+        out[m.group(1)] = args[m.end():end].strip()
+    return out
+
+
+def _handle_schedule_add(args: str, working_dir: str, portal_id: str | None = None) -> str:
+    """``hubspot schedule add --plan '<LoopPlan JSON>' --cron '<expr>' --name '<name>'``.
+
+    Claude builds the concrete plan interactively; this stores it against a cron
+    expression so ``run-due`` can replay it deterministically (no run-time LLM).
+    """
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return "No default portal found."
+    portal_config = load_portal_config(portal_id)
+    if not portal_config:
+        return f"Portal {portal_id} has no token configured."
+
+    flags = _parse_schedule_flags(args)
+    cron_expr = flags.get("cron", "").strip()
+    name = flags.get("name", "").strip()
+    raw = flags.get("plan", "").strip()
+    if not raw or not cron_expr or not name:
+        return "Usage: /hubspot schedule add --plan '<LoopPlan JSON>' --cron '<expr>' --name '<name>'"
+
+    try:
+        cron.validate(cron_expr)
+    except ValueError as exc:
+        return f"❌ Invalid cron expression: {exc}"
+
+    plan = parse_plan(raw)
+    if plan is None:
+        field_error = planning.last_parse_error()
+        msg = (
+            "❌ Could not parse the LoopPlan JSON. Provide a plan with a `goal` and a "
+            "`steps` array (see `docs/`)."
+        )
+        if field_error:
+            msg += f"\n  Field error: {field_error}"
+        return msg
+
+    # A scheduled run replays this plan with no human present, so it must be
+    # fully concrete: every step a verbatim tool path. Free-text steps could be
+    # mutated unattended by the agent-dispatch branch (no approval) — refuse them
+    # here so they never reach the store.
+    missing = [s.step_number for s in plan.steps if s.tool_name is None]
+    if missing:
+        return (
+            "❌ Scheduled plans must be concrete: every step needs a `tool_name` "
+            f"(verbatim tool path). Steps missing tool_name: {missing}."
+        )
+
+    schedule_id = str(uuid.uuid4())[:8]
+    now = datetime.now(timezone.utc)
+    schedule = schedule_store.Schedule(
+        id=schedule_id,
+        name=name,
+        cron=cron_expr,
+        plan=plan.model_dump(mode="json"),
+        created_at=now,
+        # Seed the run clock at creation so ``run-due`` fires the first matching
+        # tick via ``is_due``'s interval scan — an unaligned poll interval
+        # (e.g. launchd StartInterval) would otherwise miss an exact-minute match.
+        last_run_at=now,
+    )
+    schedule_store.save(portal_id, schedule)
+    next_due = cron.next_due(cron_expr, now)
+    next_due_s = next_due.isoformat() if next_due else "unknown"
+    return (
+        f"✅ Scheduled '{name}' ({schedule_id}) — cron `{cron_expr}`. "
+        f"Next due {next_due_s}."
+    )
+
+
+def _handle_schedule_list(working_dir: str, portal_id: str | None = None) -> str:
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return "No default portal found."
+
+    schedules = schedule_store.list_schedules(portal_id)
+    if not schedules:
+        return f"No schedules registered for portal {portal_id}."
+
+    now = datetime.now(timezone.utc)
+    lines = [f"**Schedules for portal {portal_id}**", ""]
+    for s in schedules:
+        next_due = cron.next_due(s.cron, now)
+        next_due_s = next_due.isoformat() if next_due else "unknown"
+        status = (s.last_batch or {}).get("status", "—")
+        lines.append(
+            f"- `{s.id}` {s.name} — cron `{s.cron}`, next due {next_due_s}, "
+            f"last batch: {status}"
+        )
+    return "\n".join(lines)
+
+
+def _handle_schedule_remove(args: str, working_dir: str, portal_id: str | None = None) -> str:
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return "No default portal found."
+
+    schedule_id = args.strip()
+    if not schedule_id:
+        return "Usage: /hubspot schedule remove <id>"
+    removed = schedule_store.remove(portal_id, schedule_id)
+    if removed:
+        return f"✅ Removed schedule {schedule_id}."
+    return f"No schedule {schedule_id} found for portal {portal_id}."
+
+
+def _handle_schedule_run_due(working_dir: str, portal_id: str | None = None) -> str:
+    if portal_id is None:
+        portal_id = detect_default_portal(working_dir)
+    if not portal_id:
+        return "No default portal found."
+    portal_config = load_portal_config(portal_id)
+    if not portal_config:
+        return f"Portal {portal_id} has no token configured."
+    return _run_async(run_scheduled_due, portal_config, working_dir)
+
+
+def _handle_schedule_install_timer(working_dir: str, portal_id: str | None = None) -> str:
+    """Return copy-paste launchd (macOS) + cron (Linux) snippets that poll ``run-due``.
+
+    A documented snippet only — nothing is written to disk.  The plugin bin is
+    referenced via ``${CLAUDE_PLUGIN_ROOT}`` (resolved by the plugin runtime).
+    """
+    bin_path = "${CLAUDE_PLUGIN_ROOT}/bin/hubspot"
+    launchd = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n'
+        "<dict>\n"
+        "  <key>Label</key><string>dev.promptmetrics.hubspot.schedule</string>\n"
+        "  <key>ProgramArguments</key>\n"
+        "  <array>\n"
+        f"    <string>{bin_path}</string>\n"
+        "    <string>schedule</string>\n"
+        "    <string>run-due</string>\n"
+        "  </array>\n"
+        "  <key>StartInterval</key><integer>900</integer>\n"
+        "  <key>RunAtLoad</key><true/>\n"
+        "</dict>\n"
+        "</plist>"
+    )
+    cron_line = f"*/15 * * * * {bin_path} schedule run-due"
+    return (
+        "Install an external timer that polls `schedule run-due` every 15 minutes.\n\n"
+        "**macOS (launchd)** — save as "
+        "`~/Library/LaunchAgents/dev.promptmetrics.hubspot.schedule.plist`, then "
+        "`launchctl load` it:\n\n"
+        f"```xml\n{launchd}\n```\n\n"
+        "**Linux (cron)** — add to your crontab (`crontab -e`):\n\n"
+        f"```cron\n{cron_line}\n```"
+    )
 
 
 def _handle_loop_status(working_dir: str, portal_id: str | None = None) -> str:

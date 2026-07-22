@@ -41,6 +41,9 @@ class LoopState:
         api_call_count: int = 0,
         rate_remaining: int | None = None,
         rate_reset_at: float | None = None,
+        run_mode: str = "interactive",
+        staged_action_ids: list[str] | None = None,
+        state_key: str | None = None,
     ) -> None:
         self.portal_id = portal_id
         self.request_text = request_text
@@ -70,6 +73,16 @@ class LoopState:
         # (legacy states and a loop that has not yet observed a rate header).
         self.rate_remaining = rate_remaining
         self.rate_reset_at = rate_reset_at
+        # Scheduled-tasks (Phase 4): ``run_mode`` "scheduled" makes _drive_loop
+        # stage each write as a pending preview and continue (deferred approval)
+        # instead of pausing at ``awaiting_approval``; ``staged_action_ids``
+        # collects those queued action_ids; ``state_key`` routes persistence to
+        # a per-run file under ``schedules/runs/`` so a scheduled run never
+        # collides with the interactive ``loop-state.json``. Defaults keep the
+        # interactive path byte-identical (mode "interactive", key None).
+        self.run_mode = run_mode
+        self.staged_action_ids = staged_action_ids or []
+        self.state_key = state_key
 
     @property
     def total_steps(self) -> int:
@@ -95,6 +108,9 @@ class LoopState:
             "api_call_count": self.api_call_count,
             "rate_remaining": self.rate_remaining,
             "rate_reset_at": self.rate_reset_at,
+            "run_mode": self.run_mode,
+            "staged_action_ids": self.staged_action_ids,
+            "state_key": self.state_key,
         }
 
     @classmethod
@@ -118,11 +134,23 @@ class LoopState:
             api_call_count=data.get("api_call_count", 0),
             rate_remaining=data.get("rate_remaining"),
             rate_reset_at=data.get("rate_reset_at"),
+            run_mode=data.get("run_mode", "interactive"),
+            staged_action_ids=data.get("staged_action_ids"),
+            state_key=data.get("state_key"),
         )
 
 
-def _state_path(portal_id: str) -> Path:
-    return CONFIG_DIR / portal_id / "loop-state.json"
+def _state_path(portal_id: str, state_key: str | None = None) -> Path:
+    """Path to the persisted state file.
+
+    Interactive loops (``state_key`` None) use the single per-portal
+    ``loop-state.json``; a scheduled run keys off its schedule id into a
+    dedicated ``schedules/runs/<key>.json`` so it never collides with an
+    interactive loop's state.
+    """
+    if state_key is None:
+        return CONFIG_DIR / portal_id / "loop-state.json"
+    return CONFIG_DIR / portal_id / "schedules" / "runs" / f"{state_key}.json"
 
 
 def load(portal_id: str) -> LoopState | None:
@@ -143,7 +171,7 @@ def load(portal_id: str) -> LoopState | None:
 def save(state: LoopState) -> Path:
     """Atomically persist loop state to disk."""
     state.updated_at = datetime.now(timezone.utc)
-    path = _state_path(state.portal_id)
+    path = _state_path(state.portal_id, state.state_key)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     dir_fd = os.open(path.parent, os.O_RDONLY)
@@ -167,8 +195,15 @@ def save(state: LoopState) -> Path:
 
 
 def clear(portal_id: str) -> None:
-    """Remove persisted loop state for a portal."""
+    """Remove persisted (interactive) loop state for a portal."""
     path = _state_path(portal_id)
+    if path.exists():
+        path.unlink()
+
+
+def clear_run(state: LoopState) -> None:
+    """Remove the persisted state file for a scheduled run (its own ``state_key``)."""
+    path = _state_path(state.portal_id, state.state_key)
     if path.exists():
         path.unlink()
 

@@ -80,6 +80,24 @@ def test_reap_expired_removes_old(monkeypatch, tmp_path):
     assert persistence.load("123", "act-1") is None
 
 
+def test_reap_expired_skips_schedule_staged_previews(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    # A schedule-staged preview (carries ``origin``) is owned by the schedule
+    # queue TTL, not the 24h interactive reaper; a plain preview is reaped.
+    persistence.store("123", "staged", {
+        "proposed_payload": {},
+        "origin": {"schedule_id": "s1", "schedule_name": "X", "run_at": "2026-07-22T09:30:00+00:00"},
+    })
+    persistence.store("123", "adhoc", {"proposed_payload": {}})
+
+    # Negative max_age -> cutoff in the future -> every non-origin preview expires.
+    removed = persistence.reap_expired("123", max_age_hours=-1)
+
+    assert removed == 1
+    assert persistence.load("123", "staged") is not None  # survives
+    assert persistence.load("123", "adhoc") is None  # reaped
+
+
 # ---------------------------------------------------------------------------
 # M4: action_id / portal_id path traversal must not escape the pending dir
 # ---------------------------------------------------------------------------

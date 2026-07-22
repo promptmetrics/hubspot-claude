@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -36,7 +36,9 @@ from hubspot_agent.sequential_dispatch import (
 from hubspot_agent.snapshot import load_undo_snapshot, snapshot_dir_for_portal
 from hubspot_agent.validation import format_scope_error, validate_scopes
 from hubspot_agent.loop_controller import LoopController
-from hubspot_agent import audit, loop_log, loop_state
+from hubspot_agent import audit, cron, loop_log, loop_state, schedule_store
+from hubspot_agent.policy import load_approval_policy
+from hubspot_agent.trace import new_trace_id
 
 
 async def initialize_session(portal_id: str) -> None:
@@ -1055,6 +1057,33 @@ async def _drive_loop(portal_config, state: loop_state.LoopState, working_dir: s
             "action": step.action,
         })
 
+        # Safety invariant (scheduled runs never mutate unattended): a scheduled
+        # plan MUST be fully concrete — every step carries ``tool_name`` and runs
+        # the verbatim-tool branch below, which stages writes as pending previews.
+        # The free-text agent branches (preview-pause and, critically, the
+        # ``mode="execute"`` low-risk branch) can classify a step as a read via
+        # ``is_write_step`` yet execute it as a write via ``_parse_agent_intent``
+        # — an unattended mutation with no approval.  Refuse to run a free-text
+        # step in scheduled mode rather than reach that path.  (schedule ``add``
+        # rejects non-concrete plans up front; this is defense-in-depth.)
+        if state.run_mode == "scheduled" and step.tool_name is None:
+            state.status = "failed"
+            state.last_error = (
+                f"Scheduled plans must be concrete tool-path plans; step "
+                f"{step.step_number} has no tool_name. Free-text agent steps "
+                f"are refused unattended (they could mutate without approval)."
+            )
+            loop_state.save(state)
+            loop_log.log_event(portal_id, state.trace_id, "step_failed", {
+                "step_number": step.step_number,
+                "error": state.last_error,
+            })
+            return _format_loop_result(
+                portal_config,
+                state,
+                f"Execution stopped at step {step.step_number}: {state.last_error}",
+            )
+
         # Verbatim tool path (PR 2 / bug 2): a step with ``tool_name`` executes
         # the exact ``tool_input`` through ``handle_tool`` instead of free-text
         # agent dispatch, so a write lands on the named record — never a fuzzy
@@ -1116,6 +1145,15 @@ async def _drive_loop(portal_config, state: loop_state.LoopState, working_dir: s
                 )
             if outcome["kind"] == "preview":
                 _capture_rate_state(state, portal_id)
+                if state.run_mode == "scheduled":
+                    state.staged_action_ids.append(outcome["action_id"])
+                    state.current_step += 1
+                    loop_state.save(state)
+                    loop_log.log_event(portal_id, state.trace_id, "write_staged", {
+                        "step_number": step.step_number,
+                        "action_id": outcome["action_id"],
+                    })
+                    continue
                 state.pending_action_id = outcome["action_id"]
                 state.status = "awaiting_approval"
                 loop_state.save(state)
@@ -1178,7 +1216,17 @@ async def _drive_loop(portal_config, state: loop_state.LoopState, working_dir: s
                     f"Execution stopped at step {step.step_number}: {preview.error_message}",
                 )
             _capture_rate_state(state, portal_id)
-            state.pending_action_id = preview.data.get("action_id")
+            action_id = preview.data.get("action_id")
+            if state.run_mode == "scheduled":
+                state.staged_action_ids.append(action_id)
+                state.current_step += 1
+                loop_state.save(state)
+                loop_log.log_event(portal_id, state.trace_id, "write_staged", {
+                    "step_number": step.step_number,
+                    "action_id": action_id,
+                })
+                continue
+            state.pending_action_id = action_id
             state.status = "awaiting_approval"
             loop_state.save(state)
             loop_log.log_event(portal_id, state.trace_id, "awaiting_approval", {
@@ -1244,7 +1292,10 @@ async def _drive_loop(portal_config, state: loop_state.LoopState, working_dir: s
         "steps_completed": state.current_step,
     })
     result = _format_loop_result(portal_config, state, "Loop completed successfully.")
-    loop_state.clear(portal_id)
+    if state.run_mode == "scheduled":
+        loop_state.clear_run(state)
+    else:
+        loop_state.clear(portal_id)
     return result
 
 
@@ -1384,6 +1435,145 @@ async def run_loop(
         "step_count": len(plan.steps),
     })
     return await _drive_loop_guarded(portal_config, state, working_dir)
+
+
+async def run_scheduled_due(portal_config, working_dir: str, *, now: datetime | None = None) -> str:
+    """Timer entry point (Phase 4): run every schedule that is due, staging writes.
+
+    For each stored schedule, in order:
+      1. Overlap/expiry gate — if the prior batch is still ``running``/``pending``,
+         expire it once older than ``schedule_queue_ttl_days`` (clear its queued
+         previews, mark ``expired`` → eligible again) or else SKIP this fire.
+      2. Due gate — ``cron.is_due(cron, last_run_at, now)``; not due → skip.
+      3. Run — replay the stored plan through ``_drive_loop`` in scheduled mode
+         (reads inline, every write staged as a pending preview, nothing mutated),
+         stamp each staged preview with its schedule provenance, and record the
+         batch (``pending`` if writes queued, else ``done``).
+
+    No Claude / no LLM at run time; the plan is replayed deterministically.  Each
+    schedule is isolated in try/except so one failure never aborts the sweep.
+    """
+    portal_id = portal_config.portal_id
+    now = now or datetime.now(timezone.utc)
+    ttl_days = load_approval_policy(portal_id).schedule_queue_ttl_days
+
+    results: list[str] = []
+    for schedule in schedule_store.list_schedules(portal_id):
+        trace_id = new_trace_id()
+        try:
+            results.append(
+                await _run_one_schedule(portal_config, schedule, now, ttl_days, trace_id, working_dir)
+            )
+        except Exception as exc:  # one schedule's failure must not abort the sweep
+            schedule_store.set_last_batch(portal_id, schedule.id, {
+                "run_at": now.isoformat(),
+                "status": "failed",
+                "pending_action_ids": [],
+                "summary": f"run failed: {exc}",
+            })
+            loop_log.log_event(portal_id, trace_id, "schedule_failed", {
+                "schedule_id": schedule.id,
+                "error": str(exc),
+            })
+            results.append(f'- "{schedule.name}" ({schedule.id}): failed — {exc}')
+
+    if not results:
+        return f"No schedules registered for portal {portal_id}."
+    return f"Scheduled sweep @ {now.isoformat()}:\n" + "\n".join(results)
+
+
+async def _run_one_schedule(portal_config, schedule, now: datetime, ttl_days: int, trace_id: str, working_dir: str) -> str:
+    """Evaluate one schedule's gates and run it if due.  Returns a summary line."""
+    portal_id = portal_config.portal_id
+    name, sid = schedule.name, schedule.id
+
+    # 1. Overlap / expiry gate.
+    #
+    # "Still pending" is derived from disk, NOT the stored status string: a
+    # queued preview that the operator has approved or rejected no longer exists
+    # (the approve/reject path clears it and never touches ``last_batch``).  So a
+    # daily schedule un-freezes as soon as its batch is resolved — we only skip
+    # while previews genuinely remain unapproved, and only until the queue TTL.
+    last_batch = schedule.last_batch
+    if last_batch and last_batch.get("status") in ("running", "pending"):
+        batch_ids = last_batch.get("pending_action_ids") or []
+        still_pending = [aid for aid in batch_ids if _load_pending_preview(portal_id, aid) is not None]
+        if still_pending:
+            run_at_s = last_batch.get("run_at")
+            expired = True
+            if run_at_s:
+                expired = (now - datetime.fromisoformat(run_at_s)) >= timedelta(days=ttl_days)
+            if not expired:
+                loop_log.log_event(portal_id, trace_id, "schedule_skipped", {
+                    "schedule_id": sid,
+                    "reason": "prior batch pending",
+                    "remaining": len(still_pending),
+                })
+                return f'- "{name}" ({sid}): skipped (prior batch pending, {len(still_pending)} unreviewed)'
+            # TTL exceeded: drop the still-queued previews, mark expired → eligible.
+            for aid in still_pending:
+                _clear_pending_preview(portal_id, aid)
+            schedule_store.set_last_batch(portal_id, sid, {**last_batch, "status": "expired"})
+            loop_log.log_event(portal_id, trace_id, "batch_expired", {
+                "schedule_id": sid,
+                "cleared": len(still_pending),
+            })
+        # else: every queued preview was approved/rejected — the batch is
+        # resolved; fall through to the due gate so the schedule runs normally.
+
+    # 2. Due gate.
+    if not cron.is_due(schedule.cron, schedule.last_run_at, now):
+        return f'- "{name}" ({sid}): skipped (not due)'
+
+    # 3. Run — mark the batch running, replay the stored plan in scheduled mode.
+    schedule_store.set_last_batch(portal_id, sid, {
+        "run_at": now.isoformat(),
+        "status": "running",
+        "pending_action_ids": [],
+    })
+    state = loop_state.LoopState(
+        portal_id=portal_id,
+        request_text=name,
+        trace_id=trace_id,
+        plan=LoopPlan.model_validate(schedule.plan),
+        run_mode="scheduled",
+        state_key=sid,
+    )
+    loop_log.log_event(portal_id, trace_id, "schedule_run_started", {
+        "schedule_id": sid,
+        "step_count": len(state.plan.steps),
+    })
+    await _drive_loop(portal_config, state, working_dir)
+    staged = list(state.staged_action_ids)
+
+    # Provenance: stamp each staged preview so approval + status can attribute it.
+    for aid in staged:
+        preview_data = _load_pending_preview(portal_id, aid)
+        if preview_data is None:
+            continue
+        preview_data["origin"] = {
+            "schedule_id": sid,
+            "schedule_name": name,
+            "run_at": now.isoformat(),
+        }
+        _store_pending_preview(portal_id, aid, preview_data)
+
+    # Record the batch outcome and advance the schedule's clock.
+    summary = f"{len(staged)} write(s) staged" if staged else "nothing to stage"
+    schedule_store.set_last_batch(portal_id, sid, {
+        "run_at": now.isoformat(),
+        "status": "pending" if staged else "done",
+        "pending_action_ids": staged,
+        "summary": summary,
+    })
+    schedule_store.set_last_run(portal_id, sid, now)
+    loop_state.clear_run(state)
+    loop_log.log_event(portal_id, trace_id, "schedule_run_completed", {
+        "schedule_id": sid,
+        "staged": len(staged),
+        "loop_status": state.status,
+    })
+    return f'- "{name}" ({sid}): ran, {summary}'
 
 
 async def loop_verify(

@@ -197,6 +197,35 @@ The agent routes each request to the correct specialist sub-agent — objects, p
 
 ---
 
+## Scheduled / recurring tasks
+
+Run hygiene on a cadence without keeping a session open. A schedule stores a
+concrete plan plus a cron expression; an OS timer replays it, running the reads
+unattended and **staging every write for you to approve later** — nothing
+mutates on its own.
+
+```bash
+# 1. Register a schedule (Claude builds the concrete plan; you supply the cron).
+hubspot schedule add --plan '<LoopPlan JSON>' --cron '0 9 * * 1' --name 'Weekly stale-deal sweep'
+
+# 2. Install the OS timer that polls for due schedules (prints a launchd/cron snippet).
+hubspot schedule install-timer
+
+# 3. Inspect / manage.
+hubspot schedule list
+hubspot schedule remove <id>
+```
+
+When a schedule fires, its writes appear under **Pending approvals** in
+`hubspot status`, grouped by schedule. Approve them as usual — each write
+re-checks the record with compare-and-set, so anything that drifted since the
+run is skipped, never overwritten. A schedule won't re-run while its last batch
+is still unreviewed; an unreviewed batch expires after `schedule_queue_ttl_days`
+(default 7). Plans must be concrete (every step a specific tool call) so the
+timer can replay them deterministically with no model in the loop.
+
+---
+
 ## Next Steps
 
 - **Full feature reference:** See [docs/superpowers/USER_MANUAL.md](docs/superpowers/USER_MANUAL.md)

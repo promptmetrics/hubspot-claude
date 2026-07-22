@@ -8,6 +8,25 @@ are kept in sync. Full release notes for each tag live at
 
 ## [Unreleased]
 
+## [0.2.13] — 2026-07-22
+
+### Added
+- **Scheduled / recurring tasks — R15.** `hubspot schedule add|list|remove|run-due|install-timer`
+  registers a recurring job (a concrete tool-path plan + a cron expression) that
+  an external timer (`launchd`/`cron`) replays via `run-due` — no always-on
+  daemon. A scheduled run executes reads inline and **stages every write as a
+  pending preview**; nothing is mutated unattended. You approve the queued batch
+  later, and each write re-verifies with per-record **compare-and-set** (drift →
+  skip), so a deferred approval can't clobber a record that changed in the
+  meantime. A schedule is skipped while its prior batch is still unreviewed and
+  un-freezes as soon as you resolve it; a batch left unreviewed past
+  `schedule_queue_ttl_days` (default 7) expires. Free-text (non-concrete) plans
+  are refused — a schedule must be a verbatim tool-path plan so cron can replay
+  it deterministically with no run-time LLM. The interactive loop is unchanged
+  (it still pauses at every write). New `cron.py` (in-house 5-field evaluator)
+  and `schedule_store.py` (per-portal, flock + atomic writes); `hubspot status`
+  groups queued previews by the schedule that staged them.
+
 ## [0.2.12] — 2026-07-22
 
 ### Added
