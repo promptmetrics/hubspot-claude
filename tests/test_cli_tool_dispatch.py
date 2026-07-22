@@ -403,13 +403,21 @@ def test_raw_api_mutating_methods_route_through_apply_write(tmp_path, monkeypatc
 def test_approve_executes_tool_initiated_preview(tmp_path, monkeypatch):
     cli, _ = _bootstrap_portal(tmp_path, monkeypatch)
     # Let the real apply_write run so a pending preview is persisted; the store
-    # binding writes under the redirected CONFIG_DIR (tmp_path).
+    # binding writes under the redirected CONFIG_DIR (tmp_path).  Phase 2: a
+    # plain create AUTO-applies (no pending to approve), so this uses a create
+    # that touches a sensitive property (lifecyclestage) -> CONFIRM tier, which
+    # STILL previews and is approved count-free.  A create's preview builder
+    # does no GET, so the real path needs no network.
 
     out = hubspot_command(
-        'tool hubspot_create_object --input {"object_type":"contacts","properties":{"firstname":"Izzy"}}',
+        'tool hubspot_create_object --input {"object_type":"contacts","properties":{"lifecyclestage":"lead"}}',
         working_dir=str(tmp_path),
     )
     preview_payload = json.loads(out)
+    # CONFIRM tier: previews, approvable with no typed count.
+    assert preview_payload["status"] == "preview"
+    assert preview_payload["approval_tier"] == "CONFIRM"
+    assert preview_payload["requires_count"] is False
     action_id = preview_payload["action_id"]
 
     # The preview must have been persisted (real store under tmp_path).
@@ -436,7 +444,7 @@ def test_approve_executes_tool_initiated_preview(tmp_path, monkeypatch):
     result = hubspot_command(f"approve {action_id}", working_dir=str(tmp_path))
     assert "Approved and executed" in result
     assert executed["tool"] == "hubspot_create_object"
-    assert executed["kwargs"]["properties"]["firstname"] == "Izzy"
+    assert executed["kwargs"]["properties"]["lifecyclestage"] == "lead"
     assert executed["kwargs"]["object_type"] == "contacts"
 
 
@@ -448,11 +456,17 @@ def test_cli_approve_soft_failure_keeps_preview(tmp_path, monkeypatch):
     """
     _bootstrap_portal(tmp_path, monkeypatch)
 
+    # Phase 2: a gated op is required so there IS a pending to approve and the
+    # approve-time execute failure is what's tested.  A create touching a
+    # sensitive property (lifecyclestage) is CONFIRM tier — it previews instead
+    # of auto-applying — and its preview builder does no GET (no network).
     out = hubspot_command(
-        'tool hubspot_create_object --input {"object_type":"contacts","properties":{"firstname":"Izzy"}}',
+        'tool hubspot_create_object --input {"object_type":"contacts","properties":{"lifecyclestage":"lead"}}',
         working_dir=str(tmp_path),
     )
-    action_id = json.loads(out)["action_id"]
+    preview_payload = json.loads(out)
+    assert preview_payload["status"] == "preview"
+    action_id = preview_payload["action_id"]
 
     from hubspot_agent.persistence import load as load_pending
     from hubspot_agent.snapshot import snapshot_dir_for_portal
@@ -494,12 +508,17 @@ def test_approve_uses_portal_id_kwarg_not_default_portal(tmp_path, monkeypatch):
 
     from hubspot_agent.persistence import load as load_pending
 
-    # Create a pending preview under portal 999 via the tool write path.
+    # Create a pending preview under portal 999 via the tool write path.  Phase
+    # 2: a plain create AUTO-applies (leaving no pending), so use a create that
+    # touches a sensitive property (lifecyclestage) -> CONFIRM tier, which
+    # previews and persists a pending record to approve.
     out = hubspot_command(
-        'tool hubspot_create_object --input {"object_type":"contacts","properties":{"firstname":"Izzy"}}',
+        'tool hubspot_create_object --input {"object_type":"contacts","properties":{"lifecyclestage":"lead"}}',
         working_dir=str(tmp_path), portal_id="999",
     )
-    action_id = json.loads(out)["action_id"]
+    preview_payload = json.loads(out)
+    assert preview_payload["status"] == "preview"
+    action_id = preview_payload["action_id"]
 
     # The preview is portal-scoped to 999; the default portal (123) has nothing.
     assert load_pending("999", action_id) is not None
@@ -527,7 +546,7 @@ def test_approve_uses_portal_id_kwarg_not_default_portal(tmp_path, monkeypatch):
     assert "Approved and executed" in result
     assert executed["portal_id"] == "999"
     assert executed["tool"] == "hubspot_create_object"
-    assert executed["kwargs"]["properties"]["firstname"] == "Izzy"
+    assert executed["kwargs"]["properties"]["lifecyclestage"] == "lead"
     # Preview cleared after a successful execute.
     assert load_pending("999", action_id) is None
 

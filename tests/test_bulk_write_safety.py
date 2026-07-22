@@ -59,29 +59,6 @@ async def test_bulk_update_preview_captures_each_record_originals(portal_dir):
         if tool_name == "hubspot_get_object":
             oid = str(kwargs["object_id"])
             return {"id": oid, "properties": originals[oid]}
-        return {}
-
-    portal_config = PortalConfig(portal_id="123", token="test-token")
-    with patch("hubspot_agent.handlers.invoke_tool", side_effect=fake_invoke):
-        result = await handle_tool(
-            _FakeClient(), None, portal_config,
-            {"tool_name": "hubspot_bulk_update_objects", "input": _bulk_update_input()},
-        )
-
-    data = result["data"]
-    assert data["status"] == "preview"
-    assert data["required_confirmation"] == 2
-    assert data["original_values"] == originals
-
-
-@pytest.mark.asyncio
-async def test_bulk_update_bare_approve_refused_then_exact_count_executes(portal_dir):
-    originals = {"c-1": {"firstname": "Old1"}, "c-2": {"firstname": "Old2"}}
-
-    async def fake_invoke(tool_name, portal_id, **kwargs):
-        if tool_name == "hubspot_get_object":
-            oid = str(kwargs["object_id"])
-            return {"id": oid, "properties": originals[oid]}
         if tool_name == "hubspot_bulk_update_objects":
             return {"succeeded": 2, "failed": 0, "total": 2, "results": [], "errors": []}
         return {}
@@ -92,23 +69,74 @@ async def test_bulk_update_bare_approve_refused_then_exact_count_executes(portal
             _FakeClient(), None, portal_config,
             {"tool_name": "hubspot_bulk_update_objects", "input": _bulk_update_input()},
         )
-        action_id = result["data"]["action_id"]
 
-        # Bug 5a: bare approve (no count) on a 2-record write is refused.
-        with pytest.raises(Exception) as exc:
-            await execute_pending_write(portal_config, action_id, confirm_count=None)
-        assert "Multi-record" in str(exc.value) or "impact count" in str(exc.value)
-
-        # Exact count executes and saves a snapshot with both records' originals.
-        exec_result = await execute_pending_write(portal_config, action_id, confirm_count=2)
-        assert exec_result.status == "success"
-
+    data = result["data"]
+    # Phase 2: a reversible 2-record bulk update is AUTO tier and applies
+    # immediately — there is no preview envelope to inspect.
+    assert data["status"] == "applied"
+    action_id = data["action_id"]
+    # Capture-for-undo coverage is preserved: the undo snapshot written for the
+    # action_id holds EVERY record's pre-change originals (asserted on the
+    # snapshot instead of the now-gone preview envelope).
     snapshot_file = portal_dir / "123" / "undo_snapshots" / f"{action_id}.json"
     assert snapshot_file.exists()
     snapshot = json.loads(snapshot_file.read_text())
     assert snapshot["original_values"] == originals
     assert snapshot["metadata"]["intent_type"] == "update"
     assert snapshot["metadata"]["undoable"] is True
+
+
+@pytest.mark.asyncio
+async def test_reversible_bulk_update_auto_applies_but_destructive_still_gated(portal_dir):
+    """Phase 2 contract shift + preserved count-gate coverage.
+
+    The old Bug-5a typed-count gate for a *reversible* multi-record bulk UPDATE
+    is intentionally gone: such a write is AUTO tier and applies with no count.
+    The typed-count (FULL_GATE) gate now guards destructive / non-reversible
+    ops, which this test still exercises via a destructive delete — bare approve
+    is refused, exact count executes.  Count-gate coverage stays in this file.
+    """
+    originals = {"c-1": {"firstname": "Old1"}, "c-2": {"firstname": "Old2"}}
+
+    async def fake_invoke(tool_name, portal_id, **kwargs):
+        if tool_name == "hubspot_get_object":
+            oid = str(kwargs["object_id"])
+            return {"id": oid, "properties": originals.get(oid, {"firstname": "Old"})}
+        if tool_name == "hubspot_bulk_update_objects":
+            return {"succeeded": 2, "failed": 0, "total": 2, "results": [], "errors": []}
+        if tool_name == "hubspot_delete_object":
+            return {"id": str(kwargs.get("object_id")), "archived": True}
+        return {}
+
+    portal_config = PortalConfig(portal_id="123", token="test-token")
+    with patch("hubspot_agent.handlers.invoke_tool", side_effect=fake_invoke):
+        # (a) reversible 2-record bulk update AUTO-applies — no count needed.
+        applied = await handle_tool(
+            _FakeClient(), None, portal_config,
+            {"tool_name": "hubspot_bulk_update_objects", "input": _bulk_update_input()},
+        )
+        assert applied["data"]["status"] == "applied"
+
+        # (b) a destructive delete is FULL_GATE: it previews and demands a count.
+        preview = await handle_tool(
+            _FakeClient(), None, portal_config,
+            {"tool_name": "hubspot_delete_object", "input": {"object_type": "contacts", "object_id": "c-1"}},
+        )
+        del_data = preview["data"]
+        assert del_data["status"] == "preview"
+        assert del_data["requires_count"] is True
+        del_action = del_data["action_id"]
+
+        # Bare approve (no count) on a destructive write is refused.
+        with pytest.raises(Exception) as exc:
+            await execute_pending_write(portal_config, del_action, confirm_count=None)
+        assert "Destructive" in str(exc.value) or "impact count" in str(exc.value)
+        # Gate rejected before execution — the preview is still on disk.
+        assert (portal_dir / "123" / "pending_previews" / f"{del_action}.json").exists()
+
+        # Exact count executes the destructive write.
+        exec_result = await execute_pending_write(portal_config, del_action, confirm_count=1)
+        assert exec_result.status == "success"
 
 
 @pytest.mark.asyncio
@@ -212,10 +240,15 @@ async def test_bulk_update_flat_records_rejected_at_preview(portal_dir):
 
 
 def test_bulk_update_undo_restores_all_records(portal_dir):
-    """End-to-end via the CLI: bulk update -> approve with count -> undo.
+    """End-to-end via the CLI: bulk update AUTO-applies -> undo.
 
-    Patches ``handlers.invoke_tool`` for the preview pre-fetch + execute, then
-    ``cli.invoke_tool`` + ``HubSpotClient`` for the undo restores.
+    Phase 2: a reversible 2-record bulk update is AUTO tier, so the ``tool``
+    command executes immediately (capturing the undo snapshot on the way) —
+    there is no separate ``approve`` step.  Undo must still restore every
+    record from the captured snapshot, so undo coverage is preserved.
+
+    Patches ``handlers.invoke_tool`` for the preview pre-fetch + auto-execute,
+    then ``cli.invoke_tool`` + ``HubSpotClient`` for the undo restores.
     """
     originals = {
         "c-1": {"firstname": "Old1", "email": "a@example.com"},
@@ -233,18 +266,15 @@ def test_bulk_update_undo_restores_all_records(portal_dir):
     portal_config = PortalConfig(portal_id="123", token="test-token")
     action_id = None
     with patch("hubspot_agent.handlers.invoke_tool", side_effect=fake_invoke):
-        preview = hubspot_command(
+        applied = hubspot_command(
             "tool hubspot_bulk_update_objects --input "
             + json.dumps(_bulk_update_input()),
             working_dir=str(portal_dir),
         )
-        payload = json.loads(preview)
+        payload = json.loads(applied)
+        # AUTO-applied in one shot (no approve): the bulk update ran now.
+        assert payload["status"] == "applied"
         action_id = payload["action_id"]
-
-    # Approve with the exact count executes the bulk update (handlers.invoke_tool).
-    with patch("hubspot_agent.handlers.invoke_tool", side_effect=fake_invoke):
-        approved = hubspot_command(f"approve {action_id} 2", working_dir=str(portal_dir))
-    assert "Approved and executed" in approved
 
     restore_calls: list[dict] = []
 
