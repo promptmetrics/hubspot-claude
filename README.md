@@ -31,6 +31,7 @@ It runs as a Claude Code plugin (`/hubspot`). Claude orchestrates ~44 stateless 
 - **Work across every portal you manage** — state is isolated per portal and auto-detected from a `.hubspot-portal` file. No cross-portal accidents.
 - **Turn one portal workflow into a reusable template** — extract an existing workflow into a reviewable JSON blueprint, parameterize it, and create new workflows from it.
 - **Let trivial writes flow, gate the risky ones** — risk-tiered approval auto-applies provably-safe, reversible writes (up to a configurable record ceiling) while still gating destructive, over-ceiling, non-undoable, sensitive-field, and side-effectful workflow writes.
+- **Approve a cleanup once, apply it to the whole set** — with `--pattern`, approve one transformation rule and scale it across every matched record via per-record compare-and-set: records that have drifted from what you approved are skipped, never overwritten.
 
 The exact agent, tool, and blueprint counts live in code — run `hubspot agents list` / `hubspot tools list` rather than trusting a number in prose.
 
