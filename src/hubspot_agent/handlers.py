@@ -24,6 +24,7 @@ from hubspot_agent.models import BatchApprovalMode, RiskLevel, TaskIntent
 from hubspot_agent.persistence import clear as _clear_pending
 from hubspot_agent.persistence import confirm as _confirm_pending
 from hubspot_agent.persistence import load as _load_pending
+from hubspot_agent.policy import AUTO, FULL_GATE
 from hubspot_agent.safety import apply_write
 from hubspot_agent.scope_registry import RAW_API_WRITE_METHODS, WRITE_TOOLS, get_required_scopes
 from hubspot_agent.snapshot import (
@@ -283,6 +284,7 @@ async def handle_tool(client, cache, portal_config: PortalConfig, params: dict[s
     tool_input = params.get("input") or {}
     if not isinstance(tool_input, dict):
         raise HandlerError("validation", "'input' must be a JSON object.")
+    loop_step_number = params.get("loop_step_number")
     target_object = tool_input.get("object_type") if isinstance(tool_input, dict) else None
 
     if tool_name == "hubspot_bulk_update_objects":
@@ -337,8 +339,30 @@ async def handle_tool(client, cache, portal_config: PortalConfig, params: dict[s
         proposed_payload=tool_input,
         batch_mode=BatchApprovalMode(params.get("batch_mode", "single")),
         trace_id=params.get("trace_id"),
-        loop_step_number=params.get("loop_step_number"),
+        loop_step_number=loop_step_number,
     )
+    tier = aw.preview_data.get("approval_tier")
+    # Bounded Autonomy (Phase 2): a provably-safe interactive write auto-applies
+    # (act-and-notify) — execute now, report the result + an undo command.
+    # Loop-originated writes (loop_step_number set) NEVER auto-apply; the durable
+    # loop still pauses at every write.
+    if tier == AUTO and loop_step_number is None:
+        try:
+            result = await execute_pending_write(portal_config, aw.action_id, client=client)
+        except ExecuteError as exc:
+            # Auto-apply failed mid-execute (e.g. transient HubSpot 401/429). The
+            # pending record is retained on disk in a completable state, so tell
+            # the operator how to finish or discard it rather than leaking a
+            # generic error and an invisible pending write.
+            raise HandlerError(
+                exc.kind,
+                f"Auto-apply of {tool_name} failed: {exc.message}. The change is staged as "
+                f"pending action {aw.action_id} — run `hubspot approve {aw.action_id}` to complete "
+                f"it or `hubspot reject {aw.action_id}` to discard.",
+                retryable=exc.retryable,
+                guidance=exc.guidance,
+            )
+        return _ok(_applied_envelope(tool_name, aw, result))
     return _ok(
         {
             "status": "preview",
@@ -349,6 +373,8 @@ async def handle_tool(client, cache, portal_config: PortalConfig, params: dict[s
             "impact_count": aw.preview.impact_count,
             "original_values": aw.preview.original_values,
             "required_confirmation": aw.preview.impact_count,
+            "approval_tier": tier,
+            "requires_count": tier == FULL_GATE,
         }
     )
 
@@ -358,6 +384,32 @@ def _is_destructive(preview_data: dict[str, Any]) -> bool:
     intent = preview_data.get("intent") or {}
     risk = preview.get("risk_level") or intent.get("risk_level")
     return risk == RiskLevel.DESTRUCTIVE.value
+
+
+def _applied_envelope(tool_name: str, aw, result: "ExecuteResult") -> dict[str, Any]:
+    """Envelope for an auto-applied (AUTO-tier) write: the executed result plus
+    an undo affordance.  This is a *final result*, not step narration, so it is
+    surfaced even under quiet/terse output."""
+    n = aw.preview.impact_count
+    obj = (aw.preview_data.get("intent") or {}).get("target_object") or "record(s)"
+    payload = aw.preview.proposed_payload if isinstance(aw.preview.proposed_payload, dict) else {}
+    props = payload.get("properties")
+    p = len(props) if isinstance(props, dict) else None
+    summary = f"✓ Applied: updated {n} record(s)"
+    if p:
+        summary += f", {p} propert{'y' if p == 1 else 'ies'}"
+    summary += f" on {obj}. Undo: hubspot undo {aw.action_id}"
+    return {
+        "status": "applied",
+        "tool": tool_name,
+        "action_id": aw.action_id,
+        "impact_count": n,
+        "created_ids": result.created_ids,
+        "audit_failed": result.audit_failed,
+        "undo_command": f"hubspot undo {aw.action_id}",
+        "message": summary,
+        "result": result.data,
+    }
 
 
 class ExecuteError(Exception):
@@ -417,11 +469,17 @@ async def execute_pending_write(
         raise ExecuteError("not_found", f"No pending preview found with ID {action_id}.")
 
     required = preview_data.get("required_confirmation") or 0
-    # Bug 5a: the exact-count gate fired only for destructive previews, so a
-    # multi-record bulk update (MEDIUM risk, ``required > 1``) could be
-    # bare-approved and execute against N records with no count confirmation.
-    # Gate any preview that is destructive OR names more than one record.
-    if _is_destructive(preview_data) or required > 1:
+    # The exact-count gate is reserved for FULL_GATE-tier writes (destructive,
+    # non-reversible, or sensitive-field under a full_gate policy).  CONFIRM-tier
+    # writes approve count-free; AUTO never reaches here via approve.  Records
+    # persisted before ``approval_tier`` existed fall back to the legacy rule
+    # (destructive OR multi-record) so in-flight previews stay gated (Bug 5a).
+    tier = preview_data.get("approval_tier")
+    if tier is not None:
+        needs_count = tier == FULL_GATE
+    else:
+        needs_count = _is_destructive(preview_data) or required > 1
+    if needs_count:
         already_confirmed = preview_data.get("confirmed_count") == required
         if confirm_count is None:
             if not already_confirmed:

@@ -106,6 +106,8 @@ async def test_handle_tool_missing_name(env):
 
 @pytest.mark.asyncio
 async def test_handle_tool_write_routes_through_apply_write(env):
+    from hubspot_agent.snapshot import load_undo_snapshot, snapshot_dir_for_portal
+
     client = FakeClient()
     out = await handle_tool(
         client,
@@ -115,15 +117,22 @@ async def test_handle_tool_write_routes_through_apply_write(env):
     )
     assert out["ok"] is True
     data = out["data"]
-    assert data["status"] == "preview"
+    # Bounded Autonomy (Phase 2): a reversible 1-record create is AUTO tier, so
+    # it executes immediately inside handle_tool and returns an applied envelope.
+    assert data["status"] == "applied"
     assert data["tool"] == "hubspot_create_object"
     assert data["action_id"]
-    assert data["risk_level"] == "medium"
-    # The preview was persisted (FR-5b: tool-initiated, no agent).
-    pending = _load_pending("123", data["action_id"])
-    assert pending is not None
-    assert pending["agent_name"] is None
-    assert pending["tool_name"] == "hubspot_create_object"
+    # Intent preserved: the write went through the safety path (apply_write ->
+    # execute_pending_write), NOT a bare POST — proven by the undo snapshot
+    # captured for the action_id with the created id (create-intent metadata).
+    snap = load_undo_snapshot(snapshot_dir_for_portal("123"), data["action_id"])
+    assert snap is not None
+    assert snap["metadata"]["intent_type"] == "create"
+    assert snap["metadata"]["created_ids"] == ["new-1"]
+    # The create actually hit the client through invoke_tool (not fabricated).
+    assert client.posts
+    # Auto-applied writes are executed + cleared: no pending preview remains.
+    assert _load_pending("123", data["action_id"]) is None
 
 
 @pytest.mark.asyncio
@@ -138,6 +147,27 @@ async def test_handle_tool_scope_blocked(env):
         )
     assert exc.value.error["kind"] == "scope"
     assert "crm.objects.contacts.write" in exc.value.error["message"]
+
+
+@pytest.mark.asyncio
+async def test_auto_apply_execute_failure_surfaces_recovery(env, monkeypatch):
+    # review MAJOR #2: if an AUTO write fails mid-execute, the operator must be
+    # told the change is a recoverable pending record, not get a generic error.
+    from hubspot_agent.handlers import ExecuteError
+
+    async def boom(*args, **kwargs):
+        raise ExecuteError("server", "HubSpot 401", retryable=True)
+
+    monkeypatch.setattr("hubspot_agent.handlers.execute_pending_write", boom)
+    with pytest.raises(HandlerError) as exc:
+        await handle_tool(
+            FakeClient(),
+            None,
+            _portal(),
+            {"tool_name": "hubspot_create_object", "input": {"object_type": "contacts", "properties": {"firstname": "Izzy"}}},
+        )
+    msg = exc.value.error["message"]
+    assert "approve" in msg and "pending" in msg
 
 
 @pytest.mark.asyncio
@@ -205,16 +235,22 @@ async def test_handle_tool_concurrent_writes_offload_persistence(env, monkeypatc
 
     monkeypatch.setattr(orchestrator, "_store_pending_preview", _slow_store)
 
+    # Use a destructive delete: it classifies FULL_GATE, so it stays a preview
+    # and does NOT auto-apply (Phase 2).  That keeps the persistence-offload
+    # under test — apply_write still stores the pending preview via the
+    # offloaded _store_pending_preview — without auto-execute reloading a
+    # pending the mocked (no-op) store never actually wrote.
     async def _one_write():
         return await handle_tool(
             FakeClient(),
             None,
             _portal(),
-            {"tool_name": "hubspot_create_object", "input": {"object_type": "contacts", "properties": {"firstname": "Izzy"}}},
+            {"tool_name": "hubspot_delete_object", "input": {"object_type": "contacts", "object_id": "42"}},
         )
 
     results = await asyncio.gather(_one_write(), _one_write())
     assert all(r["ok"] for r in results)
+    # Each concurrent write persisted through the offloaded store exactly once.
     assert len(thread_ids) == 2
     # Persistence ran in worker threads, not on the event-loop thread — so the
     # blocking sleep did not stall the loop and both writes completed.

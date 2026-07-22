@@ -1223,6 +1223,32 @@ async def _tool_write(tool_name, portal_id, portal_config, tool_input, required_
             request_text=f"tool {tool_name}",
             proposed_payload=tool_input,
         )
+        from hubspot_agent.handlers import AUTO, FULL_GATE, _applied_envelope
+
+        tier = aw.preview_data.get("approval_tier")
+        # CLI direct tool dispatch is interactive (no loop step), so a provably
+        # safe write auto-applies (Bounded Autonomy, Phase 2).
+        if tier == AUTO:
+            try:
+                result = await execute_pending_write(portal_config, aw.action_id, client=client)
+            except ExecuteError as exc:
+                # Surface the recoverable pending write instead of a raw traceback.
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "tool": tool_name,
+                        "action_id": aw.action_id,
+                        "error": {"kind": exc.kind, "message": exc.message, "retryable": exc.retryable},
+                        "message": (
+                            f"Auto-apply failed: {exc.message}. Staged as pending {aw.action_id} — "
+                            f"run `hubspot approve {aw.action_id}` to complete or "
+                            f"`hubspot reject {aw.action_id}` to discard."
+                        ),
+                    },
+                    indent=2,
+                    default=str,
+                )
+            return json.dumps(_applied_envelope(tool_name, aw, result), indent=2, default=str)
         return json.dumps(
             {
                 "status": "preview",
@@ -1233,6 +1259,8 @@ async def _tool_write(tool_name, portal_id, portal_config, tool_input, required_
                 "impact_count": aw.preview.impact_count,
                 "original_values": aw.preview.original_values,
                 "required_confirmation": aw.preview.impact_count,
+                "approval_tier": tier,
+                "requires_count": tier == FULL_GATE,
             },
             indent=2,
             default=str,

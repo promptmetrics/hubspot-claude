@@ -153,6 +153,15 @@ async def apply_write(
     # so execute_pending_write need not know about loops.
     if loop_step_number is not None:
         preview_data["loop_step_number"] = loop_step_number
+    # Classify the write into an approval tier (Bounded Autonomy, Phase 2) and
+    # persist it, so both the auto-apply decision (interactive callers) and the
+    # execute-time count gate read one deterministic value.  Loaded per-portal;
+    # a missing/malformed policy file falls back to the conservative default.
+    from hubspot_agent.policy import classify_write, load_approval_policy
+
+    preview_data["approval_tier"] = classify_write(
+        preview_data, load_approval_policy(portal_config.portal_id)
+    )
     # Resolve the store binding lazily from the orchestrator module so that
     # tests which monkeypatch ``hubspot_agent.orchestrator._store_pending_preview``
     # still intercept the write (the call site moved here from dispatch_agent,
