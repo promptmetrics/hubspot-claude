@@ -31,6 +31,7 @@ from hubspot_agent.sequential_dispatch import (
     _build_step_request,
     _capture_artifacts,
     _resolve_artifacts,
+    classify_intent_type,
     is_write_step,
 )
 from hubspot_agent.snapshot import load_undo_snapshot, snapshot_dir_for_portal
@@ -235,23 +236,6 @@ async def check_dispatch_readiness(agent_names: list[str], portal_config) -> dic
 # Intent parsing
 # ---------------------------------------------------------------------------
 
-_SEARCH_WORDS = {"find", "search", "get", "list", "show", "retrieve", "lookup", "query"}
-_CREATE_WORDS = {"create", "add", "new", "insert", "build", "make"}
-_UPDATE_WORDS = {"update", "change", "edit", "modify", "set", "rename", "patch"}
-_DELETE_WORDS = {"delete", "remove", "destroy", "drop", "clear", "purge"}
-
-
-def _has_boundary_word(text: str, words: set[str]) -> bool:
-    """True if any word appears as a whole word in ``text``.
-
-    Substring matching (``w in text``) mis-classified tokens like ``"renewal"``
-    → create (contains ``"new"``) and ``"created"`` → create (contains
-    ``"create"``).  ``\\b``-anchored matching makes ``new`` not match
-    ``renewal``/``renew`` and ``create`` not match ``created``, so a write lands
-    on the intended record instead of a fuzzy ``records[0]`` (bug 2).
-    """
-    return any(re.search(rf"\b{re.escape(w)}\b", text) for w in words)
-
 _OBJ_MAP = {
     "contact": "contacts", "contacts": "contacts",
     "company": "companies", "companies": "companies",
@@ -273,22 +257,10 @@ _STOP_WORDS = {
 def _parse_agent_intent(agent_name: str, request_text: str) -> TaskIntent:
     text = request_text.lower()
 
-    # Priority: search → delete → update → create.  Reads first (a read must
-    # never masquerade as a write), then destructive verbs before non-destructive
-    # so a phrase carrying both (e.g. "delete the renewal") fails safe into the
-    # destructive count gate instead of being reclassified as a create via
-    # "new".  Word-boundary matching (see ``_has_boundary_word``) prevents
-    # substring false-positives like "renewal"→create or "created"→create.
-    if _has_boundary_word(text, _SEARCH_WORDS):
-        intent_type = "search"
-    elif _has_boundary_word(text, _DELETE_WORDS):
-        intent_type = "delete"
-    elif _has_boundary_word(text, _UPDATE_WORDS):
-        intent_type = "update"
-    elif _has_boundary_word(text, _CREATE_WORDS):
-        intent_type = "create"
-    else:
-        intent_type = "unknown"
+    # Classification is shared with the approval gate (``is_write_step``) via
+    # ``classify_intent_type`` so the two can never disagree on whether a step
+    # writes.  Priority: search → delete → update → create.
+    intent_type = classify_intent_type(text)
 
     target_object = None
     if agent_name == "objects":
@@ -662,11 +634,13 @@ def _format_loop_result(
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "escalate", "stop", "stopped"})
 
 # A step needs a HITL pause if it is a write by action-verb OR the plan marked
-# it medium/high/destructive risk.  Keying on risk too closes the gap where a
-# destructive step phrased with a verb outside ``is_write_step``'s set (e.g.
-# "purge"/"archive"/"deactivate"/"remove") would otherwise be treated as a read
-# and executed with no approval.  Fail safe: an over-cautious pause on a
-# misclassified read is harmless; skipping approval on a real write is not.
+# it medium/high/destructive risk.  ``is_write_step`` now shares its intent
+# vocabulary with the executor (``classify_intent_type``), so synonym verbs
+# ("remove"/"purge"/"clear"/"set"/"modify"/…) are caught at the gate — not just
+# by a correctly-set ``risk_level``.  The risk check stays as defense-in-depth
+# (e.g. a plan that flags an unusual phrasing as risky).  Fail safe: an
+# over-cautious pause on a misclassified read is harmless; skipping approval on
+# a real write is not.
 _APPROVAL_RISK_LEVELS = frozenset({RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.DESTRUCTIVE})
 
 

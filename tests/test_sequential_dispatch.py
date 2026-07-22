@@ -2,7 +2,62 @@ import pytest
 from unittest.mock import patch
 
 from hubspot_agent.models import AgentResult, LoopPlan, PlanStep, RiskLevel, StepArtifact, VerificationResult
-from hubspot_agent.sequential_dispatch import execute_plan, verify_step
+from hubspot_agent.sequential_dispatch import (
+    classify_intent_type,
+    execute_plan,
+    is_write_step,
+    verify_step,
+)
+
+
+# --------------------------------------------------------------------------- #
+# Write detection — the gate (is_write_step) must agree with the executor's
+# own intent parser (classify_intent_type) so a free-text write step can never
+# slip past approval and inline-execute.  Regression for the synonym-verb hole.
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("action", [
+    "remove stale deals",       # delete synonym (not in the old verb set)
+    "purge the deal",
+    "clear the company",
+    "destroy the ticket",
+    "drop the contact",
+    "set lifecyclestage on the deal",   # update synonym
+    "modify the contact",
+    "rename the property",
+    "patch the record",
+    "add a new contact",        # create synonym
+    "insert a company",
+])
+def test_is_write_step_catches_synonym_write_verbs(action):
+    step = PlanStep(step_number=1, agent="objects", action=action, risk_level=RiskLevel.LOW)
+    assert is_write_step(step) is True
+    assert classify_intent_type(action) in {"create", "update", "delete"}
+
+
+@pytest.mark.parametrize("action", [
+    "merge duplicate companies",   # explicit object-mutation verbs preserved
+    "enroll contacts in the workflow",
+    "toggle the workflow",
+    "bulk update deals",
+    "upsert the contact",
+])
+def test_is_write_step_preserves_explicit_mutation_verbs(action):
+    step = PlanStep(step_number=1, agent="objects", action=action, risk_level=RiskLevel.LOW)
+    assert is_write_step(step) is True
+
+
+@pytest.mark.parametrize("action", [
+    "find deals closing this quarter",
+    "show me the contact",
+    "list companies in the pipeline",
+    "get the ticket",
+    "search for stale deals to remove",   # search verb wins → read (fail-safe priority)
+])
+def test_is_write_step_leaves_reads_as_reads(action):
+    step = PlanStep(step_number=1, agent="objects", action=action, risk_level=RiskLevel.LOW)
+    assert is_write_step(step) is False
+    assert classify_intent_type(action) == "search"
 
 
 def _make_plan() -> LoopPlan:

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-A Claude Code plugin (`/hubspot`, package `hubspot-agent`, currently 0.2.13) for natural-language HubSpot CRM administration. Claude orchestrates ~44 specialist sub-agents that each call the `hubspot` CLI over Bash, with mandatory human-in-the-loop approval for every write. Implementation is complete and actively maintained — this is no longer a greenfield project.
+A Claude Code plugin (`/hubspot`, package `hubspot-agent`, currently 0.2.14) for natural-language HubSpot CRM administration. Claude orchestrates ~44 specialist sub-agents that each call the `hubspot` CLI over Bash, with mandatory human-in-the-loop approval for every write. Implementation is complete and actively maintained — this is no longer a greenfield project.
 
 ## Commands
 
