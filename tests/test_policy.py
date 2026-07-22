@@ -88,7 +88,10 @@ def _pd(*, intent_type="update", risk="medium", impact=1, original_values=None, 
         "preview": {
             "risk_level": risk,
             "impact_count": impact,
-            "original_values": original_values if original_values is not None else {"1": {"x": "old"}},
+            # default = FULL capture (one original per targeted record); pass an
+        # explicit dict to model partial/empty capture.
+        "original_values": original_values if original_values is not None
+        else {str(i): {"x": "old"} for i in range(impact)},
         },
         "proposed_payload": payload or {"properties": {"jobtitle": "Engineer"}},
     }
@@ -181,6 +184,20 @@ def test_never_auto_override_extends_not_replaces(cfg):
     assert "my_custom_tool" in p.never_auto_tools
     assert "hubspot_create_workflow" in p.never_auto_tools  # shipped guard retained
     assert "hubspot_enroll_workflow" in p.never_auto_tools
+
+
+def test_partial_capture_update_downgrades_to_confirm():
+    # a bulk update targeting 3 records but capturing only 2 originals is only
+    # partially undoable → CONFIRM, not AUTO (review MINOR)
+    pd = _pd(intent_type="update", impact=3,
+             original_values={"c-1": {"x": "old"}, "c-2": {"x": "old"}})
+    assert classify_write(pd, DEFAULT) == CONFIRM
+
+
+def test_full_capture_bulk_update_is_auto():
+    pd = _pd(intent_type="update", impact=3,
+             original_values={"c-1": {"x": "o"}, "c-2": {"x": "o"}, "c-3": {"x": "o"}})
+    assert classify_write(pd, DEFAULT) == AUTO
 
 
 def test_sensitive_detected_via_original_values(cfg):

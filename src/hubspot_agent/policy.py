@@ -163,6 +163,12 @@ def classify_write(preview_data: dict[str, Any], policy: ApprovalPolicy) -> str:
             changed_keys.update(rec.keys())
     if changed_keys & set(policy.sensitive_properties):
         return policy.sensitive_tier
+    # Partial-capture guard: an update that captured fewer originals than the
+    # records it targets is only PARTIALLY undoable (undo would restore just the
+    # captured subset).  Keep a human checkpoint (CONFIRM) rather than AUTO.
+    # Single-record updates (impact 1, one captured) and creates are unaffected.
+    if intent_type == "update" and len(original_values) < impact:
+        return CONFIRM
     if impact > policy.auto_apply_max_records:
         return CONFIRM
     return AUTO
