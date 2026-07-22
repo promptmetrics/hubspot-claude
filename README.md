@@ -240,6 +240,17 @@ claude --plugin-dir ./                       # load the plugin for this session
 
 </details>
 
+## Going further
+
+- [QUICKSTART.md](docs/QUICKSTART.md) — full setup, auth (token + OAuth), first read/write
+- [docs/PRD.md](docs/PRD.md) — product spec, roadmap, and requirement status (R1–R13)
+- [docs/BLUEPRINTS.md](docs/BLUEPRINTS.md) — workflow blueprint format + review checklist
+- [docs/API_REFERENCE.md](docs/API_REFERENCE.md) — the `hubspot_agent` package for extenders
+- [docs/adr/](docs/adr/) — architecture decision records (ADR-0003: deterministic routing as a security property)
+- [V4 Flows API gotchas](docs/V4_FLOWS_API_Gotchas_and_Decisions.md) — reverse-engineered HubSpot workflow-API caveats
+- [CHANGELOG.md](CHANGELOG.md) — release history
+- [CONTRIBUTING.md](CONTRIBUTING.md) · [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) · [SECURITY.md](SECURITY.md) · [GOVERNANCE.md](GOVERNANCE.md)
+
 ## Notes &amp; limitations
 
 - **Not for Claude Cowork.** Cowork runs in a cloud Linux sandbox, ignores `SessionStart` hooks, and breaks the local-execution assumptions (venv provisioning, local CLI exec, local token storage, warm-client daemon). Bringing HubSpot into Cowork would mean repackaging it as an MCP connector — a separate project. ([claude-code#40495](https://github.com/anthropics/claude-code/issues/40495), [#47993](https://github.com/anthropics/claude-code/issues/47993))

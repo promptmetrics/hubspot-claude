@@ -71,6 +71,8 @@ Append-only. Every non-trivial decision gets a dated line and one line of why.
 - **2026-07-22** — Phase 2 §5 hardening (v0.2.9): closed the partial-capture AUTO edge — `classify_write` downgrades an update capturing fewer originals than targeted records to CONFIRM (only a fully-captured, fully-undoable update auto-applies). `auto_apply_max_records` default reaffirmed at 100 (bounded by undo/audit/partial-capture). Full suite 1145 passed on Python 3.12.
 - **2026-07-21** — Phase 2 side-effect carve-out (resolves the §5 "Phase 2 landing" question): workflow writes (`create/update/toggle/enroll_workflow`, `create_workflow_from_blueprint`) added to a new config `never_auto_tools` so they ALWAYS keep the human gate (CONFIRM) — "deletable" ≠ "side-effect-free": a workflow enrolls and acts on contacts the moment it exists, and deleting it later doesn't undo that. Benign single- and multi-record (≤threshold) reversible object creates/updates DO auto-apply. The 9 regressed tests were migrated to the new contract (count-gate coverage repointed to a destructive delete; capture-for-undo asserted on the snapshot), not weakened. Full suite green on Python 3.12 (1140 passed, 1 skipped). Still uncommitted; no version bump yet.
 
+- **2026-07-22** — Accepting external contributions. The repo is open-source under a **benevolent-maintainer** model (PromptMetrics / Izzy Aly): added community-health files (`SECURITY.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `GOVERNANCE.md`) and a README "Going further" docs index. Product scope stays tracked here (numbered requirements + Status table) and architecture in `docs/adr/`. Resolves the contribution posture of the §5 "Business model" question; commercial vs. community-supported remains open. Docs/meta only — no code change, no version bump.
+
 ## 5. Open questions
 
 Unresolved items blocking or shaping the work. Move to §4 once answered.
@@ -82,7 +84,7 @@ Unresolved items blocking or shaping the work. Move to §4 once answered.
 - [x] **Phase 2 — partial-capture AUTO** *(resolved 2026-07-22, v0.2.9)* — `classify_write` now downgrades an update with `len(original_values) < impact_count` to CONFIRM, so a partially-undoable bulk update keeps a human checkpoint.
 - [x] **Phase 2 — AUTO ceiling risk appetite** *(resolved 2026-07-22)* — kept at 100 (informed choice; bounded by undo, audit, and the partial-capture guard). Per-portal `auto_apply_max_records` stays the tuning knob.
 - [ ] **Solo vs. team user.** Drives RBAC, conversation memory, PII redaction, tour mode (`research/2026-05-07...:766`).
-- [ ] **Business model.** Personal tool, open-source project, or commercial product? Affects scope, packaging, support posture.
+- [ ] **Business model.** *(Contribution posture resolved 2026-07-22 — see §4: open-source, accepting external contributions under a benevolent-maintainer model.)* Commercial vs. purely community-supported is still open; affects packaging and support posture.
 - [ ] **Token economics / cost ceiling.** No per-session/portal cost ceiling on sub-agent tool use; Phase 3 must define hard-stop vs. warn-and-continue + per-agent attribution (R12).
 - [ ] **Market validation.** No pilot data or user interviews exist; PMF unvalidated. Freeze features pending problem interviews?
 - [ ] **HubSpot API churn vs. blueprint maintenance.** Unknown API stability rate drives long-term maintenance burden of the 19 blueprints.
