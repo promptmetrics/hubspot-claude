@@ -24,6 +24,63 @@ class APIResponse:
     headers: dict[str, str]
 
 
+# Phase 3 PR-B (back-pressure): last-seen HubSpot rate-limit state per portal.
+# The durable loop builds a fresh HubSpotClient per step (dispatch closes its
+# client immediately), so a per-instance attribute never survives to the loop
+# level. We keep a module-level per-portal snapshot that ``_request`` refreshes
+# from every response; ``_drive_loop`` reads it between steps to decide pacing.
+_LAST_RATE_STATE: dict[str, tuple[int | None, float | None]] = {}
+
+
+def parse_rate_limit(headers: dict[str, str]) -> tuple[int | None, float | None]:
+    """Extract ``(remaining, seconds_until_reset)`` from HubSpot rate headers.
+
+    Reads ``X-HubSpot-RateLimit-Remaining`` and the interval header
+    (``X-HubSpot-RateLimit-Interval-Milliseconds``, milliseconds). Header keys
+    are matched case-insensitively (httpx lowercases them via ``dict()``).
+    Absent or malformed values degrade to ``None`` for that slot; a fully
+    absent/empty mapping returns ``(None, None)``. Pure and side-effect free.
+    """
+    if not headers:
+        return (None, None)
+    lower = {str(k).lower(): v for k, v in headers.items()}
+    remaining: int | None = None
+    reset_seconds: float | None = None
+    remaining_raw = lower.get("x-hubspot-ratelimit-remaining")
+    if remaining_raw is not None:
+        try:
+            remaining = int(remaining_raw)
+        except (TypeError, ValueError):
+            remaining = None
+    interval_raw = lower.get("x-hubspot-ratelimit-interval-milliseconds")
+    if interval_raw is not None:
+        try:
+            reset_seconds = float(interval_raw) / 1000.0
+        except (TypeError, ValueError):
+            reset_seconds = None
+    return (remaining, reset_seconds)
+
+
+def record_rate_state(portal_id: str, headers: dict[str, str]) -> tuple[int | None, float | None]:
+    """Parse ``headers`` and remember the last-seen rate state for ``portal_id``.
+
+    Converts the interval (seconds-until-reset) into an absolute reset epoch so
+    the loop can pace ``sleep until reset``. Stores nothing when both slots are
+    ``None`` (unparseable headers), preserving any prior good snapshot. Returns
+    the stored ``(remaining, reset_epoch)`` tuple.
+    """
+    remaining, reset_seconds = parse_rate_limit(headers)
+    reset_at = time.time() + reset_seconds if reset_seconds is not None else None
+    if remaining is not None or reset_at is not None:
+        _LAST_RATE_STATE[portal_id] = (remaining, reset_at)
+    return (remaining, reset_at)
+
+
+def get_last_rate_state(portal_id: str) -> tuple[int | None, float | None]:
+    """Return the last-seen ``(remaining, reset_epoch)`` for a portal, or Nones."""
+    return _LAST_RATE_STATE.get(portal_id, (None, None))
+
+
 class HubSpotClient:
     BASE_URL = "https://api.hubapi.com"
     _RATE_LIMIT = 100  # requests per 10 seconds
@@ -167,10 +224,15 @@ class HubSpotClient:
                 category=category,
                 field_errors=field_errors,
             )
+        headers = dict(resp.headers)
+        # PR-B back-pressure: remember the server's rate-limit signal so the
+        # durable loop can pace between steps. Purely additive — request/retry
+        # semantics above are untouched.
+        record_rate_state(portal_id, headers)
         return APIResponse(
             status_code=resp.status_code,
             body=resp.json() if resp.text else {},
-            headers=dict(resp.headers),
+            headers=headers,
         )
 
     async def get(

@@ -328,3 +328,102 @@ async def test_client_500_server_category(respx_mock):
         await client.get("/crm/v3/objects/contacts/1", portal_id="123")
     assert exc_info.value.category == ErrorCategory.SERVER
     await client.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 PR-B (back-pressure): rate-limit header parsing + last-seen snapshot.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_rate_limit_valid_headers():
+    from hubspot_agent.client import parse_rate_limit
+
+    headers = {
+        "X-HubSpot-RateLimit-Remaining": "37",
+        "X-HubSpot-RateLimit-Interval-Milliseconds": "10000",
+    }
+    remaining, reset_seconds = parse_rate_limit(headers)
+    assert remaining == 37
+    assert reset_seconds == 10.0
+
+
+def test_parse_rate_limit_case_insensitive():
+    # httpx lowercases header keys via dict(resp.headers); parsing must not care.
+    from hubspot_agent.client import parse_rate_limit
+
+    remaining, reset_seconds = parse_rate_limit(
+        {"x-hubspot-ratelimit-remaining": "5", "x-hubspot-ratelimit-interval-milliseconds": "5000"}
+    )
+    assert remaining == 5
+    assert reset_seconds == 5.0
+
+
+def test_parse_rate_limit_absent_returns_none():
+    from hubspot_agent.client import parse_rate_limit
+
+    assert parse_rate_limit({}) == (None, None)
+    assert parse_rate_limit({"content-type": "application/json"}) == (None, None)
+
+
+def test_parse_rate_limit_malformed_degrades_per_slot():
+    from hubspot_agent.client import parse_rate_limit
+
+    remaining, reset_seconds = parse_rate_limit(
+        {"X-HubSpot-RateLimit-Remaining": "notanint",
+         "X-HubSpot-RateLimit-Interval-Milliseconds": "also-bad"}
+    )
+    assert remaining is None
+    assert reset_seconds is None
+    # A good remaining with a missing interval still yields the remaining.
+    remaining, reset_seconds = parse_rate_limit({"X-HubSpot-RateLimit-Remaining": "12"})
+    assert remaining == 12
+    assert reset_seconds is None
+
+
+def test_record_and_get_last_rate_state(monkeypatch):
+    import hubspot_agent.client as client_mod
+    from hubspot_agent.client import get_last_rate_state, record_rate_state
+
+    monkeypatch.setattr(client_mod, "_LAST_RATE_STATE", {})
+    monkeypatch.setattr(client_mod.time, "time", lambda: 1000.0)
+    remaining, reset_at = record_rate_state(
+        "portal-x",
+        {"X-HubSpot-RateLimit-Remaining": "4", "X-HubSpot-RateLimit-Interval-Milliseconds": "10000"},
+    )
+    assert remaining == 4
+    assert reset_at == 1010.0  # now + interval seconds
+    assert get_last_rate_state("portal-x") == (4, 1010.0)
+
+
+def test_record_rate_state_preserves_prior_on_unparseable(monkeypatch):
+    import hubspot_agent.client as client_mod
+    from hubspot_agent.client import get_last_rate_state, record_rate_state
+
+    monkeypatch.setattr(client_mod, "_LAST_RATE_STATE", {})
+    record_rate_state(
+        "portal-y",
+        {"X-HubSpot-RateLimit-Remaining": "9", "X-HubSpot-RateLimit-Interval-Milliseconds": "10000"},
+    )
+    prior = get_last_rate_state("portal-y")
+    record_rate_state("portal-y", {"content-type": "application/json"})
+    assert get_last_rate_state("portal-y") == prior
+
+
+@pytest.mark.asyncio
+async def test_request_records_rate_state(respx_mock, monkeypatch):
+    import hubspot_agent.client as client_mod
+
+    monkeypatch.setattr(client_mod, "_LAST_RATE_STATE", {})
+    client = HubSpotClient(PortalConfig(portal_id="rate-portal", token="test-token"))
+    respx_mock.get("https://api.hubapi.com/crm/v3/objects/contacts/1").mock(
+        return_value=httpx.Response(
+            200,
+            json={"id": "1"},
+            headers={"X-HubSpot-RateLimit-Remaining": "3",
+                     "X-HubSpot-RateLimit-Interval-Milliseconds": "10000"},
+        )
+    )
+    await client.get("/crm/v3/objects/contacts/1", portal_id="rate-portal")
+    remaining, _reset = client_mod.get_last_rate_state("rate-portal")
+    assert remaining == 3
+    await client.close()

@@ -3,13 +3,17 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from hubspot_agent.capabilities import CapabilityMatrix, probe_portal, validate_capabilities
-from hubspot_agent.client import HubSpotClient
+from hubspot_agent.client import HubSpotClient, get_last_rate_state
+from hubspot_agent.errors import HubSpotError, RateLimitError
 from hubspot_agent.config import CONFIG_DIR, load_portal_config
 from hubspot_agent.dispatch import get_execute_dispatch, get_preview_builder, get_reconcile_dispatch
 from hubspot_agent.models import AgentResult, BatchApprovalMode, LoopPlan, PreviewResult, RiskLevel, StepArtifact, TaskIntent, VerificationResult
@@ -838,6 +842,12 @@ async def _run_loop_tool_step(
         try:
             resp = await handle_tool(client, cache, portal_config, params)
         except HandlerError as exc:
+            # A retryable handler error (transient server/rate blip on a
+            # read/preview build) is re-raised so the loop's per-step retry
+            # budget can back off and re-run the whole step.  A terminal error
+            # still returns the fail outcome for immediate fail-and-stop.
+            if exc.error.get("retryable"):
+                raise
             return {"kind": "failed", "error": exc.error.get("message", "tool call failed")}
         data = resp.get("data", {})
         if data.get("status") == "preview":
@@ -857,6 +867,138 @@ async def _run_loop_tool_step(
         return {"kind": "read", "artifact": artifact}
     finally:
         await client.close()
+
+
+# ---------------------------------------------------------------------------
+# Back-pressure (Phase 3 PR-B): per-step retry with backoff + proactive pacing.
+#
+# ONLY read/preview execution is retried/paced — the write mutation happens
+# out-of-band at ``hubspot approve`` (execute_pending_write), which _drive_loop
+# never touches.  A write step still pauses at ``awaiting_approval``; it is
+# never auto-retried.
+# ---------------------------------------------------------------------------
+
+# Total attempts for a transient read/preview step (1 initial + retries).
+_READ_RETRY_BUDGET = 3
+# Cap on any single backoff/pacing sleep — reuse the client's Retry-After cap so
+# a misconfigured server signal cannot hang the loop.
+_BACKPRESSURE_CAP_SECONDS = HubSpotClient._MAX_RETRY_AFTER_SECONDS
+# Pace before the next step once the server says this few requests remain in the
+# current interval.  A small constant (the parse helper does not surface the
+# interval max), erring toward pacing early.
+_RATE_LIMIT_LOW_WATERMARK = 10
+
+
+async def _default_sleep(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+# Indirection so tests can spy on / stub the sleep without real waits.  Resolved
+# by module-global name at call time, so ``monkeypatch.setattr`` on this symbol
+# takes effect inside the helpers below.
+_sleep = _default_sleep
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    """Classify an exception raised by a read/preview step as transient.
+
+    Transient (worth retrying): rate limits, HubSpot 5xx, network/timeout
+    faults, and handler/execute errors explicitly flagged ``retryable``.
+    Everything else (validation, not-found, scope, auth, unexpected) is terminal
+    and fails the step immediately, as today.
+    """
+    from hubspot_agent.handlers import ExecuteError, HandlerError
+
+    if isinstance(exc, RateLimitError):
+        return True
+    if isinstance(exc, HubSpotError):
+        return exc.status_code is not None and exc.status_code >= 500
+    if isinstance(exc, ExecuteError):
+        return exc.retryable
+    if isinstance(exc, HandlerError):
+        return bool(exc.error.get("retryable"))
+    if isinstance(exc, httpx.TransportError):
+        # Covers timeouts, connect/read errors, and other transport faults.
+        return True
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
+        return True
+    return False
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """Server-suggested backoff for a transient error, if any."""
+    from hubspot_agent.handlers import HandlerError
+
+    if isinstance(exc, RateLimitError):
+        return float(exc.retry_after) if exc.retry_after is not None else None
+    if isinstance(exc, HandlerError):
+        ra = exc.error.get("retry_after")
+        return float(ra) if ra is not None else None
+    return None
+
+
+async def _execute_read_step_with_retry(coro_factory, portal_id: str, trace_id: str, step_number: int):
+    """Run a read/preview step coroutine, retrying transient failures.
+
+    ``coro_factory`` is a zero-arg callable returning a fresh awaitable per
+    attempt (each attempt builds its own client).  Retries up to
+    ``_READ_RETRY_BUDGET`` total attempts with exponential backoff, honoring a
+    server ``Retry-After``/``retry_after`` when present (capped).  A terminal
+    (non-transient) error raises immediately.  After the budget is exhausted the
+    last transient error is re-raised so the caller falls through to the
+    existing fail-and-stop.  NEVER used for the write-approval path.
+    """
+    attempt = 0
+    while True:
+        try:
+            return await coro_factory()
+        except Exception as exc:
+            if not _is_transient_error(exc) or attempt >= _READ_RETRY_BUDGET - 1:
+                raise
+            attempt += 1
+            server_backoff = _retry_after_seconds(exc)
+            if server_backoff is not None:
+                delay = min(server_backoff, _BACKPRESSURE_CAP_SECONDS)
+            else:
+                delay = min(2.0 ** (attempt - 1), _BACKPRESSURE_CAP_SECONDS)
+            loop_log.log_event(portal_id, trace_id, "step_retry", {
+                "step_number": step_number,
+                "attempt": attempt,
+                "error": str(exc),
+                "sleep_seconds": delay,
+            })
+            await _sleep(delay)
+
+
+def _capture_rate_state(state: loop_state.LoopState, portal_id: str) -> None:
+    """Fold the client's last-seen rate signal into the (persisted) loop state."""
+    remaining, reset_at = get_last_rate_state(portal_id)
+    if remaining is not None:
+        state.rate_remaining = remaining
+    if reset_at is not None:
+        state.rate_reset_at = reset_at
+
+
+async def _pace_if_needed(state: loop_state.LoopState, portal_id: str) -> None:
+    """Sleep before the next step when the server signals low remaining quota.
+
+    Reads the persisted ``rate_remaining``/``rate_reset_at`` (updated after the
+    previous step).  Fresh loops (no observed header) never pace.  The sleep is
+    bounded by ``_BACKPRESSURE_CAP_SECONDS`` and goes through the injectable
+    ``_sleep`` so tests assert the decision without waiting.
+    """
+    remaining = state.rate_remaining
+    reset_at = state.rate_reset_at
+    if remaining is None or remaining > _RATE_LIMIT_LOW_WATERMARK or reset_at is None:
+        return
+    sleep_for = min(max(reset_at - time.time(), 0.0), _BACKPRESSURE_CAP_SECONDS)
+    if sleep_for <= 0:
+        return
+    loop_log.log_event(portal_id, state.trace_id, "paced", {
+        "remaining": remaining,
+        "sleep_seconds": sleep_for,
+    })
+    await _sleep(sleep_for)
 
 
 async def _drive_loop(portal_config, state: loop_state.LoopState, working_dir: str) -> str:
@@ -891,6 +1033,11 @@ async def _drive_loop(portal_config, state: loop_state.LoopState, working_dir: s
                 state,
                 f"Loop stopped: proxy budget exhausted ({which}).",
             )
+
+        # Back-pressure pacing (PR-B): if the previous step's response said the
+        # rate-limit interval is nearly spent, sleep until it resets before
+        # issuing the next step's reads.  No-op on a fresh loop (no header yet).
+        await _pace_if_needed(state, portal_id)
 
         step = plan.steps[state.current_step]
         # Count this step against the proxy budget.  The loop makes no LLM
@@ -933,7 +1080,27 @@ async def _drive_loop(portal_config, state: loop_state.LoopState, working_dir: s
                     f"Execution stopped at step {step.step_number}: {state.last_error}",
                 )
 
-            outcome = await _run_loop_tool_step(portal_config, state, step, resolved_input)
+            try:
+                outcome = await _execute_read_step_with_retry(
+                    lambda: _run_loop_tool_step(portal_config, state, step, resolved_input),
+                    portal_id, state.trace_id, step.step_number,
+                )
+            except Exception as exc:
+                # Transient budget exhausted, or a terminal error while building
+                # the tool preview / running the read tool → fail-and-stop.  No
+                # write was persisted, so nothing to roll back.
+                state.status = "failed"
+                state.last_error = str(exc)
+                loop_state.save(state)
+                loop_log.log_event(portal_id, state.trace_id, "step_failed", {
+                    "step_number": step.step_number,
+                    "error": state.last_error,
+                })
+                return _format_loop_result(
+                    portal_config,
+                    state,
+                    f"Execution stopped at step {step.step_number}: {state.last_error}",
+                )
             if outcome["kind"] == "failed":
                 state.status = "failed"
                 state.last_error = outcome["error"]
@@ -948,6 +1115,7 @@ async def _drive_loop(portal_config, state: loop_state.LoopState, working_dir: s
                     f"Execution stopped at step {step.step_number}: {outcome['error']}",
                 )
             if outcome["kind"] == "preview":
+                _capture_rate_state(state, portal_id)
                 state.pending_action_id = outcome["action_id"]
                 state.status = "awaiting_approval"
                 loop_state.save(state)
@@ -959,6 +1127,7 @@ async def _drive_loop(portal_config, state: loop_state.LoopState, working_dir: s
             # Read tool executed inline → capture artifact, advance, continue.
             artifact = outcome["artifact"]
             state.artifacts.append(artifact)
+            _capture_rate_state(state, portal_id)
             state.current_step += 1
             loop_state.save(state)
             loop_log.log_event(portal_id, state.trace_id, "step_completed", {
@@ -968,14 +1137,33 @@ async def _drive_loop(portal_config, state: loop_state.LoopState, working_dir: s
             continue
 
         if _requires_approval(step):
-            preview = await dispatch_agent(
-                step.agent,
-                step_request,
-                portal_config,
-                mode="preview",
-                trace_id=state.trace_id,
-                loop_step_number=step.step_number,
-            )
+            # Retry only the PREVIEW build (a read) on a transient blip.  The
+            # write itself is never executed here — it pauses for approval.
+            try:
+                preview = await _execute_read_step_with_retry(
+                    lambda: dispatch_agent(
+                        step.agent,
+                        step_request,
+                        portal_config,
+                        mode="preview",
+                        trace_id=state.trace_id,
+                        loop_step_number=step.step_number,
+                    ),
+                    portal_id, state.trace_id, step.step_number,
+                )
+            except Exception as exc:
+                state.status = "failed"
+                state.last_error = str(exc)
+                loop_state.save(state)
+                loop_log.log_event(portal_id, state.trace_id, "step_failed", {
+                    "step_number": step.step_number,
+                    "error": state.last_error,
+                })
+                return _format_loop_result(
+                    portal_config,
+                    state,
+                    f"Execution stopped at step {step.step_number}: {state.last_error}",
+                )
             if preview.status == "error":
                 state.status = "failed"
                 state.last_error = preview.error_message
@@ -989,6 +1177,7 @@ async def _drive_loop(portal_config, state: loop_state.LoopState, working_dir: s
                     state,
                     f"Execution stopped at step {step.step_number}: {preview.error_message}",
                 )
+            _capture_rate_state(state, portal_id)
             state.pending_action_id = preview.data.get("action_id")
             state.status = "awaiting_approval"
             loop_state.save(state)
@@ -999,14 +1188,32 @@ async def _drive_loop(portal_config, state: loop_state.LoopState, working_dir: s
             return _format_pause_message(portal_config, state, preview)
 
         # Low-risk read step (no write verb, low/no risk): execute directly,
-        # capture the artifact, advance — no approval needed.
-        result = await dispatch_agent(
-            step.agent,
-            step_request,
-            portal_config,
-            mode="execute",
-            trace_id=state.trace_id,
-        )
+        # capture the artifact, advance — no approval needed.  Retry a transient
+        # blip; a terminal error (or exhausted budget) fails-and-stops.
+        try:
+            result = await _execute_read_step_with_retry(
+                lambda: dispatch_agent(
+                    step.agent,
+                    step_request,
+                    portal_config,
+                    mode="execute",
+                    trace_id=state.trace_id,
+                ),
+                portal_id, state.trace_id, step.step_number,
+            )
+        except Exception as exc:
+            state.status = "failed"
+            state.last_error = str(exc)
+            loop_state.save(state)
+            loop_log.log_event(portal_id, state.trace_id, "step_failed", {
+                "step_number": step.step_number,
+                "error": state.last_error,
+            })
+            return _format_loop_result(
+                portal_config,
+                state,
+                f"Execution stopped at step {step.step_number}: {state.last_error}",
+            )
         if result.status == "error":
             state.status = "failed"
             state.last_error = result.error_message
@@ -1022,6 +1229,7 @@ async def _drive_loop(portal_config, state: loop_state.LoopState, working_dir: s
             )
         artifact = _capture_artifacts(result, step)
         state.artifacts.append(artifact)
+        _capture_rate_state(state, portal_id)
         state.current_step += 1
         loop_state.save(state)
         loop_log.log_event(portal_id, state.trace_id, "step_completed", {

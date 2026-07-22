@@ -39,6 +39,8 @@ class LoopState:
         pending_action_id: str | None = None,
         step_count: int = 0,
         api_call_count: int = 0,
+        rate_remaining: int | None = None,
+        rate_reset_at: float | None = None,
     ) -> None:
         self.portal_id = portal_id
         self.request_text = request_text
@@ -62,6 +64,12 @@ class LoopState:
         # resume: steps executed and (approximate) HubSpot API calls made.
         self.step_count = step_count
         self.api_call_count = api_call_count
+        # Back-pressure rate state (Phase 3 PR-B), persisted so pacing survives
+        # resume: the last-seen HubSpot rate-limit remaining count and the
+        # absolute epoch at which the current interval resets. Both default None
+        # (legacy states and a loop that has not yet observed a rate header).
+        self.rate_remaining = rate_remaining
+        self.rate_reset_at = rate_reset_at
 
     @property
     def total_steps(self) -> int:
@@ -85,6 +93,8 @@ class LoopState:
             "pending_action_id": self.pending_action_id,
             "step_count": self.step_count,
             "api_call_count": self.api_call_count,
+            "rate_remaining": self.rate_remaining,
+            "rate_reset_at": self.rate_reset_at,
         }
 
     @classmethod
@@ -106,6 +116,8 @@ class LoopState:
             pending_action_id=data.get("pending_action_id"),
             step_count=data.get("step_count", 0),
             api_call_count=data.get("api_call_count", 0),
+            rate_remaining=data.get("rate_remaining"),
+            rate_reset_at=data.get("rate_reset_at"),
         )
 
 
