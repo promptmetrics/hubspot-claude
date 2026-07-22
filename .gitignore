@@ -18,7 +18,8 @@ dist/
 AGENTS.md
 CLAUDE.md
 TASKS.md
-docs/
+docs/*
+!docs/PRD.md
 plans/
 scripts/*
 !scripts/check-artifact-allowlist.sh
