@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,11 +21,67 @@ from hubspot_agent.snapshot import save_undo_snapshot, update_undo_snapshot
 ApprovalCallback = Callable[[dict[str, Any]], bool]
 
 
+# Intent vocabulary — the SINGLE source of truth shared by the approval gate
+# (``is_write_step`` below) and the loop executor (``orchestrator._parse_agent_intent``),
+# so the two can never disagree on whether a step writes.  These previously lived
+# only in orchestrator; keeping one copy here closes the gap where a synonym verb
+# ("remove"/"clear"/"set"/"modify"/…) was a write to the executor but a read to
+# the gate, letting a free-text write step inline-execute with no approval.
+_SEARCH_WORDS = {"find", "search", "get", "list", "show", "retrieve", "lookup", "query"}
+_CREATE_WORDS = {"create", "add", "new", "insert", "build", "make"}
+_UPDATE_WORDS = {"update", "change", "edit", "modify", "set", "rename", "patch"}
+_DELETE_WORDS = {"delete", "remove", "destroy", "drop", "clear", "purge"}
+
+# Object-mutation verbs that aren't search/create/update/delete words but still
+# write (merge/enroll/toggle/bulk/upsert).  Matched as substrings, preserving the
+# original ``is_write_step`` behavior so nothing that used to gate stops gating.
+_EXPLICIT_WRITE_VERBS = {"create", "update", "delete", "upsert", "merge", "enroll", "toggle", "bulk"}
+
+_WRITE_INTENT_TYPES = frozenset({"create", "update", "delete"})
+
+
+def _has_boundary_word(text: str, words: set[str]) -> bool:
+    """True if any word appears as a whole word in ``text``.
+
+    Word-boundary (not substring) matching so tokens like ``"renewal"`` don't
+    match ``new`` and ``"created"`` doesn't match ``create``.
+    """
+    return any(re.search(rf"\b{re.escape(w)}\b", text) for w in words)
+
+
+def classify_intent_type(text: str) -> str:
+    """Classify an action string into search/delete/update/create/unknown.
+
+    Priority: search → delete → update → create.  Reads first (a read must never
+    masquerade as a write); destructive before non-destructive so a phrase
+    carrying both (e.g. "delete the renewal") fails safe into the destructive
+    path rather than being reclassified as a create via "new".
+    """
+    text = text.lower()
+    if _has_boundary_word(text, _SEARCH_WORDS):
+        return "search"
+    if _has_boundary_word(text, _DELETE_WORDS):
+        return "delete"
+    if _has_boundary_word(text, _UPDATE_WORDS):
+        return "update"
+    if _has_boundary_word(text, _CREATE_WORDS):
+        return "create"
+    return "unknown"
+
+
 def is_write_step(step: PlanStep) -> bool:
-    """Heuristic: steps whose action contains create/update/delete/upsert/enroll/toggle are writes."""
+    """True if the step mutates — i.e. the executor would treat it as a write.
+
+    Additive union of two checks so nothing that used to gate stops gating:
+    (1) an explicit object-mutation verb as a substring (merge/enroll/toggle/…),
+    (2) the shared ``classify_intent_type`` returning create/update/delete —
+    which closes the synonym hole (remove/clear/set/modify/rename/…) where a
+    free-text write step previously slipped past the gate and inline-executed.
+    """
     action = step.action.lower()
-    write_verbs = {"create", "update", "delete", "upsert", "merge", "enroll", "toggle", "bulk"}
-    return any(verb in action for verb in write_verbs)
+    if any(verb in action for verb in _EXPLICIT_WRITE_VERBS):
+        return True
+    return classify_intent_type(action) in _WRITE_INTENT_TYPES
 
 
 def _resolve_artifacts(

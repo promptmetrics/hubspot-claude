@@ -8,6 +8,20 @@ are kept in sync. Full release notes for each tag live at
 
 ## [Unreleased]
 
+## [0.2.14] — 2026-07-22
+
+### Fixed
+- **Durable-loop write detection aligned with the executor.** The approval gate
+  (`is_write_step`) used a narrower verb set than the loop's intent parser
+  (`_parse_agent_intent`), so a free-text step phrased with a synonym verb
+  (`remove`, `clear`, `set`, `modify`, `rename`, `purge`, …) was a *read* to the
+  gate but a *write* to the executor — and could inline-execute in an interactive
+  loop with no approval pause. Both now share one `classify_intent_type`, so the
+  gate and executor can never disagree; nothing that previously gated stops
+  gating (the change is additive). Surfaced by the pre-ship review of the
+  scheduled-tasks feature, which had already closed the same hole for scheduled
+  runs.
+
 ## [0.2.13] — 2026-07-22
 
 ### Added
