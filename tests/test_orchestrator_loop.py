@@ -170,6 +170,67 @@ async def test_run_loop_preview_error_stops():
 
 
 # ---------------------------------------------------------------------------
+# Proxy budget (Phase 3 PR-A): per-step enforcement
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_loop_stops_mid_run_at_step_budget():
+    # Two read steps, but max_steps=1: the loop must stop BEFORE the second
+    # step (per-step enforcement, not only at the post-write verify checkpoint).
+    plan = LoopPlan(
+        goal="Two reads",
+        steps=[
+            PlanStep(step_number=1, agent="objects", action="find contacts", risk_level=RiskLevel.LOW),
+            PlanStep(step_number=2, agent="objects", action="find companies", risk_level=RiskLevel.LOW),
+        ],
+        overall_risk=RiskLevel.LOW,
+        max_steps=1,
+    )
+
+    async def dispatch(agent_name, request_text, portal_config=None, mode="preview", **kwargs):
+        return AgentResult(agent_name=agent_name, status="success", data={"artifacts": {}})
+
+    with patch("hubspot_agent.orchestrator.dispatch_agent", dispatch):
+        result = await run_loop("two reads", _portal_config(), ".", "trace-budget", plan=plan)
+
+    assert "budget exhausted" in result.lower()
+    state = loop_state.load("123")
+    assert state is not None
+    assert state.status == "stopped"
+    assert state.current_step == 1  # first step executed, stopped before the second
+    assert state.step_count == 1
+
+    from hubspot_agent import loop_log
+    events = loop_log.get_recent("123", trace_id="trace-budget")
+    assert any(e["event_type"] == "budget_exhausted" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_run_loop_stops_mid_run_at_api_call_budget():
+    plan = LoopPlan(
+        goal="Two reads",
+        steps=[
+            PlanStep(step_number=1, agent="objects", action="find contacts", risk_level=RiskLevel.LOW),
+            PlanStep(step_number=2, agent="objects", action="find companies", risk_level=RiskLevel.LOW),
+        ],
+        overall_risk=RiskLevel.LOW,
+        max_api_calls=1,
+    )
+
+    async def dispatch(agent_name, request_text, portal_config=None, mode="preview", **kwargs):
+        return AgentResult(agent_name=agent_name, status="success", data={"artifacts": {}})
+
+    with patch("hubspot_agent.orchestrator.dispatch_agent", dispatch):
+        result = await run_loop("two reads", _portal_config(), ".", "trace-apibudget", plan=plan)
+
+    assert "budget exhausted" in result.lower()
+    state = loop_state.load("123")
+    assert state.status == "stopped"
+    assert state.api_call_count == 1
+
+
+# ---------------------------------------------------------------------------
 # Resume disambiguation (awaiting_approval)
 # ---------------------------------------------------------------------------
 

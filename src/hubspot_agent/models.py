@@ -63,6 +63,14 @@ class LoopPlan(BaseModel):
     steps: list[PlanStep]
     overall_risk: RiskLevel = RiskLevel.LOW
     max_iterations: int = 3
+    # Proxy budget (Phase 3 PR-A): plan-configurable runaway guards enforced
+    # per-step by _drive_loop and at verify by LoopController.  Defaults apply
+    # to plans persisted before these fields existed, so a missing budget is
+    # the shipped default — never "unlimited".
+    max_steps: int = 50
+    max_api_calls: int = 1000
+    error_budget: int = 5
+    verification_plateau: int = 2
     artifact_schema: dict[str, Any] = Field(default_factory=dict)
 
 

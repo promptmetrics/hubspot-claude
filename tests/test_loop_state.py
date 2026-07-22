@@ -105,6 +105,29 @@ def test_pending_action_id_defaults_none_on_legacy_state():
     assert restored.pending_action_id is None
 
 
+def test_proxy_budget_counters_roundtrip():
+    # Phase 3 PR-A: step_count/api_call_count persist through to_dict/from_dict.
+    state = _make_state()
+    state.step_count = 7
+    state.api_call_count = 42
+    data = state.to_dict()
+    assert data["step_count"] == 7
+    assert data["api_call_count"] == 42
+    restored = LoopState.from_dict(data)
+    assert restored.step_count == 7
+    assert restored.api_call_count == 42
+
+
+def test_proxy_budget_counters_default_zero_on_legacy_state():
+    # A pre-Phase-3 state file (no step_count/api_call_count keys) still loads.
+    data = _make_state().to_dict()
+    data.pop("step_count")
+    data.pop("api_call_count")
+    restored = LoopState.from_dict(data)
+    assert restored.step_count == 0
+    assert restored.api_call_count == 0
+
+
 @pytest.mark.parametrize("status", ["awaiting_approval", "awaiting_verification"])
 def test_human_wait_states_never_stale(status):
     # A loop parked on a human decision must survive the 2h reaper — clearing it

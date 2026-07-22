@@ -644,6 +644,8 @@ def _format_loop_result(
 #   awaiting_verification  a write executed; waiting for Claude to re-read the
 #                          records and supply a VerificationResult via
 #                          ``loop verify``.  Also staleness-exempt.
+#   stopped                a proxy budget (max_steps / max_api_calls) was
+#                          exhausted mid-run; terminal, halted for review.
 #   completed/failed/escalate/stop   terminal; cleared or halted.
 #
 # The safety-critical execute path (handlers.execute_pending_write, run by
@@ -651,7 +653,7 @@ def _format_loop_result(
 # reads only the persisted pending record, undo snapshot, and audit log.
 # ---------------------------------------------------------------------------
 
-_TERMINAL_STATUSES = frozenset({"completed", "failed", "escalate", "stop"})
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "escalate", "stop", "stopped"})
 
 # A step needs a HITL pause if it is a write by action-verb OR the plan marked
 # it medium/high/destructive risk.  Keying on risk too closes the gap where a
@@ -868,7 +870,36 @@ async def _drive_loop(portal_config, state: loop_state.LoopState, working_dir: s
     plan = state.plan
 
     while state.current_step < len(plan.steps):
+        # Proxy-budget back-pressure (Phase 3 PR-A): hard-stop a runaway loop
+        # BEFORE executing another step — enforced per-step, not only at the
+        # post-write verify checkpoint.  A missing budget field defaults (never
+        # "unlimited"), so this always fires.
+        if state.step_count >= plan.max_steps or state.api_call_count >= plan.max_api_calls:
+            which = "max_steps" if state.step_count >= plan.max_steps else "max_api_calls"
+            state.status = "stopped"
+            state.last_error = f"budget exhausted: {which}"
+            loop_state.save(state)
+            loop_log.log_event(portal_id, state.trace_id, "budget_exhausted", {
+                "which": which,
+                "step_count": state.step_count,
+                "api_call_count": state.api_call_count,
+                "max_steps": plan.max_steps,
+                "max_api_calls": plan.max_api_calls,
+            })
+            return _format_loop_result(
+                portal_config,
+                state,
+                f"Loop stopped: proxy budget exhausted ({which}).",
+            )
+
         step = plan.steps[state.current_step]
+        # Count this step against the proxy budget.  The loop makes no LLM
+        # calls, so api_call_count is an approximation: +1 per executed step
+        # (each step issues >=1 HubSpot request via its handler/agent).  A write
+        # step is counted once here on the pause iteration and is not re-entered
+        # on approve→continue, so it is not double-counted.
+        state.step_count += 1
+        state.api_call_count += 1
         resolved = _resolve_artifacts(step, {a.step_number: a for a in state.artifacts})
         step_request = _build_step_request(step, state.request_text, resolved)
         loop_log.log_event(portal_id, state.trace_id, "step_started", {
@@ -1180,7 +1211,13 @@ async def loop_verify(
         )
 
     step = state.plan.steps[state.current_step]
-    controller = LoopController(max_iterations=state.plan.max_iterations)
+    controller = LoopController(
+        max_iterations=state.plan.max_iterations,
+        verification_plateau=state.plan.verification_plateau,
+        error_budget=state.plan.error_budget,
+        max_steps=state.plan.max_steps,
+        max_api_calls=state.plan.max_api_calls,
+    )
     decision = controller.next_action(state, verification=verification)
     loop_log.log_event(portal_id, state.trace_id, "verification", {
         "step_number": step.step_number,

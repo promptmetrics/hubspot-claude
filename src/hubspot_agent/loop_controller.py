@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,9 +23,10 @@ class LoopController:
     Stop conditions:
 
     - ``max_iterations`` exceeded.
+    - ``max_steps`` proxy budget: executed-step count exhausted.
+    - ``max_api_calls`` proxy budget: HubSpot API-call count exhausted.
     - ``verification_plateau`` identical mismatches in a row.
     - ``error_budget`` non-retryable or unexpected errors exceeded.
-    - ``cost_ceiling`` estimated cost (USD proxy) exceeded.
 
     The controller is stateless except for the ``LoopState`` it mutates in
     place on ``record_iteration``.
@@ -37,12 +37,14 @@ class LoopController:
         max_iterations: int = 3,
         verification_plateau: int = 2,
         error_budget: int = 5,
-        cost_ceiling: float = 0.50,
+        max_steps: int = 50,
+        max_api_calls: int = 1000,
     ) -> None:
         self.max_iterations = max_iterations
         self.verification_plateau = verification_plateau
         self.error_budget = error_budget
-        self.cost_ceiling = cost_ceiling
+        self.max_steps = max_steps
+        self.max_api_calls = max_api_calls
 
     def next_action(
         self,
@@ -55,9 +57,10 @@ class LoopController:
         This method checks stop conditions in order of precedence:
 
         1. Iteration ceiling
-        2. Cost ceiling (via environment proxy)
-        3. Error budget exhaustion
-        4. Verification plateau (two identical mismatches)
+        2. Step budget (proxy)
+        3. API-call budget (proxy)
+        4. Error budget exhaustion
+        5. Verification plateau (two identical mismatches)
 
         If none fire and a verification mismatch is present, the loop retries.
         If verification passes, the loop proceeds to the next step.
@@ -69,10 +72,17 @@ class LoopController:
                 final=True,
             )
 
-        if self._cost_exceeded():
+        if state.step_count >= self.max_steps:
             return LoopDecision(
                 action="stop",
-                reason=f"Estimated cost ceiling (${self.cost_ceiling:.2f}) exceeded.",
+                reason=f"Step budget ({self.max_steps}) exhausted.",
+                final=True,
+            )
+
+        if state.api_call_count >= self.max_api_calls:
+            return LoopDecision(
+                action="stop",
+                reason=f"API-call budget ({self.max_api_calls}) exhausted.",
                 final=True,
             )
 
@@ -126,14 +136,6 @@ class LoopController:
     def record_iteration(self, state: LoopState) -> None:
         """Increment the loop iteration counter after a retry or execute cycle."""
         state.iterations += 1
-
-    def _cost_exceeded(self) -> bool:
-        """Check a crude cost proxy via environment variable."""
-        spent = os.environ.get("HUBSPOT_LOOP_COST", "0")
-        try:
-            return float(spent) >= self.cost_ceiling
-        except ValueError:
-            return False
 
     def _error_budget_exceeded(self, state: LoopState) -> bool:
         """Return True if too many errors have been logged."""
