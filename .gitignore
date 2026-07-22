@@ -18,6 +18,7 @@ dist/
 TASKS.md
 docs/*
 !docs/PRD.md
+!docs/QUICKSTART.md
 plans/
 scripts/*
 !scripts/check-artifact-allowlist.sh

@@ -40,8 +40,24 @@ Tests use `pytest-asyncio`, `respx`/`pytest-httpx` (no live HubSpot calls), and 
 
 `.claude-plugin/` holds `plugin.json` + `marketplace.json`; `SKILL.md` is the `/hubspot` skill prompt; `hooks/install.sh` (SessionStart) provisions the plugin venv under `${CLAUDE_PLUGIN_DATA}/venv` and always exits 0 (a failed provision is silent — check `install.log`). `bin/hubspot` self-heals a version-drifted venv on every invocation. When bumping the version, keep `pyproject.toml` and `.claude-plugin/plugin.json` in sync.
 
+## Product spec (source of truth)
+
+The product spec lives in `docs/PRD.md`. Read it at the start of any implementation work.
+
+Keep it current as part of the job — not as a separate task:
+
+- When you make a non-trivial decision, append a dated line to the Decisions log.
+- When scope changes, edit the affected numbered requirement in place (don't just append a note).
+- When a requirement's behavior changes, update its acceptance criteria.
+- At the end of a work session, reconcile Status against what the code actually does.
+
+If a change genuinely doesn't affect the spec, say so explicitly rather than skipping silently. Reference requirements by number (e.g. "R4") in commits and explanations.
+
+Run `/sync-prd` to reconcile the PRD against recent commits and current code.
+
 ## Source of Truth
 
+- `docs/PRD.md` — product spec (source of truth); see "Product spec" above
 - `README.md` — user-facing behavior, command table, state layout
 - `docs/superpowers/specs/` — design specs (original agent design, blueprint learning loop)
 - `docs/adr/` — architectural decision records
