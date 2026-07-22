@@ -9,7 +9,7 @@
 # docs/PRD.md (the only tracked file under docs/; source-of-truth spec)
 set -u
 
-allow_regex='^(src/|tests/|bin/hubspot$|hooks/|\.claude-plugin/|\.github/|scripts/check-artifact-allowlist\.sh$|docs/PRD\.md$|output-styles/|SKILL\.md$|README\.md$|LICENSE$|pyproject\.toml$|\.gitignore$)'
+allow_regex='^(src/|tests/|bin/hubspot$|hooks/|\.claude-plugin/|\.github/|scripts/check-artifact-allowlist\.sh$|docs/PRD\.md$|output-styles/|SKILL\.md$|README\.md$|CHANGELOG\.md$|LICENSE$|pyproject\.toml$|\.gitignore$)'
 
 bad=$(git ls-files | grep -Ev "$allow_regex")
 if [ -n "$bad" ]; then
