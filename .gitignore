@@ -15,8 +15,6 @@ dist/
 
 # Dev-only paths — kept on disk but excluded from the shipping artifact
 # (allowlist: src/ tests/ bin/hubspot hooks/ .claude-plugin/ SKILL.md README.md LICENSE pyproject.toml).
-AGENTS.md
-CLAUDE.md
 TASKS.md
 docs/*
 !docs/PRD.md
