@@ -116,6 +116,13 @@ def reap_expired(portal_id: str, max_age_hours: int = 24) -> int:
                 continue
             try:
                 data = json.loads(file_path.read_text())
+                # Schedule-staged previews carry an ``origin`` stamp; their
+                # lifetime is the schedule queue TTL (``schedule_queue_ttl_days``,
+                # default 7d), owned by the schedule expiry path — not this 24h
+                # interactive reaper.  Skipping them keeps a staged batch alive
+                # for review across a multi-day absence.
+                if data.get("origin"):
+                    continue
                 stored = data.get("_stored_at")
                 if not stored:
                     mtime = file_path.stat().st_mtime

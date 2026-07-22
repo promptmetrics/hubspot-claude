@@ -38,6 +38,9 @@ _DEFAULT_POLICY: dict[str, Any] = {
     # larger than this requires the typed count at approve, reusing the FULL_GATE
     # count ceremony.  Defaults to auto_apply_max_records when unset (see _coerce).
     "pattern_confirm_threshold": 100,
+    # Days a scheduled run's queued (staged) writes stay approvable before the
+    # batch auto-expires (Phase 4 scheduled tasks; spec §4/§5).
+    "schedule_queue_ttl_days": 7,
     "sensitive_properties": ["amount", "dealstage", "hubspot_owner_id", "lifecyclestage"],
     "sensitive_property_action": "confirm",
     # Side-effectful writes that must ALWAYS keep the human gate even though they
@@ -58,6 +61,7 @@ _DEFAULT_POLICY: dict[str, Any] = {
 class ApprovalPolicy:
     auto_apply_max_records: int = 100
     pattern_confirm_threshold: int = 100
+    schedule_queue_ttl_days: int = 7
     sensitive_properties: tuple[str, ...] = ()
     sensitive_property_action: str = "confirm"  # "confirm" | "full_gate"
     never_auto_tools: tuple[str, ...] = ()
@@ -84,6 +88,14 @@ def _coerce(raw: dict[str, Any]) -> ApprovalPolicy:
         pattern_threshold = int(merged.get("pattern_confirm_threshold", max_records))
     except (TypeError, ValueError):
         pattern_threshold = max_records
+    # Days a staged scheduled batch stays approvable. A malformed or negative
+    # value falls back to the shipped default (7) rather than fail-open.
+    try:
+        queue_ttl = int(merged.get("schedule_queue_ttl_days", 7))
+        if queue_ttl < 0:
+            queue_ttl = 7
+    except (TypeError, ValueError):
+        queue_ttl = 7
     # Union the safety lists with the shipped defaults: an override extends,
     # never replaces, so config cannot drop a shipped protection.  dict.fromkeys
     # dedups while preserving order (shipped entries first).
@@ -96,6 +108,7 @@ def _coerce(raw: dict[str, Any]) -> ApprovalPolicy:
     return ApprovalPolicy(
         auto_apply_max_records=max_records,
         pattern_confirm_threshold=pattern_threshold,
+        schedule_queue_ttl_days=queue_ttl,
         sensitive_properties=tuple(props),
         sensitive_property_action=action,
         never_auto_tools=tuple(never_auto),

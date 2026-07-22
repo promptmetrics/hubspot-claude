@@ -32,6 +32,7 @@ It runs as a Claude Code plugin (`/hubspot`). Claude orchestrates ~44 stateless 
 - **Turn one portal workflow into a reusable template** — extract an existing workflow into a reviewable JSON blueprint, parameterize it, and create new workflows from it.
 - **Let trivial writes flow, gate the risky ones** — risk-tiered approval auto-applies provably-safe, reversible writes (up to a configurable record ceiling) while still gating destructive, over-ceiling, non-undoable, sensitive-field, and side-effectful workflow writes.
 - **Approve a cleanup once, apply it to the whole set** — with `--pattern`, approve one transformation rule and scale it across every matched record via per-record compare-and-set: records that have drifted from what you approved are skipped, never overwritten.
+- **Put recurring hygiene on a schedule** — register a cron job (`hubspot schedule add`) that an OS timer replays: it runs the reads unattended and stages every write for you to approve later. Nothing mutates without a human, and a staged write that a record has since drifted from is skipped at approval, not clobbered.
 
 The exact agent, tool, and blueprint counts live in code — run `hubspot agents list` / `hubspot tools list` rather than trusting a number in prose.
 
@@ -121,6 +122,7 @@ The plugin ships a single entrypoint at `${CLAUDE_PLUGIN_ROOT}/bin/hubspot` (a P
 | `hubspot approve <id> [<count>]` | Execute a previewed write (count required + re-checked for destructive) |
 | `hubspot reject <id>` | Discard a pending write |
 | `hubspot loop status\|log\|continue\|abandon` | Inspect or steer a running loop |
+| `hubspot schedule add\|list\|remove\|run-due\|install-timer` | Register/replay recurring jobs; writes stage for approval |
 | `hubspot serve` / `serve stop` | Warm-client daemon lifecycle |
 | `hubspot portal auth\|token\|list\|switch` | Portal + auth management |
 | `hubspot setup <id> oauth\|token <pat>` | Full portal setup |

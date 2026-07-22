@@ -82,6 +82,29 @@ def test_pattern_confirm_threshold_malformed_falls_back_to_records_ceiling(cfg):
     assert p.pattern_confirm_threshold == 40
 
 
+def test_schedule_queue_ttl_days_default(cfg):
+    assert load_approval_policy("123").schedule_queue_ttl_days == 7
+
+
+def test_schedule_queue_ttl_days_override(cfg):
+    (cfg / "approval_policy.json").write_text(json.dumps({"schedule_queue_ttl_days": 14}))
+    assert load_approval_policy("123").schedule_queue_ttl_days == 14
+
+
+def test_schedule_queue_ttl_days_malformed_falls_back(cfg):
+    (cfg / "approval_policy.json").write_text(
+        json.dumps({"schedule_queue_ttl_days": "oops"})
+    )
+    assert load_approval_policy("123").schedule_queue_ttl_days == 7
+
+
+def test_schedule_queue_ttl_days_negative_falls_back(cfg):
+    (cfg / "approval_policy.json").write_text(
+        json.dumps({"schedule_queue_ttl_days": -3})
+    )
+    assert load_approval_policy("123").schedule_queue_ttl_days == 7
+
+
 def test_malformed_file_falls_back(cfg):
     (cfg / "approval_policy.json").write_text("{ this is not json")
     p = load_approval_policy("123")
