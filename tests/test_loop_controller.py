@@ -95,18 +95,33 @@ def test_different_mismatch_resets_plateau():
     assert d3.action == "retry"
 
 
-def test_cost_ceiling_stops():
-    controller = LoopController(cost_ceiling=0.50)
-    state = _make_state()
-    import os
+def test_step_budget_stops():
+    # Proxy budget replaces the retired HUBSPOT_LOOP_COST env hook: an executed
+    # step count at/over max_steps hard-stops the loop.
+    controller = LoopController(max_steps=10)
+    state = _make_state(step_count=10)
+    decision = controller.next_action(state)
+    assert decision.action == "stop"
+    assert decision.final
+    assert "Step budget" in decision.reason
 
-    os.environ["HUBSPOT_LOOP_COST"] = "0.75"
-    try:
-        decision = controller.next_action(state)
-        assert decision.action == "stop"
-        assert "cost ceiling" in decision.reason
-    finally:
-        del os.environ["HUBSPOT_LOOP_COST"]
+
+def test_api_call_budget_stops():
+    controller = LoopController(max_api_calls=100)
+    state = _make_state(api_call_count=100)
+    decision = controller.next_action(state)
+    assert decision.action == "stop"
+    assert decision.final
+    assert "API-call budget" in decision.reason
+
+
+def test_budgets_do_not_stop_under_limit():
+    # A verified verdict still proceeds while both proxy budgets are under limit.
+    controller = LoopController(max_steps=50, max_api_calls=1000)
+    state = _make_state(step_count=49, api_call_count=999)
+    verification = VerificationResult(status=VerificationResult.Status.VERIFIED)
+    decision = controller.next_action(state, verification=verification)
+    assert decision.action == "proceed"
 
 
 def test_step_error_escalates():

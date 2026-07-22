@@ -37,6 +37,8 @@ class LoopState:
         last_verification_hash: str | None = None,
         plateau_count: int = 0,
         pending_action_id: str | None = None,
+        step_count: int = 0,
+        api_call_count: int = 0,
     ) -> None:
         self.portal_id = portal_id
         self.request_text = request_text
@@ -56,6 +58,10 @@ class LoopState:
         # preview the human must ``approve``.  Cleared once the write is
         # verified and the loop advances.
         self.pending_action_id = pending_action_id
+        # Proxy-budget counters (Phase 3 PR-A), persisted so the budget survives
+        # resume: steps executed and (approximate) HubSpot API calls made.
+        self.step_count = step_count
+        self.api_call_count = api_call_count
 
     @property
     def total_steps(self) -> int:
@@ -77,6 +83,8 @@ class LoopState:
             "last_verification_hash": self.last_verification_hash,
             "plateau_count": self.plateau_count,
             "pending_action_id": self.pending_action_id,
+            "step_count": self.step_count,
+            "api_call_count": self.api_call_count,
         }
 
     @classmethod
@@ -96,6 +104,8 @@ class LoopState:
             last_verification_hash=data.get("last_verification_hash"),
             plateau_count=data.get("plateau_count", 0),
             pending_action_id=data.get("pending_action_id"),
+            step_count=data.get("step_count", 0),
+            api_call_count=data.get("api_call_count", 0),
         )
 
 
